@@ -145,3 +145,37 @@ def test_extra_parameters_with_defaults_are_allowed() -> None:
     async def place_order(cmd: PlaceOrder, *, note: str = "") -> None: ...
 
     app.command_handler(place_order)
+
+
+def test_only_the_message_annotation_is_resolved() -> None:
+    app = _app()
+
+    @app.command_handler
+    async def place_order(cmd: PlaceOrder, note: NotImportedHere = None) -> NotImportedEither:  # type: ignore[name-defined]  # noqa: F821
+        return None
+
+
+def test_an_unresolvable_message_annotation_names_its_parameter() -> None:
+    app = _app()
+    with pytest.raises(TypeError, match=r"the annotation of cmd cannot be resolved"):
+
+        @app.command_handler
+        async def place_order(cmd: NotAMessageHere) -> None:  # type: ignore[name-defined]  # noqa: F821
+            return None
+
+
+def test_a_handler_is_named_without_locals() -> None:
+    app = _app()
+
+    @app.command_handler
+    async def place_order(cmd: PlaceOrder) -> None: ...
+
+    with pytest.raises(TypeError) as raised:
+
+        @app.command_handler
+        async def again(cmd: PlaceOrder) -> None: ...
+
+    text = str(raised.value)
+    assert "<locals>" not in text
+    assert "test_a_handler_is_named_without_locals.again" in text
+    assert "test_a_handler_is_named_without_locals.place_order" in text

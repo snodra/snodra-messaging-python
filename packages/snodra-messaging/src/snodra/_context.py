@@ -21,6 +21,10 @@ class MessageInfo:
     headers: Mapping[str, str]
     """Every request header, read-only."""
 
+    def __hash__(self) -> int:
+        # The headers are a mapping: hashed by their items, so that equal infos hash alike.
+        return hash((self.id, self.type, self.correlation_id, frozenset(self.headers.items())))
+
 
 _CURRENT: Final[ContextVar[MessageInfo | None]] = ContextVar("snodra.current_message", default=None)
 

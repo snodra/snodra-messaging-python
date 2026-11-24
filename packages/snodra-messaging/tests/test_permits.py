@@ -12,6 +12,7 @@ from typing import Any
 from fakehub import FakeHub, ack, forward
 from helpers import PlaceOrder, acknowledged, eventually, new_app, next_reply, within
 from snodra import App
+from snodra._connection import _Stream
 from snodra._hubpb import hub_pb2
 from snodra._permits import PermitLedger
 
@@ -191,3 +192,10 @@ async def test_a_request_without_a_local_permit_waits_for_one(hub: FakeHub) -> N
     for id in ("r-1", "r-2"):
         assert (await s.recv_reply()).request_id == id
         assert (await s.recv_permits()).count == 1
+
+
+def test_the_stream_ledger_batches_by_the_timings() -> None:
+    stream = _Stream(hub_pb2.Register(initial_permits=64), 1.0, permit_batch=4)
+    for _ in range(8):
+        stream.permits.arrived()
+    assert [stream.permits.finished()[0] for _ in range(4)] == [0, 0, 0, 4]

@@ -6,6 +6,7 @@ See https://snodra.damoreira.com/library-authors/protocol/ ("Handling a request"
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -463,3 +464,39 @@ async def test_shutdown_returns_by_its_deadline_with_a_handler_ignoring_cancella
             if t.get_name().startswith("snodra:handler"):
                 t.cancel()
                 await asyncio.wait([t], timeout=1.0)
+
+
+async def test_no_task_is_left_when_the_shutdown_budget_cuts_the_drain(hub: FakeHub) -> None:
+    app = new_app(hub)  # 256 handlers at once: a finished request's permit waits for the batch timer
+    started = asyncio.Event()
+
+    @app.command_handler
+    async def place_order(cmd: PlaceOrder) -> None:
+        started.set()
+        await asyncio.Event().wait()  # until cancelled
+
+    await app.start()
+    s = await acknowledged(hub)
+    await s.send(_request("r-1"))
+    await asyncio.wait_for(started.wait(), 1.0)
+    await app.shutdown(timeout=0.3)
+    current = asyncio.current_task()
+    left = sorted(
+        t.get_name() for t in asyncio.all_tasks() if t is not current and not t.done() and not _of_the_fake_hub(t)
+    )
+    assert left == [], f"left after shutdown: {left}"
+
+
+def _of_the_fake_hub(t: asyncio.Task[Any]) -> bool:
+    """A task of the in-process fake hub (its own code or grpc's server), which runs on until the test ends."""
+    code = getattr(t.get_coro(), "cr_code", None)
+    path = "" if code is None else code.co_filename
+    return "fakehub" in path or f"{os.sep}grpc{os.sep}" in path
+
+
+def test_message_info_is_hashable() -> None:
+    a = MessageInfo("r-1", "orders.PlaceOrder", "c-1", {"x-tenant": "t-1"})
+    b = MessageInfo("r-1", "orders.PlaceOrder", "c-1", {"x-tenant": "t-1"})
+    assert a == b
+    assert hash(a) == hash(b)
+    assert len({a, b, MessageInfo("r-2", "orders.PlaceOrder", "c-1", {})}) == 2

@@ -23,7 +23,7 @@ import grpc.aio
 from snodra._backoff import jitter, next_wait
 from snodra._hubpb import hub_pb2, hub_pb2_grpc
 from snodra._permits import PermitLedger
-from snodra._timings import Timings
+from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +82,9 @@ _HALF_CLOSE: Final = _HalfClose()
 class _Stream:
     """One ``Hub.Connect`` stream: its outbound queue, its handshake and the silent-hub watch."""
 
-    def __init__(self, register: hub_pb2.Register, interval: float) -> None:
+    def __init__(
+        self, register: hub_pb2.Register, interval: float, permit_batch: int = DEFAULT_TIMINGS.permit_batch
+    ) -> None:
         self.register = register
         self.out: asyncio.Queue[hub_pb2.ClientMessage | _HalfClose] = asyncio.Queue()
         self.writable = True
@@ -99,7 +101,7 @@ class _Stream:
         # The silent-hub watch, armed by the ack: the last sign of life (loop time) and the heartbeats written since.
         self.last_echo = 0.0
         self.unanswered = 0
-        self.permits = PermitLedger(register.initial_permits)
+        self.permits = PermitLedger(register.initial_permits, batch=permit_batch)
         """The permits the hub holds for this stream, and those to give back on it."""
 
     def put(self, m: hub_pb2.ClientMessage) -> bool:
@@ -342,7 +344,7 @@ class HubConnection:
 
     async def _attempt(self) -> _End:
         """One stream, from its opening to its end; why it ended. Its clean-up records whether it reached its ack."""
-        stream = _Stream(self._register, self._timings.heartbeat_before_ack)
+        stream = _Stream(self._register, self._timings.heartbeat_before_ack, self._timings.permit_batch)
         channel = grpc.aio.insecure_channel(self.address, options=self._options)
         tasks: list[asyncio.Task[Any]] = []
         try:

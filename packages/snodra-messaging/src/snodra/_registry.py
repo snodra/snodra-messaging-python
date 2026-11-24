@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 import typing
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -12,6 +13,13 @@ from snodra._errors import RegistrationClosed
 from snodra._messages import type_name
 
 Kind = Literal["command", "query"]
+
+_UNEVALUATED: dict[str, Any] = {}
+"""``inspect.signature`` leaves an annotation it cannot evaluate as a forward reference where it can (Python 3.14)."""
+if sys.version_info >= (3, 14):
+    import annotationlib
+
+    _UNEVALUATED["annotation_format"] = annotationlib.Format.FORWARDREF
 
 HandlerFn = Callable[..., Awaitable[Any]]
 
@@ -25,11 +33,13 @@ class Handler:
     type: str
     kind: Kind
     label: str
-    """How logs and errors name it: the function's qualified name."""
+    """How logs and errors name it: the function's qualified name, without ``<locals>``."""
 
 
 def label_of(fn: object) -> str:
-    return getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None) or repr(fn)
+    """The function's qualified name without ``<locals>.`` (``register.place_order``)."""
+    name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+    return repr(fn) if not isinstance(name, str) else name.replace("<locals>.", "")
 
 
 class Registry:
@@ -78,7 +88,8 @@ def _message_class(fn: object, label: str) -> type:
     """The class the first parameter of fn is annotated with; ``TypeError`` when fn cannot be called with the message
     alone or its annotation is not a message class."""
     try:
-        signature = inspect.signature(fn)  # type: ignore[arg-type]
+        # Annotations are not evaluated here (Python 3.14 evaluates them lazily): only the message's is resolved below.
+        signature = inspect.signature(fn, **_UNEVALUATED)  # type: ignore[arg-type]
     except (TypeError, ValueError) as e:
         raise TypeError(f"handler {label}: its signature cannot be read ({e})") from None
     params = list(signature.parameters.values())
@@ -89,11 +100,12 @@ def _message_class(fn: object, label: str) -> type:
     for p in rest:
         if p.default is inspect.Parameter.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
             raise TypeError(f"handler {label}: its parameter {p.name} has no default; the message is the only argument")
+    if first.annotation is inspect.Parameter.empty:
+        raise TypeError(f"handler {label}: its parameter {first.name} must be annotated with the message class")
     try:
-        hints = typing.get_type_hints(fn)
+        cls = _resolve(first.annotation, fn)
     except Exception as e:
         raise TypeError(f"handler {label}: the annotation of {first.name} cannot be resolved ({e})") from None
-    cls = hints.get(first.name)
     if cls is None:
         raise TypeError(f"handler {label}: its parameter {first.name} must be annotated with the message class")
     if not isinstance(cls, type):
@@ -106,3 +118,14 @@ def _message_class(fn: object, label: str) -> type:
             "@snodra.message_type(...)"
         ) from None
     return cls
+
+
+def _resolve(annotation: object, fn: object) -> object:
+    """An annotation's value: a text (``from __future__ import annotations``) or a forward reference is evaluated in the
+    function's module, as ``typing.get_type_hints`` does; ``Annotated`` is unwrapped."""
+    text = annotation if isinstance(annotation, str) else getattr(annotation, "__forward_arg__", None)
+    if isinstance(text, str):
+        annotation = eval(text, dict(getattr(fn, "__globals__", {})))  # an annotation, evaluated as typing does
+    if typing.get_origin(annotation) is typing.Annotated:
+        annotation = typing.get_args(annotation)[0]
+    return annotation

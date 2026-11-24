@@ -82,6 +82,8 @@ class Dispatcher:
         self._running: dict[tuple[object, str], _Running] = {}
         self._tasks: dict[asyncio.Task[None], _Running] = {}
         self._timers: set[asyncio.Task[None]] = set()
+        self._closed = False
+        """Set by :meth:`abandon`: no permit timer is armed any more (the shutdown is under way)."""
 
     # Called by the stream's reader: never raises, runs no user code, never waits.
 
@@ -128,7 +130,9 @@ class Dispatcher:
 
     def abandon(self) -> None:
         """Cancels every handler still running, without waiting for it, and the permit timers; one warning names the
-        handlers it cancels."""
+        handlers it cancels. From then on no permit timer is armed: a handler it cancels ends after it, and its
+        permit, when still due, is written at once or dropped with its stream."""
+        self._closed = True
         for timer in list(self._timers):
             timer.cancel()
         left = [r for t, r in self._tasks.items() if not t.done() and not r.abandoned]
@@ -228,7 +232,7 @@ class Dispatcher:
         """One request of the stream finished: its permit is pending, written now or by the flush timer."""
         n, arm = arrival.permits.finished()
         self._grant(arrival, n)
-        if arm and arrival.writable:
+        if arm and arrival.writable and not self._closed:
             timer = asyncio.create_task(self._flush_later(arrival), name="snodra:permits")
             self._timers.add(timer)
             timer.add_done_callback(self._timers.discard)
