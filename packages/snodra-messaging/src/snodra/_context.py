@@ -20,7 +20,7 @@ class MessageInfo:
     type: str
     """The wire type name, for example ``orders.PlaceOrder``."""
     correlation_id: str
-    """The request's ``correlationId`` header; its id when it carries none."""
+    """The request's ``correlationId`` header (an empty one as it is); its id when it carries none."""
     headers: Mapping[str, str]
     """Every request header, read-only."""
 

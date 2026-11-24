@@ -12,13 +12,13 @@ import json
 import logging
 import math
 import time
-import urllib.request
 from typing import Any, Final
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from snodra import _http
 from snodra._errors import Unauthenticated
 from snodra._meta import client_version
 
@@ -63,11 +63,13 @@ class JwksVerifier:
     """Verifies RS256 tokens against the keys of the JWKS at ``url``, and their issuer, expiry and not-before (each
     with ``leeway`` seconds of clock skew).
 
-    The keys are fetched at the first token and cached; until a fetch succeeds every token that needs them fetches
-    again. A token whose ``kid`` the cache does not know fetches them again, at most once per ``min_refresh``. A fetch
-    runs off the event loop (``urllib`` in a thread, at most ``fetch_timeout`` seconds and 1 MiB) in one task,
-    ``snodra:jwks``, that every token needing the keys meanwhile waits for: a waiter that is cancelled leaves it to
-    the others. A token is refused with :class:`Unauthenticated` and a short reason, safe to send back to the caller.
+    The keys are fetched at the first token and cached. A fetch starts at most once per ``min_refresh``: a token whose
+    ``kid`` the cache does not know fetches them again once that long passed since the last fetch (the first one
+    included), and after a first fetch that failed every token is refused until it passed. A fetch runs off the event
+    loop (see :mod:`snodra._http`: no redirect followed, ``fetch_timeout`` seconds for the whole download and its
+    parsing, at most 1 MiB, the proxy environment variables honoured) in one task, ``snodra:jwks``, that every token
+    needing the keys meanwhile waits for: a waiter that is cancelled leaves it to the others. A token is refused with
+    :class:`Unauthenticated` and a short reason, safe to send back to the caller.
     """
 
     def __init__(
@@ -88,7 +90,8 @@ class JwksVerifier:
         self._max_bytes = max_bytes
         self._keys: dict[str, rsa.RSAPublicKey | None] | None = None
         """The published keys by id (None: published but unusable); None until a fetch succeeded."""
-        self._last_forced: float | None = None
+        self._last_fetch: float | None = None
+        """When the latest fetch started (loop time)."""
         self._fetch: asyncio.Task[dict[str, rsa.RSAPublicKey | None]] | None = None
         self._closed = False
 
@@ -103,6 +106,8 @@ class JwksVerifier:
             raise Unauthenticated("unreadable token")
         if header.get("alg") != "RS256":
             raise Unauthenticated("unsupported token algorithm")
+        if "crit" in header:  # no extension is understood here, so none that must be (RFC 7515, 4.1.11)
+            raise Unauthenticated("unsupported critical header")
         kid = header.get("kid")
         if not isinstance(kid, str) or not kid:
             raise Unauthenticated("token has no kid")
@@ -144,9 +149,10 @@ class JwksVerifier:
     async def _key(self, kid: str) -> rsa.RSAPublicKey:
         if self._keys is None:
             await self._load(forced=False)
-        if self._keys is None or kid not in self._keys:
-            await self._load(forced=True)
         keys = self._keys or {}
+        if kid not in keys:
+            await self._load(forced=True)
+            keys = self._keys or {}
         if kid not in keys:
             raise Unauthenticated("unknown signing key")
         key = keys[kid]
@@ -155,17 +161,19 @@ class JwksVerifier:
         return key
 
     async def _load(self, *, forced: bool) -> None:
-        """Waits for a fetch of the keys: the one in progress, else a new one. A forced fetch (an unknown ``kid``)
-        starts at most once per ``min_refresh``; within it, nothing is fetched."""
+        """Waits for a fetch of the keys: the one in progress, else a new one when ``min_refresh`` passed since the
+        last. Within it a forced fetch (an unknown ``kid``, the keys known) does nothing, and a first load (no keys
+        yet: the last fetch failed) is refused."""
         if self._closed:
             raise Unauthenticated(UNAVAILABLE)
         task = self._fetch
         if task is None:
             now = asyncio.get_running_loop().time()
-            if forced:
-                if self._last_forced is not None and now - self._last_forced < self._min_refresh:
+            if self._last_fetch is not None and now - self._last_fetch < self._min_refresh:
+                if forced:
                     return
-                self._last_forced = now
+                raise Unauthenticated(UNAVAILABLE)
+            self._last_fetch = now
             task = asyncio.create_task(self._fetch_keys(), name="snodra:jwks")
             self._fetch = task
             task.add_done_callback(self._fetched)
@@ -190,21 +198,20 @@ class JwksVerifier:
         self._keys = task.result()
 
     async def _fetch_keys(self) -> dict[str, rsa.RSAPublicKey | None]:
-        async with asyncio.timeout(self._fetch_timeout):
-            body = await asyncio.to_thread(self._download)
-        return parse_jwks(body)
-
-    def _download(self) -> bytes:
-        request = urllib.request.Request(
-            self._url, headers={"Accept": "application/json", "User-Agent": client_version()}
+        return await _http.exchange(
+            self._url,
+            read=_keys_of,
+            timeout=self._fetch_timeout,
+            max_bytes=self._max_bytes,
+            headers={"Accept": "application/json", "User-Agent": client_version()},
         )
-        with urllib.request.urlopen(
-            request, timeout=self._fetch_timeout
-        ) as response:  # http:// or https:// only (Settings)
-            body: bytes = response.read(self._max_bytes + 1)
-        if len(body) > self._max_bytes:
-            raise ValueError(f"the JWKS is larger than {self._max_bytes} bytes")
-        return body
+
+
+def _keys_of(response: _http.Response) -> dict[str, rsa.RSAPublicKey | None]:
+    """The keys of a JWKS answer (in the exchange's thread); ``ValueError`` for any answer but a 2xx JWKS."""
+    if not 200 <= response.status < 300:
+        raise ValueError(f"the JWKS endpoint answered HTTP {response.status} (a redirect is not followed)")
+    return parse_jwks(response.body)
 
 
 def parse_jwks(body: bytes) -> dict[str, rsa.RSAPublicKey | None]:

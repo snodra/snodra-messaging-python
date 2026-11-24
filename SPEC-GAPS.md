@@ -34,8 +34,8 @@ library does there. Where an entry is settled, its behaviour is this library's r
   `handler <name>: access denied`, and a caller whose rule raised with `PERMISSION_DENIED`
   `handler <name>: access denied (<ClassName>)`, `<name>` being the handler function's qualified name. A forwarded
   token the JWKS verifier refuses is answered `UNAUTHENTICATED` with one of the verifier's short reasons
-  (`snodra/_jwt.py`): `unreadable token`, `unsupported token algorithm`, `token has no kid`, `signing keys
-  unavailable`, `unknown signing key`, `unusable signing key`, `invalid token`, `token has no expiry`,
+  (`snodra/_jwt.py`): `unreadable token`, `unsupported token algorithm`, `unsupported critical header`, `token has
+  no kid`, `signing keys unavailable`, `unknown signing key`, `unusable signing key`, `invalid token`, `token has no expiry`,
   `token expired`, `token not valid yet`, `token issuer not accepted`.
 - **Question:** settled.
 
@@ -92,3 +92,13 @@ library does there. Where an entry is settled, its behaviour is this library's r
   the app stops sending. Heartbeats, replies and permits are never held back.
 - **Question:** open: should the specification bound the buffer, or leave unbounded the memory a stalled stream may
   hold?
+
+### SG-9: an empty correlation id
+
+- **Specification:** `messages.md` (Correlation id) says that when the message being handled "carries none", its own
+  id stands in, and that a deadline with an empty correlation id is read as one without. It does not say whether a
+  request whose `correlationId` header is present but empty carries one.
+- **This library:** `snodra/_dispatch.py` (`Dispatcher._call`) and `snodra/_propagation.py`. A request without the
+  header has its id as its correlation id; a request with an empty header keeps the empty string: the handler's
+  `current_message().correlation_id` is `""`, and the requests it sends carry `correlationId: ""` on.
+- **Question:** open: should an empty `correlationId` header count as none, so that the request's id stands in?

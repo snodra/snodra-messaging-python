@@ -6,6 +6,7 @@ See https://snodra.damoreira.com/docs/library-authors/messages/ ("Forwarded iden
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -75,9 +76,13 @@ def role(name: str) -> Guard:
 
 
 def caller_matches(rule: Callable[[Caller], bool]) -> Guard:
-    """A caller rule returns ``True`` for; a rule that raises refuses the caller."""
+    """A caller rule returns ``True`` for; a rule that raises refuses the caller. The rule is a plain function: an
+    ``async`` one is a ``TypeError``."""
     if not callable(rule):
         raise TypeError(f"caller_matches needs a function of the caller, got {rule!r}")
+    call = rule if inspect.isroutine(rule) else type(rule).__call__  # a function, or an object's __call__
+    if inspect.iscoroutinefunction(call):
+        raise TypeError(f"caller_matches needs a plain function of the caller, not an async one: {rule!r}")
     name = getattr(rule, "__qualname__", None)
     return Guard(rule, f"caller_matches({name.replace('<locals>.', '') if isinstance(name, str) else repr(rule)})")
 

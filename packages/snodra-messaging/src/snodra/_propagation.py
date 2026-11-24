@@ -45,14 +45,15 @@ def check_own(own: Mapping[str, str] | None) -> dict[str, str]:
 
 def outgoing_headers(own: Mapping[str, str] | None, *, forward_jwt: bool) -> dict[str, str]:
     """The headers of a request sent now: the caller's own (checked by :func:`check_own`), then the ``correlationId``
-    of the request being handled (its id when it carries none; a new UUID outside any handling), its
-    ``authorization`` (``Bearer <token>``) when ``forward_jwt``, and its ``traceparent`` when it is a valid one."""
+    of the request being handled (its id when it carries none, an empty one as it is; a new UUID outside any
+    handling), its ``authorization`` (``Bearer <token>``) when ``forward_jwt``, and its ``traceparent`` when it is a
+    valid one."""
     headers = check_own(own)
     info = current_message()
     if info is None:
         headers[CORRELATION_ID] = new_id()
         return headers
-    headers[CORRELATION_ID] = info.correlation_id or info.id
+    headers[CORRELATION_ID] = info.correlation_id
     if forward_jwt and (authorization := info.headers.get(AUTHORIZATION)) is not None:
         token = bearer_token(authorization)
         if token is not None:

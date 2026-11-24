@@ -85,6 +85,9 @@ async def test_the_message_info_reaches_the_tasks_the_handler_starts(hub: FakeHu
     await s.send(_request("r-1", headers={"correlationId": "c-9"}))
     await s.recv_reply()
     assert seen == [MessageInfo("r-1", "orders.PlaceOrder", "c-9", {"correlationId": "c-9"})]
+    await s.send(_request("r-2", headers={"correlationId": ""}))  # present but empty: kept as it is
+    await s.recv_reply()
+    assert seen[1] == MessageInfo("r-2", "orders.PlaceOrder", "", {"correlationId": ""})
 
 
 async def test_a_command_without_result_answers_an_empty_object(hub: FakeHub) -> None:

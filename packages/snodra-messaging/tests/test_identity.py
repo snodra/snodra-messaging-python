@@ -180,6 +180,19 @@ async def test_a_guard_without_a_jwks_is_a_startup_error() -> None:
         app.command_handler(guard=lambda c: True)  # type: ignore[call-overload]
 
 
+def test_a_caller_rule_is_a_plain_function() -> None:
+    async def rule(c: Caller) -> bool:
+        return True
+
+    class AsyncRule:
+        async def __call__(self, c: Caller) -> bool:
+            return True
+
+    for r in (rule, AsyncRule()):
+        with pytest.raises(TypeError, match="async"):
+            caller_matches(r)  # type: ignore[arg-type]
+
+
 async def test_the_guard_order(hub: FakeHub, jwks: Jwks) -> None:
     app = new_app(hub, jwks_url=jwks.url, issuer=ISSUER)
     seen: list[Caller | None] = []
@@ -354,18 +367,32 @@ async def test_an_unknown_kid_refreshes_the_jwks_at_most_once_per_minute(hub: Fa
         return await next_reply(s)
 
     assert (await ask("a", "k-1")).WhichOneof("result") == "payload"
+    loaded = time.monotonic()
     assert jwks.fetches == 1
     assert _error(await ask("b", "k-2")) == (hub_pb2.UNAUTHENTICATED, "unknown signing key")
-    refreshed = time.monotonic()
-    assert jwks.fetches == 2  # an unknown kid fetches again
+    assert jwks.fetches == 1  # the first load was the refresh: not again within the minimum refresh
+
+    async def until_fetched(n: int, id_: str) -> float:
+        """Asks with k-2 until the JWKS was fetched n times; when the last fetch happened (at the latest)."""
+        deadline = time.monotonic() + 3.0
+        i = 0
+        while jwks.fetches < n:
+            assert time.monotonic() < deadline, f"the JWKS was not fetched {n} times"
+            await asyncio.sleep(0.05)
+            assert _error(await ask(f"{id_}-{i}", "k-2")) == (hub_pb2.UNAUTHENTICATED, "unknown signing key")
+            i += 1
+        return time.monotonic()
+
+    refreshed = await until_fetched(2, "c")  # an unknown kid fetches again once the minimum refresh passed
+    assert refreshed - loaded >= 0.5
     jwks.published.append(dict(jwks.published[0], kid="k-2"))  # the issuer publishes k-2
-    assert _error(await ask("c", "k-2")) == (hub_pb2.UNAUTHENTICATED, "unknown signing key")
+    assert _error(await ask("d", "k-2")) == (hub_pb2.UNAUTHENTICATED, "unknown signing key")
     assert jwks.fetches == 2  # not again within the minimum refresh
 
     answered: list[hub_pb2.Reply] = []
 
     async def until_answered() -> bool:
-        r = await ask(f"d-{len(answered)}", "k-2")
+        r = await ask(f"e-{len(answered)}", "k-2")
         answered.append(r)
         return bool(r.WhichOneof("result") == "payload")
 

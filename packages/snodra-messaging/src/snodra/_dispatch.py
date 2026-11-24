@@ -233,7 +233,9 @@ class Dispatcher:
         id_ = request.id
         headers = dict(request.headers)
         # Set for this request only, and restored after it: an in-process call runs in its caller's task.
-        info = MessageInfo(id_, request.type, headers.get(CORRELATION_ID) or id_, MappingProxyType(headers))
+        # An empty correlationId is one the request carries: kept as it is.
+        # TODO(spec-gap): SG-9
+        info = MessageInfo(id_, request.type, headers.get(CORRELATION_ID, id_), MappingProxyType(headers))
         current = _CURRENT.set(info)
         calling = _CALLER.set(caller)
         try:

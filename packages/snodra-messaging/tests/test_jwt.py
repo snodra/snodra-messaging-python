@@ -7,16 +7,17 @@ See https://snodra.damoreira.com/docs/library-authors/messages/ ("Forwarded iden
 import asyncio
 import json
 import time
+from typing import Any
 
 import pytest
-from helpers import ISSUER, Jwks, b64url, jwk, sign
-from snodra import Unauthenticated
+from helpers import ISSUER, Jwks, b64url, eventually, jwk, sign
+from snodra import Unauthenticated, _jwt
 from snodra._identity import bearer_token, check_shape
 from snodra._jwt import JwksVerifier
 
 
-def _verifier(jwks: Jwks, *, fetch_timeout: float = 5.0) -> JwksVerifier:
-    return JwksVerifier(jwks.url, ISSUER, min_refresh=60.0, fetch_timeout=fetch_timeout)
+def _verifier(jwks: Jwks, *, fetch_timeout: float = 5.0, min_refresh: float = 60.0) -> JwksVerifier:
+    return JwksVerifier(jwks.url, ISSUER, min_refresh=min_refresh, fetch_timeout=fetch_timeout)
 
 
 def _segment(value: object) -> str:
@@ -77,6 +78,7 @@ async def test_the_tokens_a_verifier_refuses(jwks: Jwks) -> None:
             "unsupported token algorithm"
         ),
         sign({"alg": "RS256"}, {"iss": ISSUER, "exp": now + 60}, jwks.key): "token has no kid",
+        sign(header | {"crit": ["exp"]}, {"iss": ISSUER, "exp": now + 60}, jwks.key): "unsupported critical header",
         jwks.mint(key=jwks.other): "invalid token",
         jwks.mint()[:-4] + "AAAA": "invalid token",
         jwks.mint() + "!": "invalid token",
@@ -121,14 +123,71 @@ async def test_the_keys_are_fetched_once_and_cached(jwks: Jwks) -> None:
     await v.close()
 
 
-async def test_an_unavailable_jwks_refuses_and_a_later_token_fetches_again(jwks: Jwks) -> None:
+async def test_a_failed_first_load_is_tried_again_at_most_once_per_minimum_refresh(jwks: Jwks) -> None:
     jwks.down = True
-    v = _verifier(jwks)
+    v = _verifier(jwks, min_refresh=0.3)
     with pytest.raises(Unauthenticated, match=r"^signing keys unavailable$"):
         await v.verify(jwks.mint())
+    failed = time.monotonic()
     jwks.down = False
-    await v.verify(jwks.mint())  # the first load is tried again until it succeeds
+    with pytest.raises(Unauthenticated, match=r"^signing keys unavailable$"):
+        await v.verify(jwks.mint())  # within the minimum refresh: refused without a fetch
+    assert jwks.fetches == 1
+    while True:  # then tried again, until it succeeds
+        try:
+            await v.verify(jwks.mint())
+            break
+        except Unauthenticated:
+            assert time.monotonic() - failed < 2.0, "the keys were never fetched again"
+            await asyncio.sleep(0.02)
+    assert time.monotonic() - failed >= 0.3
     assert jwks.fetches == 2
+    await v.close()
+
+
+async def test_an_unknown_kid_right_after_the_first_load_fetches_once(jwks: Jwks) -> None:
+    v = _verifier(jwks)
+    with pytest.raises(Unauthenticated, match=r"^unknown signing key$"):
+        await v.verify(jwks.mint(kid="k-2"))
+    assert jwks.fetches == 1  # the first load counts as the refresh
+    await v.close()
+
+
+async def test_a_redirect_is_never_followed(jwks: Jwks) -> None:
+    for location in ("/elsewhere", "ftp://127.0.0.1/jwks", "https://issuer.test/jwks"):
+        jwks.redirect = location
+        v = _verifier(jwks)
+        with pytest.raises(Unauthenticated, match=r"^signing keys unavailable$"):
+            await v.verify(jwks.mint())
+        await v.close()
+    assert jwks.paths == ["/jwks"] * 3
+
+
+async def test_the_jwks_is_parsed_off_the_event_loop(jwks: Jwks, monkeypatch: pytest.MonkeyPatch) -> None:
+    on_loop: list[bool] = []
+    parse = _jwt.parse_jwks
+
+    def watched(body: bytes) -> Any:
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return parse(body)
+
+    monkeypatch.setattr(_jwt, "parse_jwks", watched)
+    v = _verifier(jwks)
+    await v.verify(jwks.mint())
+    assert on_loop == [False]
+    await v.close()
+
+
+async def test_the_fetch_timeout_bounds_the_whole_download(jwks: Jwks) -> None:
+    jwks.dribble = True  # every byte in time for a per-read timeout, the whole far beyond the fetch timeout
+    v = _verifier(jwks, fetch_timeout=0.2)
+    with pytest.raises(Unauthenticated, match=r"^signing keys unavailable$"):
+        await v.verify(jwks.mint())
+    await eventually(lambda: jwks.dribble_cut, within=1.0)  # the download itself was cut, not only the wait
     await v.close()
 
 
@@ -155,7 +214,7 @@ async def test_a_waiter_cancelled_leaves_the_fetch_to_the_others(jwks: Jwks) -> 
     v = _verifier(jwks)
     first = asyncio.create_task(v.verify(jwks.mint()))
     second = asyncio.create_task(v.verify(jwks.mint()))
-    await asyncio.sleep(0.05)  # both wait on the fetch
+    await eventually(lambda: jwks.fetches == 1)  # both wait on the fetch
     second.cancel()
     with pytest.raises(asyncio.CancelledError):
         await second
@@ -168,7 +227,7 @@ async def test_a_closed_verifier_ends_its_fetch_and_refuses(jwks: Jwks) -> None:
     jwks.delay = 1.0
     v = _verifier(jwks)
     waiting = asyncio.create_task(v.verify(jwks.mint()))
-    await asyncio.sleep(0.05)
+    await eventually(lambda: jwks.fetches == 1)
     await v.close()
     with pytest.raises(Unauthenticated, match=r"^signing keys unavailable$"):
         await waiting

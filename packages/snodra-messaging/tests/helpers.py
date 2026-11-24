@@ -169,11 +169,21 @@ class _JwksHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         jwks = self.server.jwks
+        jwks.paths.append(self.path)
         jwks.fetches += 1
         if jwks.delay > 0:
             time.sleep(jwks.delay)
         if jwks.down:
             self.send_error(503, "down")
+            return
+        if jwks.redirect is not None and self.path == "/jwks":
+            self.send_response(302)
+            self.send_header("Location", jwks.redirect)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if jwks.dribble:
+            self._dribble(jwks)
             return
         body = json.dumps({"keys": list(jwks.published)}).encode()
         self.send_response(200)
@@ -181,6 +191,23 @@ class _JwksHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _dribble(self, jwks: Jwks) -> None:
+        """Announces a large body and sends one byte of it every 20 ms, for at most 3 s; records whether the client
+        cut the connection meanwhile."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "100000")
+        self.end_headers()
+        until = time.monotonic() + 3.0
+        try:
+            while time.monotonic() < until:
+                self.wfile.write(b" ")
+                self.wfile.flush()
+                time.sleep(0.02)
+        except OSError:
+            jwks.dribble_cut = True
+        self.close_connection = True
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
@@ -203,8 +230,10 @@ class _JwksServer(http.server.ThreadingHTTPServer):
 class Jwks:
     """An issuer of the tests: its JWKS (the key ``k-1``) served by a local HTTP server in a thread, at :attr:`url`.
 
-    ``delay`` (seconds) holds every answer back; ``down`` answers 503; ``fetches`` counts the requests;
-    ``published`` is the JWKS's keys, which a test may change."""
+    ``delay`` (seconds) holds every answer back; ``down`` answers 503; ``redirect`` answers ``/jwks`` with a 302 to
+    that location; ``dribble`` sends the body one byte every 20 ms and sets ``dribble_cut`` when the client cuts the
+    connection; ``fetches`` counts the requests and ``paths`` lists their paths; ``published`` is the JWKS's keys,
+    which a test may change."""
 
     def __init__(self) -> None:
         self.key = rsa_key(0)
@@ -213,7 +242,11 @@ class Jwks:
         self.published: list[dict[str, str]] = [jwk(self.key, "k-1")]
         self.delay = 0.0
         self.down = False
+        self.redirect: str | None = None
+        self.dribble = False
+        self.dribble_cut = False
         self.fetches = 0
+        self.paths: list[str] = []
         self._server = _JwksServer(self)
         self._thread = threading.Thread(target=self._server.serve_forever, args=(0.05,), name="tests:jwks", daemon=True)
         self._thread.start()

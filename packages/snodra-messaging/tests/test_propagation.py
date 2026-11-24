@@ -74,7 +74,11 @@ async def test_a_nested_request_carries_the_handled_context(hub: FakeHub) -> Non
 async def test_the_handled_id_stands_in_for_a_missing_correlation_id(hub: FakeHub) -> None:
     _, s = await _relaying(hub)
     assert await _nested(s, "r-9", {}) == {"correlationId": "r-9", "x-tenant": "t-1"}
-    assert (await _nested(s, "r-10", {"correlationId": ""}))["correlationId"] == "r-10"
+
+
+async def test_an_empty_correlation_id_is_carried_on_as_it_is(hub: FakeHub) -> None:
+    _, s = await _relaying(hub)
+    assert (await _nested(s, "r-10", {"correlationId": ""}))["correlationId"] == ""
 
 
 async def test_outside_any_handling_the_correlation_id_is_fresh(hub: FakeHub) -> None:

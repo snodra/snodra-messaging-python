@@ -57,7 +57,8 @@ class Settings:
     jwks_url: str | None = None
     """The issuer's signing keys (``SNODRA_JWKS_URL``, ``http://`` or ``https://``): every forwarded token is verified
     against them (RS256) before a handler is looked up. Without it no token is an identity: every caller is anonymous,
-    and a handler with a guard cannot be registered."""
+    and a handler with a guard cannot be registered. The keys are fetched without following a redirect, through the
+    proxy the environment names (``https_proxy``, ``http_proxy``, ``no_proxy``)."""
     issuer: str | None = None
     """The ``iss`` a token must carry (``SNODRA_ISSUER``); required with ``jwks_url``."""
     roles_claim: str = "roles"
