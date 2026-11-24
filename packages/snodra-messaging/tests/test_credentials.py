@@ -6,7 +6,9 @@ See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Credentials").
 
 import base64
 import itertools
+import json
 import logging
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -37,8 +39,9 @@ from snodra import (
     Settings,
     Token,
     TokenFile,
+    _credentials,
 )
-from snodra._credentials import refresh_at
+from snodra._credentials import MAX_TOKEN_RESPONSE, ClientCredentialsSource, TokenError, refresh_at
 from snodra._hubpb import hub_pb2
 
 SECRET = "s3cr3t-token"
@@ -337,3 +340,127 @@ async def test_a_token_source_gives_the_jwt(hub: FakeHub) -> None:
     await s.send(forward(hub_pb2.Request(id="q-1", kind=hub_pb2.QUERY, type="orders.GetOrder", payload=b"{}")))
     assert (await next_reply(s)).request_id == "q-1"
     assert calls == 1
+
+
+async def test_a_hung_token_file_never_delays_heartbeats(
+    hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file = tmp_path / "token"
+    file.write_text("t-1\n")
+    await start_app(hub, credentials=TokenFile(str(file)))
+    s, _ = await _registered(hub, interval_ms=100)
+    release = threading.Event()
+    reads = 0
+    read = _credentials.TokenFileCredentials._read
+
+    def hung(self: _credentials.TokenFileCredentials) -> str:
+        nonlocal reads
+        reads += 1
+        release.wait(5.0)  # a mount that does not answer
+        return read(self)
+
+    monkeypatch.setattr(_credentials.TokenFileCredentials, "_read", hung)
+    try:
+        beats: list[float] = []
+        while len(beats) < 8:
+            m = await s.recv(within=1.0)
+            if m.WhichOneof("message") == "heartbeat":
+                beats.append(time.monotonic())
+        gaps = [b - a for a, b in itertools.pairwise(beats)]
+        assert max(gaps) <= 0.2, gaps
+        assert reads == 1  # one read at a time, however many ticks pass
+        file.write_text("t-2\n")
+    finally:
+        release.set()
+    assert (await s.recv_credentials(within=1.0)).token == "t-2"  # followed once the read came back
+
+
+async def test_short_lived_tokens_are_renewed_at_most_once_a_second(hub: FakeHub) -> None:
+    calls = 0
+
+    class Source:
+        async def token(self) -> AccessToken:
+            nonlocal calls
+            calls += 1
+            return AccessToken(f"own-{calls}", time.time() + 0.05)
+
+    await start_app(hub, credentials=Source())
+    s, r = await _registered(hub, interval_ms=100)
+    assert r.credentials.jwt == "own-1"
+    sent: list[float] = []
+    started = time.monotonic()
+    deadline = started + 1.6
+    while (left := deadline - time.monotonic()) > 0:
+        try:
+            m = await s.recv(within=left)
+        except AssertionError as e:
+            if "no frame" not in str(e):
+                raise
+            break
+        if m.WhichOneof("message") == "credentials":
+            sent.append(time.monotonic() - started)
+    assert 1 <= len(sent) <= 2, sent  # not one every 25 ms
+    assert calls <= 3, calls
+
+
+async def test_each_renewal_goes_to_every_stream(hub: FakeHub, hub2: FakeHub, token_endpoint: TokenEndpoint) -> None:
+    token_endpoint.default = TokenAnswer(expires_in=2)  # renewed every second
+    await start_app([hub, hub2], credentials=_client(token_endpoint))
+    s1, r1 = await _registered(hub, interval_ms=200)
+    s2, r2 = await _registered(hub2, interval_ms=200)
+    assert (r1.credentials.jwt, r2.credentials.jwt) == ("jwt-1", "jwt-1")  # one token for both hubs
+    assert (await s1.recv_credentials(within=3.0)).jwt == "jwt-2"
+    assert (await s2.recv_credentials(within=3.0)).jwt == "jwt-2"
+
+
+async def test_the_token_endpoints_answers(token_endpoint: TokenEndpoint) -> None:
+    source = ClientCredentialsSource(_client(token_endpoint), timeout=2.0)
+
+    async def answered(body: object, status: int = 200) -> AccessToken:
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        token_endpoint.script = [TokenAnswer(status=status, body=raw)]
+        return await source.token()
+
+    async def refused(body: object, status: int = 200) -> str:
+        with pytest.raises(TokenError) as e:
+            await answered(body, status)
+        assert token_endpoint.url not in str(e.value)  # the host only
+        return str(e.value)
+
+    token = await answered({"access_token": "a-1", "token_type": "bearer", "expires_in": 30.7})
+    assert token.value == "a-1"
+    assert token.expires_at is not None
+    within(token.expires_at - time.time(), 29.0, 30.1)  # whole seconds
+    assert (await answered({"access_token": "a-2"})).expires_at is None  # no expiry named
+    for expires_in in ("60", True, 0, -5):
+        assert "expires_in" in await refused({"access_token": "a", "expires_in": expires_in}), expires_in
+    assert "not Bearer" in await refused({"access_token": "a", "token_type": "mac"})
+    assert "without an access_token" in await refused({"token_type": "Bearer"})
+    assert "not a JSON object" in await refused(b"[1]")
+    assert "HTTP 201" in await refused({"access_token": "a"}, status=201)
+    assert "HTTP 302" in await refused(b"", status=302)
+    assert f"more than {MAX_TOKEN_RESPONSE} bytes" in await refused(b"x" * (MAX_TOKEN_RESPONSE + 1))
+    echoed = await refused({"error": "invalid_client", "error_description": "secret p@ss w:rd refused"}, status=401)
+    assert "invalid_client" in echoed
+    assert "p@ss w:rd" not in echoed
+    assert "***" in echoed
+    assert "\n" not in await refused({"error": "bad\nline"}, status=400)
+
+
+async def test_a_token_url_or_jwks_url_with_userinfo_is_refused() -> None:
+    for url in ("https://id:pw@idp.test/token", "https://id@idp.test/token"):
+        with pytest.raises(ConfigurationError, match="user") as e:
+            Settings(service="orders-service", credentials=ClientCredentials(url, "c", "s"))
+        assert "pw" not in str(e.value)
+    with pytest.raises(ConfigurationError, match="user") as e:
+        Settings(service="orders-service", jwks_url="https://id:pw@idp.test/jwks", issuer="https://idp.test")
+    assert "pw" not in str(e.value)
+
+
+async def test_a_plain_http_token_url_warns(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING)
+    Settings(service="orders-service", credentials=ClientCredentials("http://idp.test/token", "c", "s"))
+    assert any("http://" in r.getMessage() and "secret" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    Settings(service="orders-service", credentials=ClientCredentials("https://idp.test/token", "c", "s"))
+    assert not caplog.records

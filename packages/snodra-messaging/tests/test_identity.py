@@ -5,6 +5,7 @@ See https://snodra.damoreira.com/docs/library-authors/messages/ ("Forwarded iden
 """
 
 import asyncio
+import functools
 import itertools
 import json
 import socket
@@ -188,9 +189,24 @@ def test_a_caller_rule_is_a_plain_function() -> None:
         async def __call__(self, c: Caller) -> bool:
             return True
 
-    for r in (rule, AsyncRule()):
+    async def rule_of(name: str, c: Caller) -> bool:
+        return c.subject == name
+
+    for r in (rule, AsyncRule(), functools.partial(rule_of, "u-1")):
         with pytest.raises(TypeError, match="async"):
             caller_matches(r)  # type: ignore[arg-type]
+
+
+def test_a_caller_rule_that_returns_an_awaitable_refuses_the_caller() -> None:
+    async def later(c: Caller) -> bool:
+        return True
+
+    def sneaky(c: Caller) -> Any:
+        return later(c)  # a plain function handing back a coroutine
+
+    guard = caller_matches(sneaky)
+    with pytest.raises(TypeError, match="awaitable"):
+        guard.allows(Caller("u-1", ("orders-user",), {}))
 
 
 async def test_the_guard_order(hub: FakeHub, jwks: Jwks) -> None:

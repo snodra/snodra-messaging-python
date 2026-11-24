@@ -302,13 +302,14 @@ async def jwks() -> AsyncIterator[Jwks]:
 class TokenAnswer:
     """One answer of :class:`TokenEndpoint`: after ``delay`` seconds, ``status``; a 200 carries ``access_token``
     (``token``, or the next ``jwt-<n>`` when None) and ``expires_in`` (left out when None); another status carries the
-    OAuth2 ``error`` when one is given."""
+    OAuth2 ``error`` when one is given. ``body``, when set, is the whole body instead."""
 
     status: int = 200
     token: str | None = None
     expires_in: float | None = 60
     error: str | None = None
     delay: float = 0.0
+    body: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -346,7 +347,7 @@ class _TokenHandler(http.server.BaseHTTPRequestHandler):
                 doc["expires_in"] = answer.expires_in
         elif answer.error is not None:
             doc = {"error": answer.error, "error_description": "refused by the test"}
-        out = json.dumps(doc).encode()
+        out = json.dumps(doc).encode() if answer.body is None else answer.body
         self.send_response(answer.status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))

@@ -457,3 +457,56 @@ async def test_a_refusal_is_honoured_whatever_write_is_in_flight(hub: FakeHub) -
             for t in flood:
                 t.cancel()
             await asyncio.gather(*flood, return_exceptions=True)
+
+
+def _rolling(timings: object) -> tuple[_connection.HubConnection, _Stream]:
+    """A connection whose registered stream no hub serves: its heartbeats are never echoed and it never ends."""
+    conn = _connection.HubConnection(
+        "127.0.0.1:1",
+        hub_pb2.Register(service_name="orders-service", instance_id="i-1", initial_permits=1),
+        backoff=(0.05, 0.2),
+        timings=timings,  # type: ignore[arg-type]
+        on_change=lambda: None,
+        on_rejection=lambda r: None,
+    )
+    stream = _Stream(hub_pb2.Register(service_name="orders-service", instance_id="i-1", initial_permits=1), 0.1)
+    stream.on_ack(hub_pb2.RegisterAck(hub_id="hub-1"), 0.0)
+    conn._stream = stream
+    return conn, stream
+
+
+async def test_a_roll_whose_stream_outlives_the_cut_goes_on_to_the_reconnect_wait(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(_connection, "CLEAN_UP_BOUND", 0.05)
+    caplog.set_level(logging.WARNING)
+    t = replace(SCALED, roll_idle_limit=0.05, close_wait=0.05, roll_reconnect_limit=0.1)
+    conn, stream = _rolling(t)
+    rolled = await asyncio.wait_for(conn.roll_over(lambda s: True), 2.0)
+    assert rolled is False  # no new stream within the reconnect limit: never a TimeoutError
+    assert stream.cut.is_set()
+    assert not conn.rolling
+    messages = [r.getMessage() for r in caplog.records]
+    # The echo of the empty Register's heartbeat never came: the warning says so, not "requests in flight".
+    assert any("no echo" in m and "127.0.0.1:1" in m for m in messages), messages
+    assert not any("Requests still in flight" in m for m in messages), messages
+
+
+async def test_a_roll_names_the_requests_still_in_flight(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(_connection, "CLEAN_UP_BOUND", 0.05)
+    caplog.set_level(logging.WARNING)
+    t = replace(SCALED, roll_idle_limit=0.1, close_wait=0.05, roll_reconnect_limit=0.05)
+    conn, stream = _rolling(t)
+
+    async def echo() -> None:  # the hub echoes the empty Register's heartbeat
+        await eventually(lambda: stream._probes != [])
+        stream.on_echo(0.0, max(ms for ms, _ in stream._probes))
+
+    echoing = asyncio.create_task(echo())
+    assert await asyncio.wait_for(conn.roll_over(lambda s: False), 2.0) is False
+    await echoing
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Requests still in flight" in m for m in messages), messages
+    assert not any("no echo" in m for m in messages), messages
