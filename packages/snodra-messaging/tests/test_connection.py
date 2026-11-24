@@ -436,7 +436,7 @@ async def test_a_refusal_is_honoured_whatever_write_is_in_flight(hub: FakeHub) -
     # must not turn the hub's status into a transport error (grpc.aio's own write does that).
     app = await start_app(hub, reconnect_backoff=(0.05, 0.4))
     s = await hub.next_stream()
-    for refusal in range(1, 6):
+    for refusal in range(1, 13):
         await s.recv_register()
         await s.ack(ack("hub-1"))
         await eventually(lambda: app.hub_ids() == ["hub-1"])

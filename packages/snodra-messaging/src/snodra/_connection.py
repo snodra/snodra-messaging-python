@@ -13,9 +13,9 @@ import asyncio
 import logging
 import random
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Coroutine
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import grpc
 import grpc.aio
@@ -137,6 +137,8 @@ class _Stream:
         """The requests queued on the stream whose callers wait for their answer, by id."""
         self.buffered = 0
         """The requests in the outbound buffer, not yet taken by the writer."""
+        self.status: _End | None = None
+        """The status that ended the call, as it first landed (see :meth:`HubConnection._keep_status`)."""
         self.why = "hub connection stopped"
         """Why the stream ended (set when it ends): what a request written to it fails with."""
         self._room: list[asyncio.Future[None]] = []
@@ -480,6 +482,7 @@ class HubConnection:
         tasks: list[asyncio.Task[Any]] = []
         try:
             call: _Call = hub_pb2_grpc.HubStub(channel).Connect()  # type: ignore[no-untyped-call]
+            call.add_done_callback(lambda c: self._keep_status(c, stream))
             self._stream = stream
             stream.write_register(empty=False)  # the Register is the first frame of every stream
             writer = asyncio.create_task(self._write(call, stream), name=f"snodra:writer:{self.address}")
@@ -526,7 +529,7 @@ class HubConnection:
                     if not stream.took(m):
                         continue  # its caller gave up while it was buffered
                     m = m.message
-                await send_frame(call, m)
+                await call.write(m)
         except Exception as e:  # the call ended: the reader reports why
             log.debug("Hub stream to %s: a write failed: %r", self.address, e)
 
@@ -537,7 +540,7 @@ class HubConnection:
                 m = await call.read()
                 if m is grpc.aio.EOF:
                     code = await call.code()
-                    return _End(code, await call.details() or "the hub closed the stream")
+                    return stream.status or _End(code, await call.details() or "the hub closed the stream")
                 assert isinstance(m, hub_pb2.ServerMessage)
                 match m.WhichOneof("message"):
                     case "register_ack":
@@ -561,7 +564,27 @@ class HubConnection:
                     case "reply" | "error" if self._on_answer is not None:
                         self._hand_over(self._on_answer, stream, m)
         except grpc.aio.AioRpcError as e:
-            return _End(e.code(), e.details() or "")
+            return stream.status or _End(e.code(), e.details() or "")
+
+    @staticmethod
+    def _keep_status(call: grpc.aio.Call, stream: _Stream) -> None:
+        """Keeps the status that ended the call as it first landed, which the reader then reports.
+
+        The reader cannot always read the hub's status from the call: when a write meets a stream the hub has just
+        closed, grpc.aio's ``call.write`` fails the call with ``INTERNAL`` "Internal error from Core", and that replaces
+        the hub's status, a refusal included, before the reader asks. This relies on two behaviours of grpc.aio that its
+        documentation does not state: a done callback runs as soon as the call's first final status lands (the hub's,
+        before a later write replaces it), and ``code()`` / ``details()`` of a call that is done return without
+        suspending. When either does not hold, nothing is kept and the reader reports what the call says, as it would
+        without this."""
+        if stream.status is not None:
+            return
+        try:
+            code = _completed(call.code())
+            details = _completed(call.details())
+        except Exception:
+            return
+        stream.status = _End(code, details or "the hub closed the stream")
 
     def _hand_over(self, to: Callable[[_Stream, Any], None], stream: _Stream, frame: Any) -> None:
         """A frame for the dispatcher; a failure there is logged, never the end of the read loop."""
@@ -612,37 +635,19 @@ class HubConnection:
             stream.heartbeat()
 
 
-class StreamEnded(Exception):
-    """A frame could not be written: the stream ended. Its status is the reader's to report."""
-
-
-async def send_frame(call: _Call, m: hub_pb2.ClientMessage) -> None:
-    """Writes one frame on the stream; :class:`StreamEnded` when the stream can take no more.
-
-    ``call.write`` is not used: when its send fails because the hub has just closed the stream, grpc.aio marks the
-    call as failed with ``INTERNAL`` "Internal error from Core" (``set_internal_error`` in ``grpc.aio._call``), and
-    that replaces the status the hub sent, a refusal included, before the reader reads it. Here a failed send leaves
-    the call alone, so the reader reports the hub's own status, read from the receive side. A grpc.aio without the
-    parts used here gets ``call.write``."""
-    raw = getattr(call, "_cython_call", None)
-    metadata_sent = getattr(call, "_metadata_sent", None)
-    if raw is None or not isinstance(metadata_sent, asyncio.Event):
-        await call.write(m)
-        return
-    if call.done():
-        raise StreamEnded("the stream has ended")
-    if not metadata_sent.is_set():
-        await metadata_sent.wait()
-        if call.done():
-            raise StreamEnded("the stream has ended")
+def _completed[T](awaitable: Coroutine[Any, Any, T]) -> T:
+    """The value of a coroutine that finishes without suspending; :class:`_Suspended` (the coroutine closed) when it
+    would suspend."""
     try:
-        await raw.send_serialized_message(m.SerializeToString())
-    except asyncio.CancelledError:
-        if not call.cancelled():
-            call.cancel()
-        raise
-    except Exception as e:  # the send met the end of the stream
-        raise StreamEnded(f"a write failed: {e}") from None
+        awaitable.send(None)
+    except StopIteration as done:
+        return cast("T", done.value)
+    awaitable.close()
+    raise _Suspended
+
+
+class _Suspended(Exception):
+    """A coroutine that was to finish at once would suspend."""
 
 
 async def settle(
