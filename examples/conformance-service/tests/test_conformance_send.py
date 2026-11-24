@@ -158,7 +158,7 @@ async def test_a_unary_send_reports_the_decoded_reply(service: _Service) -> None
         hub_pb2.COMMAND,
         "k-1",
         1500,
-        {"x-probe": "p-1"},
+        {"x-probe": "p-1", "correlationId": ask},  # the handled request's id stands in for its correlation id
     )
     assert json.loads(probe.payload) == {"x": 1}
     await s.send(_reply(probe.id, {"ok": True}))

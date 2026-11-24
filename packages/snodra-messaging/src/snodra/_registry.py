@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from snodra._errors import RegistrationClosed
+from snodra._identity import Guard
 from snodra._messages import type_name
 
 Kind = Literal["command", "query"]
@@ -34,6 +35,8 @@ class Handler:
     kind: Kind
     label: str
     """How logs and errors name it: the function's qualified name, without ``<locals>``."""
+    guard: Guard | None = None
+    """Who may call it; None: anyone, an anonymous caller too."""
 
 
 def label_of(fn: object) -> str:
@@ -53,9 +56,10 @@ class Registry:
         """No handler is registered from now on."""
         self._closed = True
 
-    def add(self, kind: Kind, fn: object) -> Handler:
-        """Registers fn as the kind's handler of the type its first parameter is annotated with. Raises
-        :class:`RegistrationClosed` once closed and ``TypeError`` for what cannot be served, naming the handler."""
+    def add(self, kind: Kind, fn: object, guard: Guard | None = None) -> Handler:
+        """Registers fn as the kind's handler of the type its first parameter is annotated with, for the callers
+        guard lets through. Raises :class:`RegistrationClosed` once closed and ``TypeError`` for what cannot be served,
+        naming the handler."""
         label = label_of(fn)
         if self._closed:
             raise RegistrationClosed(f"handler {label}: handlers are registered before the app starts")
@@ -71,7 +75,7 @@ class Registry:
             )
         if (taken := self._handlers[kind].get(name)) is not None:
             raise TypeError(f"handler {label}: type {name} already has the {kind} handler {taken.label}")
-        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label)
+        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard)
         self._handlers[kind][name] = handler
         return handler
 

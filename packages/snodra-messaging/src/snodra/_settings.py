@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 from snodra._errors import ConfigurationError
 from snodra._ids import new_id
@@ -53,6 +54,21 @@ class Settings:
     None: no retry."""
     priorities: Mapping[str, int] = field(default_factory=dict)
     """``Request.priority`` per type, for a call that chose none (``SNODRA_SERVER_PRIORITIES``, ``type=n,type=n``)."""
+    jwks_url: str | None = None
+    """The issuer's signing keys (``SNODRA_JWKS_URL``, ``http://`` or ``https://``): every forwarded token is verified
+    against them (RS256) before a handler is looked up. Without it no token is an identity: every caller is anonymous,
+    and a handler with a guard cannot be registered."""
+    issuer: str | None = None
+    """The ``iss`` a token must carry (``SNODRA_ISSUER``); required with ``jwks_url``."""
+    roles_claim: str = "roles"
+    """Where a token's roles are (``SNODRA_SECURITY_ROLES_CLAIM``): a dotted path to a list of texts
+    (``realm_access.roles``), or ``scope`` for the space-separated scopes; blank is ``roles``."""
+    forward_jwt: bool = True
+    """A request sent while one is handled carries the handled request's ``authorization`` on
+    (``SNODRA_FORWARD_JWT``)."""
+    always_route_through_hub: bool = False
+    """Every command and query goes through a hub, also one of a type this instance handles
+    (``SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB``); by default those are answered in-process."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.service, str) or not self.service.strip():
@@ -98,6 +114,38 @@ class Settings:
                     f"priorities (SNODRA_SERVER_PRIORITIES): {k!r}={n!r} is not a type name and a 32-bit integer"
                 )
         object.__setattr__(self, "priorities", MappingProxyType(dict(self.priorities)))
+        self._check_identity()
+        for name, variable in (
+            ("forward_jwt", "SNODRA_FORWARD_JWT"),
+            ("always_route_through_hub", "SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB"),
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ConfigurationError(f"{name} ({variable}) must be True or False, got {getattr(self, name)!r}")
+
+    def _check_identity(self) -> None:
+        url, issuer = self.jwks_url, self.issuer
+        if url is not None:
+            if not isinstance(url, str) or not url.strip():
+                raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be a URL or None, got {url!r}")
+            url = url.strip()
+            parts = urlsplit(url)
+            if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+                raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be an http:// or https:// URL, got {url!r}")
+            object.__setattr__(self, "jwks_url", url)
+            if not isinstance(issuer, str) or not issuer.strip():
+                raise ConfigurationError(
+                    "the issuer (issuer, SNODRA_ISSUER) is required with jwks_url (SNODRA_JWKS_URL): tokens of other "
+                    f"issuers are refused, got {issuer!r}"
+                )
+        if issuer is not None:
+            if not isinstance(issuer, str):
+                raise ConfigurationError(f"issuer (SNODRA_ISSUER) must be a text or None, got {issuer!r}")
+            object.__setattr__(self, "issuer", issuer.strip() or None)
+        if not isinstance(self.roles_claim, str):
+            raise ConfigurationError(
+                f"roles_claim (SNODRA_SECURITY_ROLES_CLAIM) must be a claim path or scope, got {self.roles_claim!r}"
+            )
+        object.__setattr__(self, "roles_claim", self.roles_claim.strip() or "roles")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> Settings:
@@ -138,6 +186,16 @@ class Settings:
             values["default_retry"] = retry
         if (v := get("SNODRA_SERVER_PRIORITIES")) is not None:
             values["priorities"] = _env_priorities("SNODRA_SERVER_PRIORITIES", v)
+        if (v := get("SNODRA_JWKS_URL")) is not None:
+            values["jwks_url"] = v
+        if (v := get("SNODRA_ISSUER")) is not None:
+            values["issuer"] = v
+        if (v := get("SNODRA_SECURITY_ROLES_CLAIM")) is not None:
+            values["roles_claim"] = v
+        if (v := get("SNODRA_FORWARD_JWT")) is not None:
+            values["forward_jwt"] = _env_bool("SNODRA_FORWARD_JWT", v)
+        if (v := get("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB")) is not None:
+            values["always_route_through_hub"] = _env_bool("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB", v)
         values |= overrides
         if "service" not in values:
             raise ConfigurationError("the service name (service, SNODRA_SERVICE_NAME) is required")
@@ -211,6 +269,12 @@ def _env_int(name: str, value: str) -> int:
     return int(value)
 
 
+def _env_bool(name: str, value: str) -> bool:
+    if value.lower() not in _TRUE | _FALSE:
+        raise ConfigurationError(f"{name} must be true or false, got {value!r}")
+    return value.lower() in _TRUE
+
+
 def _env_pairs(name: str, value: str) -> dict[str, str]:
     pairs: dict[str, str] = {}
     for entry in value.split(","):
@@ -228,11 +292,7 @@ def _env_retry(get: Callable[[str], str | None]) -> RetryPolicy | None:
     """The policy of ``SNODRA_SERVER_RETRY_*``, None unless ``SNODRA_SERVER_RETRY_ENABLED`` is true; every variable
     is checked even while retry is off."""
     enabled = get("SNODRA_SERVER_RETRY_ENABLED")
-    on = False
-    if enabled is not None:
-        if enabled.lower() not in _TRUE | _FALSE:
-            raise ConfigurationError(f"SNODRA_SERVER_RETRY_ENABLED must be true or false, got {enabled!r}")
-        on = enabled.lower() in _TRUE
+    on = enabled is not None and _env_bool("SNODRA_SERVER_RETRY_ENABLED", enabled)
     fields: dict[str, Any] = {}
     if (v := get("SNODRA_SERVER_RETRY_MAX_ATTEMPTS")) is not None:
         fields["max_attempts"] = _env_int("SNODRA_SERVER_RETRY_MAX_ATTEMPTS", v)

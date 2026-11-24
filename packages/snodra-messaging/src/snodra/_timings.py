@@ -45,6 +45,12 @@ class Timings:
     """Requests waiting in a stream's outbound buffer at most; a call beyond waits for room."""
     max_unwritten_moves: int
     """How often a request lost in a stream's buffer moves to another stream before it fails as never sent."""
+    jwks_min_refresh: float
+    """A token whose key id the cached JWKS does not know fetches the JWKS again at most once per this."""
+    jwks_fetch_timeout: float
+    """The longest a JWKS fetch takes."""
+    jwt_leeway: float
+    """The clock skew a token's ``exp`` and ``nbf`` are allowed."""
 
 
 DEFAULT_TIMINGS: Final = Timings(
@@ -65,5 +71,8 @@ DEFAULT_TIMINGS: Final = Timings(
     retry_min_remaining=0.25,
     outbound_limit=256,
     max_unwritten_moves=8,
+    jwks_min_refresh=60.0,
+    jwks_fetch_timeout=5.0,
+    jwt_leeway=60.0,
 )
 """The shipped timings."""

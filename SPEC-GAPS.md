@@ -29,6 +29,14 @@ library does there. Where an entry is settled, its behaviour is this library's r
   `[]`; any other exception answers `HANDLER_ERROR` `<ClassName>: <message>`. Every line break in a message becomes
   one space (the conformance contract's rule for `L1-HANDLER-ERRORS`); details are set only with `HANDLER_ERROR`; a
   failure of a call the handler made is its own `HANDLER_ERROR`.
+  A guarded handler (`snodra/_dispatch.py`, `Dispatcher.answer_checked`) refuses an anonymous caller with
+  `UNAUTHENTICATED` `handler <name> requires authentication`, a caller its rule refuses with `PERMISSION_DENIED`
+  `handler <name>: access denied`, and a caller whose rule raised with `PERMISSION_DENIED`
+  `handler <name>: access denied (<ClassName>)`, `<name>` being the handler function's qualified name. A forwarded
+  token the JWKS verifier refuses is answered `UNAUTHENTICATED` with one of the verifier's short reasons
+  (`snodra/_jwt.py`): `unreadable token`, `unsupported token algorithm`, `token has no kid`, `signing keys
+  unavailable`, `unknown signing key`, `unusable signing key`, `invalid token`, `token has no expiry`,
+  `token expired`, `token not valid yet`, `token issuer not accepted`.
 - **Question:** settled.
 
 ### SG-2: the forms of a hub address

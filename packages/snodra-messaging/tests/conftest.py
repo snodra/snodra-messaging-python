@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from fakehub import FakeHub
+from helpers import jwks as jwks
 from helpers import stop_apps
 
 

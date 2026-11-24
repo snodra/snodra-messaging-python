@@ -12,9 +12,10 @@ from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 from snodra._codec import Codec
-from snodra._context import _CURRENT, MessageInfo
-from snodra._errors import DecodeError, ErrorCode, error_to_wire
+from snodra._context import _CALLER, _CURRENT, MessageInfo
+from snodra._errors import DecodeError, ErrorCode, Unauthenticated, error_to_wire
 from snodra._hubpb import hub_pb2
+from snodra._identity import AUTHORIZATION, Caller, IdentityResolver
 from snodra._permits import PermitLedger
 from snodra._registry import Handler, Kind, Registry
 from snodra._timings import Timings
@@ -73,9 +74,17 @@ class Dispatcher:
     """Serves the requests of every hub stream of an app: each one in a task of its own, ``snodra:handler:<id>``,
     at most ``max_concurrent`` at once over every hub (a request beyond waits for a local permit)."""
 
-    def __init__(self, registry: Registry, codec: Codec, max_concurrent: int, timings: Timings) -> None:
+    def __init__(
+        self,
+        registry: Registry,
+        codec: Codec,
+        max_concurrent: int,
+        timings: Timings,
+        identity: IdentityResolver | None = None,
+    ) -> None:
         self._registry = registry
         self._codec = codec
+        self._identity = IdentityResolver(None, "roles") if identity is None else identity
         self._max_concurrent = max_concurrent
         self._slots: asyncio.Semaphore | None = None
         self._timings = timings
@@ -168,7 +177,15 @@ class Dispatcher:
     async def _answer(self, request: hub_pb2.Request) -> hub_pb2.Reply:
         """The one ``Reply`` to a unary request; every outcome is a message."""
         id_ = request.id
-        # The caller's identity: the forwarded token is checked here, before the handler lookup.
+        # The caller's identity: the forwarded token is checked first, before the handler lookup.
+        try:
+            caller = await self._identity.resolve(request.headers.get(AUTHORIZATION))
+        except Unauthenticated as e:
+            log.debug("Refused %s request %s: %s", request.type, id_, e)
+            return _error_reply(id_, ErrorCode.UNAUTHENTICATED, str(e))
+        except Exception:  # a bug of the check is the caller's refusal, never an unanswered request
+            log.warning("Checking the token of %s request %s failed", request.type, id_, exc_info=True)
+            return _error_reply(id_, ErrorCode.UNAUTHENTICATED, "invalid token")
         if request.kind == hub_pb2.COMMAND:
             kind: Kind = "command"
         elif request.kind == hub_pb2.QUERY:
@@ -178,7 +195,19 @@ class Dispatcher:
         handler = self._registry.find(kind, request.type)
         if handler is None:
             return _error_reply(id_, ErrorCode.NO_HANDLER, f"no handler for type {request.type}")
-        # A guarded handler refuses an anonymous caller here, before the payload is decoded.
+        return await self.answer_checked(handler, request, caller)
+
+    async def answer_checked(self, handler: Handler, request: hub_pb2.Request, caller: Caller | None) -> hub_pb2.Reply:
+        """The ``Reply`` of handler to request from caller, once its checks pass: a guarded handler refuses an
+        anonymous caller before the payload is decoded, then the payload is decoded, then the guard's rule applies.
+        The handler runs in the calling task, with ``current_message()`` and ``current_caller()`` set for it only.
+        Every outcome is a message; a cancellation of the calling task is raised."""
+        id_ = request.id
+        guard = handler.guard
+        if guard is not None and caller is None:
+            # Before decoding, so that an anonymous caller cannot probe the payload shapes of a guarded handler.
+            # TODO(spec-gap): SG-1
+            return _error_reply(id_, ErrorCode.UNAUTHENTICATED, f"handler {handler.label} requires authentication")
         try:
             message: object = self._codec.decode(request.payload, handler.message)
         except DecodeError as e:
@@ -186,27 +215,42 @@ class Dispatcher:
         except Exception as e:  # a codec's bug is the handler's failure, never the stream's
             log.warning("Decoding %s request %s failed", request.type, id_, exc_info=True)
             return hub_pb2.Reply(request_id=id_, error=error_to_wire(id_, e, self._codec))
-        # The handler's rule on the caller (a role, a given caller) applies here, after decoding.
-        return await self._call(handler, request, message)
+        if guard is not None and caller is not None:
+            # The rule on the caller (a role, a given caller) applies once the payload decoded.
+            try:
+                allowed = guard.allows(caller)
+            except Exception as e:
+                log.warning("The guard of %s refused a caller by raising", handler.label, exc_info=True)
+                denied = f"handler {handler.label}: access denied ({type(e).__name__})"
+                return _error_reply(id_, ErrorCode.PERMISSION_DENIED, denied)
+            if not allowed:
+                return _error_reply(id_, ErrorCode.PERMISSION_DENIED, f"handler {handler.label}: access denied")
+        return await self._call(handler, request, message, caller)
 
-    async def _call(self, handler: Handler, request: hub_pb2.Request, message: object) -> hub_pb2.Reply:
+    async def _call(
+        self, handler: Handler, request: hub_pb2.Request, message: object, caller: Caller | None
+    ) -> hub_pb2.Reply:
         id_ = request.id
         headers = dict(request.headers)
-        _CURRENT.set(
-            MessageInfo(id_, request.type, headers.get(CORRELATION_ID, id_), MappingProxyType(headers))
-        )  # the task's own context: set for this request only
+        # Set for this request only, and restored after it: an in-process call runs in its caller's task.
+        info = MessageInfo(id_, request.type, headers.get(CORRELATION_ID) or id_, MappingProxyType(headers))
+        current = _CURRENT.set(info)
+        calling = _CALLER.set(caller)
         try:
             result: Any = await handler.fn(message)
             payload = self._codec.encode(result)
         except asyncio.CancelledError as e:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
-                raise  # this request was cancelled (the hub, the shutdown): never answered
+                raise  # this request was cancelled (the hub, the shutdown, an in-process caller): never answered
             # A CancelledError the handler got from something it awaited, not a cancellation of its own task: a
             # failure like any other.
             return self._failed(handler, request, e)
         except Exception as e:
             return self._failed(handler, request, e)
+        finally:
+            _CALLER.reset(calling)
+            _CURRENT.reset(current)
         return hub_pb2.Reply(request_id=id_, payload=payload)
 
     def _failed(self, handler: Handler, request: hub_pb2.Request, e: BaseException) -> hub_pb2.Reply:

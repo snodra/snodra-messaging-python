@@ -216,3 +216,90 @@ def test_the_sending_settings_from_env_refuse_bad_values(variable: str, value: s
     # A retry variable is checked even while retry is off.
     with pytest.raises(ConfigurationError, match=variable):
         Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service", variable: value})
+
+
+def test_the_identity_and_routing_settings() -> None:
+    s = Settings(service="orders-service")
+    assert (s.jwks_url, s.issuer, s.roles_claim, s.forward_jwt, s.always_route_through_hub) == (
+        None,
+        None,
+        "roles",
+        True,
+        False,
+    )
+    s = Settings(
+        service="orders-service",
+        jwks_url="https://issuer.test/jwks",
+        issuer="https://issuer.test",
+        roles_claim=" realm_access.roles ",
+        forward_jwt=False,
+        always_route_through_hub=True,
+    )
+    assert (s.jwks_url, s.issuer, s.roles_claim, s.forward_jwt, s.always_route_through_hub) == (
+        "https://issuer.test/jwks",
+        "https://issuer.test",
+        "realm_access.roles",
+        False,
+        True,
+    )
+    assert Settings(service="orders-service", roles_claim="  ").roles_claim == "roles"
+    _refused("SNODRA_ISSUER", jwks_url="https://issuer.test/jwks")
+    _refused("SNODRA_ISSUER", jwks_url="https://issuer.test/jwks", issuer=" ")
+    _refused("SNODRA_JWKS_URL", jwks_url=" ", issuer="https://issuer.test")
+    _refused("SNODRA_JWKS_URL", jwks_url="file:///etc/jwks.json", issuer="https://issuer.test")
+    _refused("SNODRA_JWKS_URL", jwks_url="issuer.test/jwks", issuer="https://issuer.test")
+    _refused("SNODRA_SECURITY_ROLES_CLAIM", roles_claim=None)
+    _refused("SNODRA_FORWARD_JWT", forward_jwt="yes")
+    _refused("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB", always_route_through_hub=1)
+
+
+def test_the_identity_and_routing_settings_from_env() -> None:
+    base = {"SNODRA_SERVICE_NAME": "orders-service"}
+    s = Settings.from_env(
+        base
+        | {
+            "SNODRA_JWKS_URL": " http://127.0.0.1:9000/jwks ",
+            "SNODRA_ISSUER": "http://127.0.0.1:9000/issuer",
+            "SNODRA_SECURITY_ROLES_CLAIM": "scope",
+            "SNODRA_FORWARD_JWT": "false",
+            "SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB": "TRUE",
+        }
+    )
+    assert (s.jwks_url, s.issuer, s.roles_claim, s.forward_jwt, s.always_route_through_hub) == (
+        "http://127.0.0.1:9000/jwks",
+        "http://127.0.0.1:9000/issuer",
+        "scope",
+        False,
+        True,
+    )
+    blank = {
+        n: " "
+        for n in (
+            "SNODRA_JWKS_URL",
+            "SNODRA_ISSUER",
+            "SNODRA_SECURITY_ROLES_CLAIM",
+            "SNODRA_FORWARD_JWT",
+            "SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB",
+        )
+    }
+    s = Settings.from_env(base | blank)
+    assert (s.jwks_url, s.issuer, s.roles_claim, s.forward_jwt, s.always_route_through_hub) == (
+        None,
+        None,
+        "roles",
+        True,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("env", "variable"),
+    [
+        ({"SNODRA_JWKS_URL": "http://127.0.0.1:9000/jwks"}, "SNODRA_ISSUER"),
+        ({"SNODRA_FORWARD_JWT": "maybe"}, "SNODRA_FORWARD_JWT"),
+        ({"SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB": "2"}, "SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB"),
+    ],
+)
+def test_the_identity_settings_from_env_refuse_bad_values(env: dict[str, str], variable: str) -> None:
+    with pytest.raises(ConfigurationError, match=variable):
+        Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service"} | env)

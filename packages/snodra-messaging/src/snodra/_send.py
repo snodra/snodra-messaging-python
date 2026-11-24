@@ -18,8 +18,10 @@ from snodra._connection import HubConnection, Lost, OutboundRequest, _Stream
 from snodra._errors import ErrorCode, HubError, NeverSent, OutcomeUnknown, SnodraError, error_from_wire
 from snodra._hubpb import hub_pb2
 from snodra._ids import new_id
+from snodra._local import LocalCalls
 from snodra._messages import type_name
 from snodra._pool import Pool
+from snodra._propagation import outgoing_headers
 from snodra._retry import RetryPolicy, retryable
 from snodra._settings import Settings
 from snodra._timings import DEFAULT_TIMINGS, Timings
@@ -106,6 +108,8 @@ class Sender:
         """The hubs; set by the app once built (they deliver the answers to :meth:`on_answer`)."""
         self.pending: dict[str, OutboundRequest] = {}
         """The requests waiting for their answer, by id."""
+        self.local: LocalCalls | None = None
+        """Answers the calls of the instance's own types in-process; set by the app."""
 
     def on_answer(self, stream: _Stream, m: hub_pb2.ServerMessage) -> None:
         """A ``Reply`` or an ``Error`` from a hub (called by the stream's reader): it answers the request of that id
@@ -130,8 +134,11 @@ class Sender:
         retry: RetryPolicy | Literal[False] | None,
     ) -> object:
         """One call: the request built, sent (retried by the policy), its answer decoded as ``result`` (None: the
-        answer is not read)."""
+        answer is not read). A call of a type this instance handles is answered in-process (see :mod:`snodra._local`):
+        its options are checked, and its timeout, retry, routing key and priority do not apply."""
         type_ = type_name(message)
+        # The own headers are checked before anything else is built: a reserved name sends nothing.
+        request_headers = outgoing_headers(headers, forward_jwt=self._settings.forward_jwt)
         chosen = self._chosen(timeout)
         policy = self._policy(retry)
         if priority is not None and (
@@ -140,12 +147,15 @@ class Sender:
             raise ValueError(f"the priority of {type_} must be a 32-bit integer, got {priority!r}")
         if routing_key is not None and not isinstance(routing_key, str):
             raise TypeError(f"the routing key of {type_} must be a text, got {routing_key!r}")
+        payload = self._codec.encode(message)
+        if self.local is not None and (local := self.local.handler(kind, type_)) is not None:
+            return await self.local.call(local, kind, payload, request_headers, result)
         template = hub_pb2.Request(
             kind=hub_pb2.COMMAND if kind == "command" else hub_pb2.QUERY,
             type=type_,
             routing_key=routing_key or "",
-            payload=self._codec.encode(message),
-            headers=dict(headers or {}),
+            payload=payload,
+            headers=request_headers,
             priority=self._settings.priorities.get(type_, 0) if priority is None else priority,
             mode=hub_pb2.UNARY,
         )

@@ -14,3 +14,4 @@ def test_default_timings() -> None:
     assert (t.permit_batch, t.permit_flush_after) == (16, 0.05)
     assert (t.guard_margin, t.fallback_max_timeout, t.default_deadline, t.retry_min_remaining) == (1.0, 60.0, 5.0, 0.25)
     assert (t.outbound_limit, t.max_unwritten_moves) == (256, 8)
+    assert (t.jwks_min_refresh, t.jwks_fetch_timeout, t.jwt_leeway) == (60.0, 5.0, 60.0)

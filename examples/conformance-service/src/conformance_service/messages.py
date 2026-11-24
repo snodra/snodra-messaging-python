@@ -57,6 +57,14 @@ class Strict:
     count: int
 
 
+@message_type("conformance.Guarded")
+@dataclass
+class Guarded:
+    """Strict's payload, for an authenticated caller only (command)."""
+
+    count: int
+
+
 @message_type("conformance.View")
 class View(RawJson):
     """Asks the instance for its own view of its connections (query)."""
@@ -144,6 +152,12 @@ class SleepAnswer:
 @dataclass
 class StrictAnswer:
     count: int
+
+
+@dataclass
+class GuardedAnswer:
+    count: int
+    user: str
 
 
 @dataclass

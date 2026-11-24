@@ -26,6 +26,13 @@ def settings_from_env(environ: Mapping[str, str]) -> Settings:
     capacity = get("CONFORMANCE_CAPACITY")
     values["max_concurrent"] = DEFAULT_CAPACITY if capacity is None else int(capacity)
     values["default_retry"] = _retry(get)
+    # Every call goes through the hub, also one of the service's own types: the runner sees what is sent.
+    values["always_route_through_hub"] = True
+    # The callers' tokens are verified only where the runner gives its issuer (conformance.Guarded needs it).
+    if (jwks_url := get("CONFORMANCE_JWKS_URL")) is not None:
+        values["jwks_url"] = jwks_url
+    if (issuer := get("CONFORMANCE_ISSUER")) is not None:
+        values["issuer"] = issuer
     return Settings(**values)
 
 

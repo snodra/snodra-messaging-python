@@ -155,7 +155,7 @@ async def test_send_writes_the_request_and_decodes_the_reply(hub: FakeHub) -> No
         "orders.GetOrder",
         "",
         3,
-        {"x-tenant": "t-1"},
+        {"x-tenant": "t-1", "correlationId": r.headers["correlationId"]},  # a fresh one outside any handling
     )
     await s.send(_reply(r.id, b'{"orderId":"o-2","total":7}'))
     assert await query == Placed("o-2", 7)

@@ -29,3 +29,19 @@ def test_absent_variables_are_not_configured() -> None:
     assert s.hubs == ("static://snodra-server:7000",)
     with pytest.raises(ConfigurationError, match="SNODRA_SERVICE_NAME"):
         settings_from_env({})
+
+
+def test_the_service_routes_every_call_through_the_hub_and_reads_the_callers_issuer() -> None:
+    base = {"CONFORMANCE_SERVICE_NAME": "conformance-python"}
+    s = settings_from_env(base)
+    assert (s.always_route_through_hub, s.jwks_url, s.issuer) == (True, None, None)
+    s = settings_from_env(
+        base
+        | {
+            "CONFORMANCE_JWKS_URL": "http://127.0.0.1:9000/jwks",
+            "CONFORMANCE_ISSUER": "http://127.0.0.1:9000/conformance",
+        }
+    )
+    assert (s.jwks_url, s.issuer) == ("http://127.0.0.1:9000/jwks", "http://127.0.0.1:9000/conformance")
+    with pytest.raises(ConfigurationError, match="SNODRA_ISSUER"):  # the URL without the issuer
+        settings_from_env(base | {"CONFORMANCE_JWKS_URL": "http://127.0.0.1:9000/jwks"})

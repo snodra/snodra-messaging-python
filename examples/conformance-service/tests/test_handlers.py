@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 import grpc
 import pytest
+from conformance_service.env import settings_from_env
 from conformance_service.handlers import register_handlers
 from fakehub import FakeHub, FakeStream, ack, forward
-from helpers import SCALED, assert_no_library_tasks
+from helpers import SCALED, Jwks, assert_no_library_tasks
 from snodra import App, Settings
 from snodra._hubpb import hub_pb2
 
@@ -65,7 +68,7 @@ def _answer(r: hub_pb2.Reply) -> object:
 
 async def test_the_register_lists_the_contracts_unary_types(hub: FakeHub, service: App) -> None:
     r = await (await hub.next_stream()).recv_register()
-    assert list(r.command_types) == [
+    assert list(r.command_types) == [  # no conformance.Guarded without a JWKS
         "conformance.Done",
         "conformance.Echo",
         "conformance.Fail",
@@ -155,3 +158,53 @@ async def test_view_answers_the_instances_view(hub: FakeHub, service: App) -> No
     assert isinstance(view, dict)
     assert view["hubIds"] == ["hub-7"]
     assert view["lastRejection"] == "ALREADY_EXISTS: type conformance.Echo is owned by another-service"
+
+
+@pytest.fixture
+async def issuer() -> AsyncIterator[Jwks]:
+    jwks = await asyncio.to_thread(Jwks)
+    try:
+        yield jwks
+    finally:
+        await asyncio.to_thread(jwks.stop)
+
+
+async def test_guarded_needs_a_verified_caller_other_than_the_refused_one(hub: FakeHub, issuer: Jwks) -> None:
+    settings = settings_from_env(
+        {
+            "CONFORMANCE_SERVICE_NAME": "conformance-python",
+            "CONFORMANCE_INSTANCE_ID": "i-1",
+            "CONFORMANCE_HUBS": hub.address,
+            "CONFORMANCE_JWKS_URL": issuer.url,
+            "CONFORMANCE_ISSUER": "https://issuer.test",
+        }
+    )
+    app = App(replace(settings, reconnect_backoff=(0.05, 0.2)), _timings=SCALED)
+    register_handlers(app, settings)
+    await app.start()
+    try:
+        s = await hub.next_stream()
+        assert "conformance.Guarded" in (await s.recv_register()).command_types
+        await s.ack(ack("hub-1"))
+
+        def bearer(sub: str = "u-1") -> dict[str, str]:
+            return {"authorization": f"Bearer {issuer.mint(sub)}"}
+
+        assert _answer(await _ask(s, "conformance.Guarded", {"count": 2}, headers=bearer())) == {
+            "count": 2,
+            "user": "u-1",
+        }
+        for payload, headers, code in (
+            ({"count": 2}, {}, hub_pb2.UNAUTHENTICATED),
+            (b"not json", {}, hub_pb2.UNAUTHENTICATED),  # decided before decoding
+            (b"not json", bearer(), hub_pb2.INVALID_REQUEST),
+            ({"count": True}, bearer(), hub_pb2.INVALID_REQUEST),
+            ({"count": 2}, bearer("conformance-refused"), hub_pb2.PERMISSION_DENIED),
+            ({"count": 2}, {"authorization": "Bearer not-a-jwt"}, hub_pb2.UNAUTHENTICATED),
+        ):
+            r = await _ask(s, "conformance.Guarded", payload, headers=headers)
+            assert r.WhichOneof("result") == "error", (payload, headers)
+            assert r.error.code == code, (payload, headers, r.error)
+    finally:
+        await app.shutdown(timeout=2.0)
+        assert_no_library_tasks()

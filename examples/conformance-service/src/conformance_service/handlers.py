@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from snodra import App, HandlerError, RawJson, Settings, current_message
+from snodra import App, HandlerError, RawJson, Settings, caller_matches, current_caller, current_message
 
 from conformance_service.messages import (
     Done,
@@ -13,6 +13,8 @@ from conformance_service.messages import (
     EchoAnswer,
     EchoQuery,
     Fail,
+    Guarded,
+    GuardedAnswer,
     Missing,
     Outcome,
     Probe,
@@ -73,6 +75,13 @@ def register_handlers(app: App, settings: Settings) -> Sends:
     @app.command_handler
     async def on_strict(m: Strict) -> StrictAnswer:
         return StrictAnswer(m.count)
+
+    if settings.jwks_url is not None:  # a guard needs the issuer's keys: without them Guarded is not served
+
+        @app.command_handler(guard=caller_matches(lambda c: c.subject != "conformance-refused"))
+        async def on_guarded(m: Guarded) -> GuardedAnswer:
+            caller = current_caller()
+            return GuardedAnswer(m.count, "" if caller is None else caller.subject)
 
     @app.query_handler
     async def on_view(m: View) -> ViewAnswer:

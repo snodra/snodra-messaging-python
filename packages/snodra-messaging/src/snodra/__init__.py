@@ -5,7 +5,7 @@ from importlib.metadata import version
 from snodra._app import App
 from snodra._codec import Codec, JsonCodec, RawJson
 from snodra._connection import Rejection
-from snodra._context import MessageInfo, current_message
+from snodra._context import MessageInfo, current_caller, current_message
 from snodra._errors import (
     ConfigurationError,
     DecodeError,
@@ -22,6 +22,7 @@ from snodra._errors import (
     SnodraError,
     Unauthenticated,
 )
+from snodra._identity import Caller, Guard, authenticated, caller_matches, role
 from snodra._messages import message_type
 from snodra._retry import RetryPolicy
 from snodra._settings import Settings
@@ -30,10 +31,12 @@ __version__: str = version("snodra-messaging")
 
 __all__ = [
     "App",
+    "Caller",
     "Codec",
     "ConfigurationError",
     "DecodeError",
     "ErrorCode",
+    "Guard",
     "HandlerError",
     "HubError",
     "InvalidRequest",
@@ -52,6 +55,10 @@ __all__ = [
     "SnodraError",
     "Unauthenticated",
     "__version__",
+    "authenticated",
+    "caller_matches",
+    "current_caller",
     "current_message",
     "message_type",
+    "role",
 ]

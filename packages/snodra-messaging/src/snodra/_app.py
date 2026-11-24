@@ -11,8 +11,12 @@ from typing import Any, Literal, TypeVar, overload
 from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
 from snodra._dispatch import Dispatcher
+from snodra._errors import ConfigurationError
+from snodra._identity import Guard, IdentityResolver
+from snodra._jwt import JwksVerifier
+from snodra._local import LocalCalls
 from snodra._pool import Pool
-from snodra._registry import Kind, Registry
+from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
 from snodra._send import Sender
 from snodra._settings import Settings
@@ -39,10 +43,25 @@ class App:
         self._timings = DEFAULT_TIMINGS if _timings is None else _timings
         self._codec: Codec = JsonCodec() if codec is None else codec
         self._registry = Registry()
-        self._dispatcher = Dispatcher(self._registry, self._codec, settings.max_concurrent, self._timings)
+        verifier = None
+        if settings.jwks_url is not None and settings.issuer is not None:
+            t = self._timings
+            verifier = JwksVerifier(
+                settings.jwks_url,
+                settings.issuer,
+                min_refresh=t.jwks_min_refresh,
+                fetch_timeout=t.jwks_fetch_timeout,
+                leeway=t.jwt_leeway,
+            )
+        self._identity = IdentityResolver(verifier, settings.roles_claim)
+        self._dispatcher = Dispatcher(
+            self._registry, self._codec, settings.max_concurrent, self._timings, identity=self._identity
+        )
         self._sender = Sender(self._codec, settings, self._timings)
         self._pool = Pool(settings, self._timings, self._dispatcher, on_answer=self._sender.on_answer)
         self._sender.pool = self._pool
+        self._sender.local = LocalCalls(self._registry, self._dispatcher, self._codec, settings)
+        self._sender.local.pool = self._pool
         self._started = False
         self._shutting_down = False
         self._stop = asyncio.Event()  # a signal, or shutdown: run() stops waiting
@@ -61,25 +80,39 @@ class App:
     @overload
     def command_handler(self, fn: H, /) -> H: ...
     @overload
-    def command_handler(self, fn: None = None, /) -> Callable[[H], H]: ...
-    def command_handler(self, fn: H | None = None, /) -> H | Callable[[H], H]:
+    def command_handler(self, fn: None = None, /, *, guard: Guard | None = None) -> Callable[[H], H]: ...
+    def command_handler(self, fn: H | None = None, /, *, guard: Guard | None = None) -> H | Callable[[H], H]:
         """Registers a command handler, bare (``@app.command_handler``) or called (``@app.command_handler()``): an
         ``async def`` whose first parameter is annotated with a ``@message_type`` class, the type it handles; what it
         returns is the reply (``None`` answers ``{}``). Raises ``TypeError`` for what cannot be served and
-        :class:`RegistrationClosed` after ``start``, naming the handler. Returns the function unchanged."""
-        return self._handler("command", fn)
+        :class:`RegistrationClosed` after ``start``, naming the handler. Returns the function unchanged.
+
+        ``guard`` (:func:`authenticated`, :func:`role`, :func:`caller_matches`) says who may call it: a request
+        without a verified caller is answered ``UNAUTHENTICATED`` before its payload is decoded, a caller the rule
+        refuses ``PERMISSION_DENIED`` once it decoded. A guard needs ``Settings.jwks_url``: without it, a guarded
+        handler is a :class:`ConfigurationError` naming it."""
+        return self._handler("command", fn, guard)
 
     @overload
     def query_handler(self, fn: H, /) -> H: ...
     @overload
-    def query_handler(self, fn: None = None, /) -> Callable[[H], H]: ...
-    def query_handler(self, fn: H | None = None, /) -> H | Callable[[H], H]:
+    def query_handler(self, fn: None = None, /, *, guard: Guard | None = None) -> Callable[[H], H]: ...
+    def query_handler(self, fn: H | None = None, /, *, guard: Guard | None = None) -> H | Callable[[H], H]:
         """Registers a point query handler, as :meth:`command_handler` registers a command handler."""
-        return self._handler("query", fn)
+        return self._handler("query", fn, guard)
 
-    def _handler(self, kind: Kind, fn: H | None) -> H | Callable[[H], H]:
+    def _handler(self, kind: Kind, fn: H | None, guard: Guard | None) -> H | Callable[[H], H]:
+        if guard is not None and not isinstance(guard, Guard):
+            raise TypeError(f"guard must be made by authenticated(), role() or caller_matches(), got {guard!r}")
+
         def register(f: H) -> H:
-            self._registry.add(kind, f)
+            if guard is not None and not self._identity.verifies:
+                raise ConfigurationError(
+                    f"handler {label_of(f)} requires an authenticated caller (guard={guard!r}) but no JWKS is "
+                    "configured to verify forwarded tokens: set jwks_url (SNODRA_JWKS_URL) and issuer (SNODRA_ISSUER); "
+                    "without them every caller is anonymous"
+                )
+            self._registry.add(kind, f, guard)
             return f
 
         return register if fn is None else register(fn)
@@ -126,7 +159,17 @@ class App:
         as ``Request.timeout_ms`` (else ``Settings.default_timeout``; without one, or with a ``timeout`` of 0 or less,
         the hub applies its own), and bounds how long the call waits for a hub: without one,
         ``Settings.default_timeout``, else 5 s. ``priority``: ``Request.priority`` (else ``Settings.priorities``, else
-        0). ``retry``: a :class:`RetryPolicy` (else ``Settings.default_retry``; ``False``: none).
+        0). ``retry``: a :class:`RetryPolicy` (else ``Settings.default_retry``; ``False``: none). ``headers``: the
+        call's own request headers; the names the library sets itself (``authorization``, ``traceparent``,
+        ``tracestate``, ``correlationId``, ``correlation-id``, in any letter case) raise :class:`ReservedHeader` before
+        anything is sent. The request carries the ``correlationId`` of the request being handled (its id when it has
+        none, a new UUID outside any handling), its valid ``traceparent``, and its ``authorization`` unless
+        ``Settings.forward_jwt`` is off.
+
+        A command of a type this instance has a command handler for is answered in-process, without a hub (unless
+        ``Settings.always_route_through_hub``): through the handler's guard, with the headers and the caller a request
+        through the hub would carry, and the same errors; its routing key, priority, timeout and retry do not apply,
+        and a cancellation of the caller cancels the handler.
 
         Raises :class:`NeverSent` when no hub took the request (the handler never ran: sending it again is safe),
         :class:`OutcomeUnknown` when the hub stream broke after the request was written (the handler may have run),
@@ -157,7 +200,8 @@ class App:
     ) -> R:
         """Sends a point query through a hub to an instance that handles its type and returns the answer decoded as
         ``result``; the options and the errors are those of :meth:`send` (the hub ignores the routing key of a
-        query). A retry policy also retries a query after an unknown outcome."""
+        query). A retry policy also retries a query after an unknown outcome. A query of a type this instance has a
+        query handler for is answered in-process, as :meth:`send` answers a command."""
         return await self._sender.call(  # type: ignore[return-value]
             query,
             result,
@@ -260,7 +304,10 @@ class App:
                     raise
                 log.debug("A connection crashed (logged when it happened); not raised over what propagates")
             finally:
-                self._down.set()
+                try:
+                    await self._identity.close()  # a JWKS fetch still running ends here
+                finally:
+                    self._down.set()
 
     async def __aenter__(self) -> App:
         await self.start()
