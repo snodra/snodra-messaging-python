@@ -13,7 +13,7 @@ from dataclasses import replace
 import grpc
 import pytest
 from fakehub import FakeHub, FakeStream, ack
-from helpers import SCALED, eventually, start_app, within
+from helpers import SCALED, PlaceOrder, eventually, start_app, within
 from snodra import Rejection, _backoff, _connection
 from snodra._connection import _Stream
 from snodra._hubpb import hub_pb2
@@ -429,3 +429,30 @@ async def test_settle_keeps_what_it_leaves_behind_until_it_ends() -> None:
     await asyncio.wait_for(task, 1.0)
     await asyncio.sleep(0)  # its done-callback runs
     assert task not in _connection._LEFT_BEHIND
+
+
+async def test_a_refusal_is_honoured_whatever_write_is_in_flight(hub: FakeHub) -> None:
+    # The hub closes the stream while the writer is busy writing requests: the write that meets the closed stream
+    # must not turn the hub's status into a transport error (grpc.aio's own write does that).
+    app = await start_app(hub, reconnect_backoff=(0.05, 0.4))
+    s = await hub.next_stream()
+    for refusal in range(1, 6):
+        await s.recv_register()
+        await s.ack(ack("hub-1"))
+        await eventually(lambda: app.hub_ids() == ["hub-1"])
+        flood = [asyncio.create_task(app.send(PlaceOrder(f"o-{n}", ["x" * 2000]), timeout=5.0)) for n in range(400)]
+        try:
+            for _ in range(20):
+                await s.recv_request()  # the writer is busy writing the rest
+            await s.close(grpc.StatusCode.ALREADY_EXISTS, f"refusal {refusal}")
+            closed = time.monotonic()
+            await eventually(lambda: app.hub_ids() == [])
+            rejection = app.rejection
+            assert rejection is not None, f"refusal {refusal}: no rejection recorded"
+            assert (rejection.code, rejection.message) == ("ALREADY_EXISTS", f"refusal {refusal}")
+            s = await hub.next_stream()
+            within(time.monotonic() - closed, 0.8 * 0.4 - SETUP, 0.4 + SETUP)  # the refusal's wait, not the backoff
+        finally:
+            for t in flood:
+                t.cancel()
+            await asyncio.gather(*flood, return_exceptions=True)

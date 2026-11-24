@@ -526,7 +526,7 @@ class HubConnection:
                     if not stream.took(m):
                         continue  # its caller gave up while it was buffered
                     m = m.message
-                await call.write(m)
+                await send_frame(call, m)
         except Exception as e:  # the call ended: the reader reports why
             log.debug("Hub stream to %s: a write failed: %r", self.address, e)
 
@@ -610,6 +610,39 @@ class HubConnection:
                     f"({stream.unanswered} heartbeats unanswered)",
                 )
             stream.heartbeat()
+
+
+class StreamEnded(Exception):
+    """A frame could not be written: the stream ended. Its status is the reader's to report."""
+
+
+async def send_frame(call: _Call, m: hub_pb2.ClientMessage) -> None:
+    """Writes one frame on the stream; :class:`StreamEnded` when the stream can take no more.
+
+    ``call.write`` is not used: when its send fails because the hub has just closed the stream, grpc.aio marks the
+    call as failed with ``INTERNAL`` "Internal error from Core" (``set_internal_error`` in ``grpc.aio._call``), and
+    that replaces the status the hub sent, a refusal included, before the reader reads it. Here a failed send leaves
+    the call alone, so the reader reports the hub's own status, read from the receive side. A grpc.aio without the
+    parts used here gets ``call.write``."""
+    raw = getattr(call, "_cython_call", None)
+    metadata_sent = getattr(call, "_metadata_sent", None)
+    if raw is None or not isinstance(metadata_sent, asyncio.Event):
+        await call.write(m)
+        return
+    if call.done():
+        raise StreamEnded("the stream has ended")
+    if not metadata_sent.is_set():
+        await metadata_sent.wait()
+        if call.done():
+            raise StreamEnded("the stream has ended")
+    try:
+        await raw.send_serialized_message(m.SerializeToString())
+    except asyncio.CancelledError:
+        if not call.cancelled():
+            call.cancel()
+        raise
+    except Exception as e:  # the send met the end of the stream
+        raise StreamEnded(f"a write failed: {e}") from None
 
 
 async def settle(
