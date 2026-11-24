@@ -1,0 +1,58 @@
+[project]
+name = "snodra-messaging-python-workspace"
+version = "0.0.0"
+description = "Workspace root of snodra-messaging-python; not published."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*", "examples/*"]
+
+[tool.uv.sources]
+snodra-messaging = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "pytest-asyncio==1.5.0",
+    "pytest-timeout==2.4.0",
+    "ruff==0.17.6",
+    "mypy==2.4.1",
+    "types-grpcio",
+    "types-protobuf",
+    "twine==7.0.0",
+    "snodra-messaging",
+]
+gen = ["grpcio-tools==1.85.4"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [
+    "packages/snodra-messaging/src/snodra/_hubpb/hub_pb2.py",
+    "packages/snodra-messaging/src/snodra/_hubpb/hub_pb2.pyi",
+    "packages/snodra-messaging/src/snodra/_hubpb/hub_pb2_grpc.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF", "SIM", "PT"]
+
+[tool.mypy]
+strict = true
+files = ["packages"]
+
+[[tool.mypy.overrides]]
+module = "snodra._hubpb.*"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["packages/snodra-messaging/tests"]
+pythonpath = ["packages/snodra-messaging/tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+timeout = 120
+addopts = "--import-mode=importlib"
+markers = ["repo: tests that read repository files"]

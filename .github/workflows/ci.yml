@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A branch keeps only its newest run. On main the runs queue instead.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# bash -eo pipefail: a failing command inside a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - run: uv sync --frozen --all-packages
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen mypy
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - run: uv sync --frozen --all-packages --python ${{ matrix.python-version }}
+      - run: uv run --frozen pytest -q
+
+  proto-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          repository: snodra/snodra-server
+          ref: ${{ vars.SNODRA_SERVER_REF || 'main' }}
+          path: snodra-server
+      - run: bash scripts/check-proto-sync.sh
+        env:
+          SNODRA_PROTO_SOURCE: ${{ github.workspace }}/snodra-server/proto/hub.proto
+          SNODRA_PROTO_SYNC_REQUIRED: "true"
+
+  generated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - run: bash scripts/gen-proto.sh
+      - run: git diff --exit-code packages/snodra-messaging/src/snodra/_hubpb
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - run: uv sync --frozen --all-packages
+      - run: uv build --all-packages --out-dir dist
+      - run: uv run --frozen twine check --strict dist/*
+      - run: uv venv -p 3.12 "$RUNNER_TEMP/v"
+      - run: uv pip install --python "$RUNNER_TEMP/v" dist/*.whl
+      - run: >-
+          "$RUNNER_TEMP/v/bin/python" -c
+          "import snodra, snodra._hubpb.hub_pb2_grpc; print(snodra.__version__)"

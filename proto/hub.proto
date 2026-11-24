@@ -1,0 +1,800 @@
+// Snodra server protocol.
+//
+// A service opens one bidirectional stream per instance with Hub.Connect, announces the command
+// and query types it handles with a Register message, and then exchanges Request and Reply
+// messages over that stream for as long as it lives. The hub keeps an in-memory registry of
+// connected instances and forwards each Request to one instance that registered its type.
+//
+// The hub never inspects or persists payloads. Payloads are JSON documents produced by the
+// Snodra messaging libraries; the JSON shape of each type is defined by the owning service's
+// *-api module (JVM) or documented contract (Rust).
+//
+// This file is the source of truth. snodra-messaging (Kotlin) and snodra-messaging-rs (Rust)
+// vendor a byte-identical copy and their CI compares it with this one.
+
+syntax = "proto3";
+
+package snodra.hub.v1;
+
+option java_package = "com.damoreira.snodra.server.v1";
+option java_multiple_files = true;
+
+// Routing and relaying of commands and queries between services.
+service Hub {
+  // One long-lived stream per service instance. The first client message must be a Register.
+  rpc Connect(stream ClientMessage) returns (stream ServerMessage);
+  // A point-in-time snapshot of connected services, instances, type ownership and in-flight
+  // requests, for operators and tooling. Never contains payloads or headers.
+  rpc Topology(TopologyRequest) returns (TopologyResponse);
+}
+
+// Everything a service instance can send to the hub.
+message ClientMessage {
+  oneof message {
+    Register register = 1;
+    Request request = 2;
+    Reply reply = 3;
+    Heartbeat heartbeat = 4;
+    // Flow control: more requests this instance can take now.
+    Permits permits = 5;
+    // Multi-part messages: a handler's streamed parts and end (a streaming query, or
+    // the pushed updates of a subscription), a sender's credits and its cancellation.
+    ReplyPart part = 6;
+    ReplyEnd end = 7;
+    Flow flow = 8;
+    Cancel cancel = 9;
+    // Multi-hub HA: what this instance sees, every 5 s; the hub keeps the latest per
+    // session.
+    InstanceStatus status = 10;
+    // Credential refresh: a new credential for this session, for the same service as
+    // its Register. The hub validates it as it validates the Register's and, for a JWT, moves the
+    // session's expiry; a refused refresh closes the stream in enforce.
+    Credentials credentials = 11;
+    // Processor control: the answer to a ServerMessage.control, matched by control_id.
+    ControlReply control_reply = 12;
+  }
+}
+
+// Everything the hub can send to a service instance.
+message ServerMessage {
+  oneof message {
+    // A command or query another service sent, forwarded to this instance because it registered
+    // the type.
+    Request request = 1;
+    // The reply to a Request this instance sent earlier (matched by Reply.request_id).
+    Reply reply = 2;
+    // A failure the hub detected for a Request this instance sent (matched by Error.request_id).
+    Error error = 3;
+    // Echo of a client Heartbeat, or an unsolicited keep-alive.
+    Heartbeat heartbeat = 4;
+    // Answers every accepted Register (see RegisterAck).
+    RegisterAck register_ack = 5;
+    // Multi-part messages: the answers of a Request with a mode other than UNARY this
+    // instance sent (see RequestMode), and, to a handler, a sender's credits and cancellation.
+    ReplyPart part = 6;
+    ReplyEnd end = 7;
+    Flow flow = 8;
+    Cancel cancel = 9;
+    // Processor control: the hub asks this instance to act on one of its event
+    // processors; exactly one ClientMessage.control_reply answers it.
+    ControlRequest control = 10;
+  }
+}
+
+// Announces what this instance handles. Must be the first message on the stream. A later
+// Register on the same stream replaces the previous registration (used when handlers are added
+// after startup). An empty service_name or instance_id is rejected. A type listed in both
+// command_types and query_types is rejected with INVALID_ARGUMENT. A type whose kind differs from
+// the kind its current owner registered is rejected with ALREADY_EXISTS.
+//
+// Query ownership: a type in query_types is exclusive, owned by one service only; a
+// type in shared_query_types may be owned by many services. Registrants must agree: a type
+// registered exclusive by one registrant and shared by another is rejected with ALREADY_EXISTS
+// (the later Register fails). A type listed in shared_query_types and in command_types or
+// query_types of the same Register is rejected with INVALID_ARGUMENT. Commands are never shared.
+// A query type may also be declared a subscription type (subscription_query_types); registrants
+// must agree on that too.
+//
+// Every accepted Register is answered with a RegisterAck, written before the echo of any
+// Heartbeat that follows it. credentials, initial_permits, load_factor, tags and client_version
+// are read from the first Register of a stream only; later Registers cannot change them. Field 11
+// is reserved for contexts; fields 5 and 6 were used by an earlier version and are never reused.
+message Register {
+  reserved 5, 6;
+  // Logical service name, for example "orders-service"; each event-store add-on derives its
+  // own names from it.
+  string service_name = 1;
+  // Unique per process, for example a UUID generated at startup. Used for consistent hashing.
+  string instance_id = 2;
+  // Fully qualified command type names this instance handles, for example "orders.PlaceOrder".
+  repeated string command_types = 3;
+  // Fully qualified query type names this instance handles, for example "orders.GetOrder".
+  repeated string query_types = 4;
+  // Checked when SNODRA_SERVER_AUTH_MODE is permissive or enforce. Never logged.
+  Credentials credentials = 7;
+  // Flow control: requests the hub may forward before the next Permits message, and
+  // the session's permit cap. At least 1; a Register with 0 is rejected with INVALID_ARGUMENT.
+  // The hub queues further requests per instance (ordered by Request.priority, then age) until
+  // Permits arrive.
+  uint32 initial_permits = 8;
+  // Relative capacity of this instance; 0 reads as 100. Weights its share of the
+  // consistent-hash ring (128 * load_factor / 100 virtual nodes, 8..1024) and its load score.
+  uint32 load_factor = 9;
+  // Free-form labels (for example "zone" -> "eu-1"). Unkeyed requests prefer instances whose tags
+  // match more of the sender's tags.
+  map<string, string> tags = 10;
+  // Free text naming the client library and its version, for example "snodra-messaging/0.1.0".
+  // Shown in the topology view; never used for routing decisions.
+  string client_version = 12;
+  // Fully qualified query type names this instance handles that many services may own,
+  // for example a "search.FindAnything" every service answers. A point query to such a
+  // type goes to one live instance of any owner; a scatter-gather query to all of them.
+  repeated string shared_query_types = 13;
+  // Of the types in query_types and shared_query_types, the ones this instance serves with a
+  // subscription handler, for example a "prices.WatchPrices" whose handler recognises the initial
+  // request by its "<id>#0" id. A type listed here and in neither is rejected with
+  // INVALID_ARGUMENT. Registrants must agree: a type registered as a subscription type by one
+  // registrant and not by another is rejected with ALREADY_EXISTS (the later Register fails), also
+  // when the only instance re-registers it (until the hub forgets the type: owner grace, then a
+  // sweep). The hub serves a subscription type in mode SUBSCRIPTION only, and mode SUBSCRIPTION
+  // for subscription types only: anything else fails with INVALID_REQUEST before any instance gets
+  // anything (see RequestMode). The initial request "<id>#0" is the hub's own and reaches the
+  // handler as usual.
+  repeated string subscription_query_types = 14;
+}
+
+// Flow control: the sender may receive `count` more forwarded requests. Clients return one permit
+// per handled request, batched (16, or 50 ms after the first unsent one), and at once when the
+// permits still held by the hub are down to min(16, initial_permits / 2). The hub never lets a
+// session hold more than its cap, which starts at initial_permits.
+message Permits {
+  uint32 count = 1;
+  // Multi-hub HA: when > 0, the hub first raises this session's cap to
+  // max(cap, grant), then adds `count` (still clamped at the cap). A grant never lowers the cap.
+  // Clients send it with the top-up that moves a departed hub's share to the surviving ones.
+  uint32 grant = 2;
+}
+
+// Multi-hub HA: an instance connected to several hubs reports, on each of its
+// streams, which hubs it currently holds an acknowledged stream to. Hubs never talk to each
+// other; this report is how one hub's topology (and the dashboard that merges all hubs) shows
+// that an instance is missing a hub. The hub keeps only the latest report per session, bounded
+// (at most 64 ids of at most 128 bytes each are kept; the rest is ignored).
+message InstanceStatus {
+  // RegisterAck.hub_id of every hub this instance has an acknowledged stream to, this one
+  // included.
+  repeated string connected_hub_ids = 1;
+  // Handlers of this instance running now, over all its hubs.
+  uint32 handlers_in_flight = 2;
+  // Event processors: one entry per event processor this instance started, as of this
+  // report. The hub keeps the latest list per session, bounded: at most 32 processors, 1024
+  // segments, 16 capabilities and 256 event types each; longer strings are cut at a UTF-8
+  // boundary (name 64 bytes, subscription and source 256, event_store 64, a capability 64,
+  // last_error 512, an event type 256, operation_id 64). A segment name or a position is never
+  // cut: a segment named in more than 128 bytes is dropped, a longer position reads as unknown.
+  // The excess is dropped, never an error to the client.
+  repeated ProcessorStatus processors = 3;
+}
+
+// The state of one event processor on one instance. When the hub aggregates a
+// processor over its instances it shows the worst state, ranked FAILING, unknown (UNSPECIFIED or
+// a value it does not know), STARTING, PAUSED, STOPPED, RUNNING.
+enum ProcessorState {
+  // Never sent on purpose; a value this hub does not know reads as this.
+  PROCESSOR_STATE_UNSPECIFIED = 0;
+  // Started, but before its first assignment, or while a reassignment is in progress (a
+  // revocation not yet followed by an assignment). An instance whose assignment is empty is idle,
+  // RUNNING.
+  PROCESSOR_STARTING = 1;
+  // Assigned (possibly no segment: idle) and records flowing (or none waiting).
+  PROCESSOR_RUNNING = 2;
+  // A record exhausted its attempts in the last 60 s, or the reader reports an error.
+  PROCESSOR_FAILING = 3;
+  // Stopping or stopped (shutdown), or stopped for a reset: out of its subscription
+  // while a reset operation holds the processor's lock (ProcessorStatus.operation_id set).
+  PROCESSOR_STOPPED = 4;
+  // Paused from the hub's control plane: still in its subscription,
+  // consuming nothing.
+  PROCESSOR_PAUSED = 5;
+}
+
+// One event processor of one instance: a reader with its own subscription to
+// the event store's source, running the handlers of one processing group. Counters are since the
+// instance started; never payloads, keys or headers.
+message ProcessorStatus {
+  // The processor's name: "default" for the handlers without a processing group, else the
+  // group name ([a-z0-9][a-z0-9-]{0,47}).
+  string name = 1;
+  // The event store's name for the processor's subscription (the name the add-on gives it),
+  // derived from the service name and the processor name.
+  string subscription = 2;
+  // The source the processor reads (the add-on's name for it).
+  string source = 3;
+  // See ProcessorState.
+  ProcessorState state = 4;
+  // The segments assigned to this instance, in the hub's segment order: decimal names by value,
+  // then the rest by bytes; empty while none is.
+  repeated SegmentStatus segments = 5;
+  // Records whose stage 1 (the processor's event handlers) completed, handled or found to be a
+  // duplicate.
+  uint64 processed_total = 6;
+  // Records that exhausted their attempts: parked as a dead letter, sent to the event
+  // store's dead-letter destination or skipped (mode "log").
+  uint64 failed_total = 7;
+  // The processor's letters in the service's message store, over all instances, sampled every
+  // 30 s; 0 when dead_letter_mode is not "collection".
+  uint64 dead_letters = 8;
+  // The message of the latest failure (never a payload or a stack trace), at most 512 bytes
+  // (cut at a UTF-8 boundary); empty when none.
+  string last_error = 9;
+  // When last_error happened, epoch milliseconds; 0 when none.
+  int64 last_error_at_ms = 10;
+  // The event types the processor's handlers handle (stage 1), sorted; "default" also lists the
+  // event types its sagas handle.
+  repeated string event_types = 11;
+  // Where a record goes once its attempts are exhausted: "collection" (a dead letter in the
+  // service's message store, the default), "event-store" (the event store's own dead-letter
+  // destination) or "log" (logged and skipped).
+  string dead_letter_mode = 12;
+  // A replay range is open on this instance's segments: records below a
+  // segment's replay_until are handled again.
+  bool replaying = 13;
+  // The reset operation holding the processor's lock; empty when none.
+  string operation_id = 14;
+  // The event store the processor reads: "kafka", "rabbitmq-streams", "memory" or the name of
+  // a third-party add-on.
+  string event_store = 15;
+  // What the event store supports: "replay", "browse", "lag", "native-dead-letter" or an
+  // add-on's own names.
+  repeated string capabilities = 16;
+}
+
+// One segment assigned to an event processor on one instance. A segment is a unit of
+// the event store's order per key (a unit the add-on defines). Positions are
+// opaque strings that only the event-store add-on reads (a decimal counter for the first-wave
+// stores); an empty string means unknown or none.
+message SegmentStatus {
+  // The segment's name, unique within the source.
+  string segment = 1;
+  // The next position this instance will process; empty when unknown.
+  string position = 2;
+  // The subscription's committed position; empty when none.
+  string committed = 3;
+  // The segment's head (the position of the next record written); empty when unknown.
+  string head = 4;
+  // The number of records between the committed position and the head (between position and
+  // head when nothing is committed); -1 when unknown; never negative otherwise.
+  int64 lag = 5;
+  // The end (exclusive) of the segment's open replay range: its records before this
+  // position are a replay; empty when the segment is not replaying.
+  string replay_until = 6;
+}
+
+// The hub asks this instance to act on one of its event processors. Exactly one
+// ControlReply with the same control_id answers it; the hub gives up after its control timeout
+// (10 s, reset_execute 120 s) and drops a late reply. An instance handles control requests off its
+// stream's read loop, one at a time per processor, and logs each at INFO.
+message ControlRequest {
+  // Unique per request, chosen by the hub (UUID).
+  string control_id = 1;
+  // The processor's name ("default" included).
+  string processor = 2;
+  oneof action {
+    ProcessorPause pause = 10;
+    ProcessorResume resume = 11;
+    ResetPrepare reset_prepare = 12;
+    ResetExecute reset_execute = 13;
+    ResetFinish reset_finish = 14;
+    DeadLetterList dead_letter_list = 15;
+    DeadLetterRetry dead_letter_retry = 16;
+    DeadLetterRetryAll dead_letter_retry_all = 17;
+    DeadLetterDiscard dead_letter_discard = 18;
+  }
+}
+
+// Persist "paused" in the service's message store (its processor control) and stop consuming
+// without leaving the subscription. Answered with ok.
+message ProcessorPause {}
+
+// Persist "not paused" and consume again. Answered with ok.
+message ProcessorResume {}
+
+// Stop consuming (leave the subscription) and hold the operation lock until lease_ms from now.
+// Re-sent with the same operation_id to renew the lease. Answered with ok once the instance has
+// left the subscription; LOCKED when another operation holds the lock; NOT_PREPARED for an
+// operation that already ended on the instance, or a renewal whose lock is gone (a late renewal
+// never takes the lock again).
+message ResetPrepare {
+  string operation_id = 1;
+  int64 lease_ms = 2;
+}
+
+// Move the subscription's committed positions to the target; sent to one instance that holds
+// operation_id. Answered with reset.
+message ResetExecute {
+  string operation_id = 1;
+  ResetTarget target = 2;
+}
+
+// Release the lock and start consuming again (the operation ended, or was aborted). Answered with
+// ok, also when nothing is held; NOT_PREPARED when another operation is held.
+message ResetFinish {
+  string operation_id = 1;
+  bool aborted = 2;
+}
+
+// Where a reset moves the subscription's committed positions. Anything but latest is a replay of
+// the records between the target and the committed positions before the reset.
+message ResetTarget {
+  oneof to {
+    // The segments' first positions.
+    bool earliest = 1;
+    // The segments' heads; never a replay.
+    bool latest = 2;
+    // The first position at or after this time, epoch milliseconds (the head where no record is
+    // that late).
+    int64 timestamp_ms = 3;
+    // Explicit positions; a segment not listed keeps its committed position.
+    SegmentPositions positions = 4;
+  }
+}
+
+// The wrapper a oneof needs for a repeated field.
+message SegmentPositions {
+  repeated SegmentPosition positions = 1;
+}
+
+message SegmentPosition {
+  string segment = 1;
+  string position = 2;
+}
+
+// List the processor's dead letters, oldest first, without payloads or headers.
+message DeadLetterList {
+  // 1..100; the hub clamps.
+  uint32 limit = 1;
+}
+
+message DeadLetterRetry {
+  string letter_id = 1;
+}
+
+message DeadLetterRetryAll {}
+
+message DeadLetterDiscard {
+  string letter_id = 1;
+}
+
+// The answer to a ControlRequest. The hub bounds what it keeps of it as it bounds a status (strings
+// cut at a UTF-8 boundary, at most 100 letters, 1024 ranges).
+message ControlReply {
+  // The ControlRequest.control_id this answers.
+  string control_id = 1;
+  oneof result {
+    // pause, resume, reset_prepare, reset_finish, dead_letter_discard (the letter existed).
+    ControlOk ok = 10;
+    // The instance would not or could not act. Nothing changed unless the message says what did:
+    // a reset_execute refused after its reset handlers ran ends with "reset handlers ran (n), m
+    // markers deleted, positions not moved: retry the reset".
+    ControlRefused refused = 11;
+    // reset_execute succeeded.
+    ResetOutcome reset = 12;
+    // dead_letter_list.
+    DeadLetterPage dead_letters = 13;
+    // dead_letter_retry.
+    DeadLetterRetryOutcome retry = 14;
+    // dead_letter_retry_all.
+    DeadLetterRetryAllOutcome retry_all = 15;
+  }
+}
+
+message ControlOk {
+  // Free text for the operator, at most 512 bytes.
+  string detail = 1;
+}
+
+message ControlRefused {
+  ControlRefusal code = 1;
+  // At most 512 bytes, never a payload.
+  string message = 2;
+}
+
+enum ControlRefusal {
+  // A value this hub does not know reads as this.
+  CONTROL_REFUSAL_UNSPECIFIED = 0;
+  // No such processor on this instance. To a prepare or a finish it means "not involved".
+  CONTROL_REFUSAL_UNKNOWN_PROCESSOR = 1;
+  // Another operation holds the processor's lock (the message names it).
+  CONTROL_REFUSAL_LOCKED = 2;
+  // reset_execute or reset_finish for an operation this instance does not hold; reset_prepare
+  // for an operation that ended on it, or a renewal whose lock is gone.
+  CONTROL_REFUSAL_NOT_PREPARED = 3;
+  // The event store refused: another instance still reads the processor's subscription (the
+  // message lists them).
+  CONTROL_REFUSAL_SUBSCRIBERS_ACTIVE = 4;
+  // A reset handler threw (or panicked); the message says how many ran (their effects stay) and
+  // that no marker or position changed.
+  CONTROL_REFUSAL_RESET_HANDLER_FAILED = 5;
+  // A bad target, a bad letter id, a dead-letter mode other than "collection", a limit out of
+  // range.
+  CONTROL_REFUSAL_INVALID = 6;
+  // Anything else (a message-store or event-store error, or "lease lost: ..." when the
+  // executor's lease was lost mid-execute); the message says what.
+  CONTROL_REFUSAL_FAILED = 7;
+  // A retry or discard of a letter that does not exist.
+  CONTROL_REFUSAL_NOT_FOUND = 8;
+  // The event store lacks the capability the request needs (see ProcessorStatus.capabilities).
+  CONTROL_REFUSAL_UNSUPPORTED = 9;
+}
+
+message ResetOutcome {
+  // One per segment that replays; empty for "latest".
+  repeated ReplayRange ranges = 1;
+  uint64 markers_deleted = 2;
+  // How many @ResetHandler ran.
+  uint32 reset_handlers = 3;
+}
+
+// Records of `segment` at a position from <= position < until are a replay. Positions are the
+// opaque strings of SegmentStatus; empty means none.
+message ReplayRange {
+  string segment = 1;
+  string from = 2;
+  string until = 3;
+}
+
+message DeadLetterPage {
+  // At most DeadLetterList.limit letters, oldest first.
+  repeated DeadLetterSummary letters = 1;
+  // Every letter of the processor.
+  uint64 total = 2;
+}
+
+// One dead letter without its payload or headers.
+message DeadLetterSummary {
+  string id = 1;
+  string processor = 2;
+  // The source the letter's record came from.
+  string source = 3;
+  // The segment of the source the record came from.
+  string segment = 4;
+  // The record's position in its segment; empty when unknown.
+  string position = 5;
+  string key = 6;
+  string event_id = 7;
+  string event_type = 8;
+  // HANDLER_FAILED, SEQUENCED or INVALID.
+  string reason = 9;
+  string error_type = 10;
+  // At most 512 bytes.
+  string error_message = 11;
+  // SEQUENCED: the id of the letter of the same key this one waits behind.
+  string blocked_by = 12;
+  uint32 attempts = 13;
+  int64 parked_at_ms = 14;
+  int64 last_attempt_at_ms = 15;
+}
+
+message DeadLetterRetryOutcome {
+  // Retried, Duplicate, Failed, Blocked, NotRetriable or NotFound.
+  string result = 1;
+  // Failed: the error (at most 512 bytes); Blocked: the head letter's id.
+  string detail = 2;
+}
+
+message DeadLetterRetryAllOutcome {
+  uint64 retried = 1;
+  uint64 failed = 2;
+  uint64 blocked = 3;
+  uint64 skipped = 4;
+}
+
+// How a client authenticates itself to the hub. Carried on Register and on
+// ClientMessage.credentials. A jwt is refused with UNAUTHENTICATED by a hub that has no
+// JWT issuer configured.
+message Credentials {
+  oneof kind {
+    // Static pre-shared token.
+    string token = 1;
+    // Client-credentials access token (JWT) issued by the OAuth2 provider; its azp claim names the service.
+    string jwt = 2;
+  }
+}
+
+// The hub's answer to every accepted Register, written before the echo of any Heartbeat that
+// follows it: the client's confirmation that the Register was processed (the ack of a later
+// Register is dropped, like a Heartbeat echo, when the session's outbound buffer is full). Carries
+// the values the client needs to align with this hub: heartbeat cadence, the eviction threshold
+// applied to this session and the request timeout rules.
+message RegisterAck {
+  // Identifies this hub process (SNODRA_SERVER_ID, default hostname plus a random suffix).
+  string hub_id = 1;
+  // How often the client should send a Heartbeat.
+  uint32 heartbeat_interval_ms = 4;
+  // The hub evicts this session after this long without a Heartbeat.
+  uint32 heartbeat_timeout_ms = 5;
+  // Timeout applied to a Request with timeout_ms == 0 and no per-type override.
+  uint32 default_timeout_ms = 6;
+  // Upper clamp for Request.timeout_ms on types without a per-type override.
+  uint32 max_timeout_ms = 7;
+  // The context this session belongs to; always "default" until contexts ship.
+  string context = 8;
+  // Per-type timeout overrides (type name -> ms). For these types the override replaces both the
+  // default and the clamp; see Request.timeout_ms.
+  map<string, uint32> type_timeouts_ms = 9;
+}
+
+// How the hub delivers a Request and its answers. The modes other than UNARY are for
+// queries only: a command fails with INVALID_REQUEST, and so does a mode value this file does not
+// define. No live instance fails with an Error NO_HANDLER. A subscription type
+// (Register.subscription_query_types) is served in mode SUBSCRIPTION only: a sender's Request for
+// it in any other mode fails with INVALID_REQUEST, and no instance gets anything.
+enum RequestMode {
+  // One handler, one Reply or Error. A subscription type fails with INVALID_REQUEST.
+  UNARY = 0;
+  // Every live instance of every owner gets an ordinary unary Request; the sender gets one
+  // ReplyPart per answer, in arrival order, then a ReplyEnd. A subscription type
+  // (Register.subscription_query_types) fails with INVALID_REQUEST, and no instance gets anything.
+  SCATTER_GATHER = 1;
+  // One live instance gets the Request (mode STREAMING, id "<id>#1", the sender's
+  // initial_credit) and answers with ReplyParts and a ReplyEnd, relayed to the sender under the
+  // sender's credits (initial_credit, then Flow). A subscription type fails with INVALID_REQUEST.
+  STREAMING = 2;
+  // The initial result comes from one live instance (an ordinary unary Request "<id>#0"); every
+  // live instance of every owner gets the Request with mode SUBSCRIPTION ("<id>#n", n >= 1) and
+  // pushes its updates as ReplyParts. The sender gets the initial result, then the updates, as
+  // ReplyParts under its credits, until a ReplyEnd or its Cancel. Only for a subscription type
+  // (Register.subscription_query_types): any other type fails with INVALID_REQUEST.
+  SUBSCRIPTION = 3;
+}
+
+// Whether a Request is a command (exactly one handler, side effects) or a query (read only).
+enum RequestKind {
+  REQUEST_KIND_UNSPECIFIED = 0;
+  COMMAND = 1;
+  QUERY = 2;
+}
+
+// A command or query. Sent by the originating instance; forwarded by the hub without changes.
+message Request {
+  // Unique id chosen by the sender (UUID). Replies and errors carry it back.
+  string id = 1;
+  RequestKind kind = 2;
+  // Fully qualified type name, for example "orders.PlaceOrder".
+  string type = 3;
+  // Optional. When present, all requests with the same key for the same type go to the same
+  // instance of the owning service (consistent hashing). Typically the aggregate id.
+  string routing_key = 4;
+  // JSON document, UTF-8. The sender's library serialises the message class to this document.
+  bytes payload = 5;
+  // Transport metadata. Known keys: "authorization" (Bearer JWT of the acting user),
+  // "correlationId", "traceparent" (W3C trace context), "tracestate".
+  map<string, string> headers = 6;
+  // Per-request timeout hint in milliseconds. The hub uses it to emit TIMEOUT if no Reply
+  // arrives in time. The effective timeout is, with override = the hub's per-type override for
+  // `type` (RegisterAck.type_timeouts_ms):
+  //   timeout_ms > 0:  min(timeout_ms, override or max_timeout_ms)
+  //   timeout_ms == 0: override or default_timeout_ms (5000 ms unless configured)
+  // Clients send 0 unless their caller chose a timeout, so per-type overrides apply.
+  uint32 timeout_ms = 7;
+  // UNARY (the default) or a multi-part mode; see RequestMode. For SCATTER_GATHER, timeout_ms is
+  // the deadline of the whole gather: the ReplyEnd comes when every target answered or the
+  // deadline passed, whichever is first.
+  RequestMode mode = 8;
+  // Higher first when the hub queues requests for a flow-controlled instance; equal priorities
+  // keep arrival order. 0 is the default. Queued requests keep their own deadline.
+  int32 priority = 9;
+  // Field 10 is reserved for contexts.
+  // Streaming and subscriptions: credits the sender grants before its first Flow.
+  uint32 initial_credit = 11;
+  // Scatter-gather: end after this many successful parts (0 = no limit). The answers of the
+  // remaining targets are dropped; a target already forwarded is sent a Cancel, one still queued
+  // leaves its queue.
+  uint32 max_results = 12;
+}
+
+// Success or application-level failure returned by the handling instance.
+message Reply {
+  // The Request.id this reply answers.
+  string request_id = 1;
+  oneof result {
+    // JSON document, UTF-8. The sender's library deserialises it to the handler's declared
+    // response type. May be an empty object for commands without a result.
+    bytes payload = 2;
+    // The handler threw or rejected the request. Forwarded as-is to the sender.
+    Error error = 3;
+  }
+}
+
+// Failure codes. The hub produces NO_HANDLER, TIMEOUT, HANDLER_DISCONNECTED, INVALID_REQUEST
+// (malformed request or duplicate in-flight id), RESOURCE_EXHAUSTED and CANCELLED, and
+// UNAUTHENTICATED or PERMISSION_DENIED for a request its access control refuses; handlers produce
+// HANDLER_ERROR, UNAUTHENTICATED, PERMISSION_DENIED and INVALID_REQUEST inside a Reply.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  // No connected instance has registered Request.type.
+  NO_HANDLER = 1;
+  // No Reply arrived within Request.timeout_ms (or the hub default).
+  TIMEOUT = 2;
+  // The instance the request was forwarded to closed its stream before replying.
+  HANDLER_DISCONNECTED = 3;
+  // The handler raised an exception. "message" carries a short description, never a stack trace.
+  HANDLER_ERROR = 4;
+  // The handling service required an authenticated caller and the request carried no readable
+  // identity, or the forwarded JWT failed validation (expired, wrong issuer, bad signature).
+  UNAUTHENTICATED = 5;
+  // The payload could not be deserialised into the handler's parameter type.
+  INVALID_REQUEST = 6;
+  // The handling service evaluated the handler's @RequiresAuthentication expression as false for
+  // an authenticated caller.
+  PERMISSION_DENIED = 7;
+  // The target instance cannot take the request now: its queue at the hub is full (entries, its
+  // bytes, or the bytes queued over the whole hub) or its session buffer is full. The handler
+  // never saw the request.
+  RESOURCE_EXHAUSTED = 8;
+  // The stream or subscription was ended by the hub (it outlived the hub's maximum duration).
+  CANCELLED = 9;
+}
+
+message Error {
+  // The Request.id this error refers to.
+  string request_id = 1;
+  ErrorCode code = 2;
+  // Human-readable, safe to log and to surface to a developer. Not for end users.
+  string message = 3;
+  // Optional machine-readable details from the handler (for example a validation error list as
+  // JSON). Empty for hub-generated errors.
+  bytes details = 4;
+}
+
+// One answer of a multi-part request. For scatter-gather, one per target that answered,
+// in arrival order, with the sender's Request.id. A target's Reply{error}, a hub-side failure of
+// one target (HANDLER_DISCONNECTED or RESOURCE_EXHAUSTED) is a part with `error` set and no
+// payload.
+message ReplyPart {
+  // The sender's Request.id.
+  string request_id = 1;
+  // JSON document, UTF-8, as the target's Reply.payload. Empty when `error` is set.
+  bytes payload = 2;
+  // The target's failure; its request_id is the sender's Request.id.
+  Error error = 3;
+  // The service and instance that answered.
+  string responder_service = 4;
+  string responder_instance = 5;
+  // Scatter-gather: 0, 1, 2, ... in the order the hub sent the parts. Streaming: the handler's own
+  // number, 1, 2, 3, ... per request with no gap, relayed unchanged. Subscription: the hub's own,
+  // 1 for the initial result, then 2, 3, ... for the updates. A gap a sender sees in a stream or a
+  // subscription is a part the hub dropped.
+  uint64 seq = 6;
+}
+
+// The last message of a multi-part request: no ReplyPart for its id follows. For
+// scatter-gather: sent when every target answered, when max_results successful parts arrived, or
+// at the deadline, whichever is first.
+message ReplyEnd {
+  // The sender's Request.id.
+  string request_id = 1;
+  // Set when the request failed as a whole. Never set for scatter-gather: partial answers are
+  // answers, and the counts below tell what was missing.
+  Error error = 2;
+  // ReplyParts sent, failed ones included.
+  uint32 parts = 3;
+  // Of those, parts carrying an error.
+  uint32 failed = 4;
+  // Targets that had not answered by the deadline (no part was sent for them).
+  uint32 timed_out = 5;
+}
+
+// Credits: the receiver of a stream or a subscription may get `credits` more parts.
+// From the sender with its Request.id; the hub passes it on to a streaming handler ("<id>#1").
+message Flow {
+  string request_id = 1;
+  uint32 credits = 2;
+}
+
+// Cancels a stream or a subscription: from the sender with its Request.id, no
+// ReplyEnd follows; from the hub to a handler with the target's id ("<id>#n") when the request
+// ended, the reason saying why.
+message Cancel {
+  string request_id = 1;
+  string reason = 2;
+}
+
+// Keep-alive. A client sends one every RegisterAck.heartbeat_interval_ms (3 s by default) and is
+// evicted after RegisterAck.heartbeat_timeout_ms (10 s by default) without one. The stream closing
+// evicts at once. The hub echoes a client Heartbeat with `sent_at_ms` unchanged.
+message Heartbeat {
+  // Sender's wall clock in milliseconds since the Unix epoch, for skew diagnostics only.
+  int64 sent_at_ms = 1;
+}
+
+// Request for a topology snapshot. Carries no parameters.
+message TopologyRequest {}
+
+// One snapshot, taken at a point in time. The hub's internal maps are read one after another, so
+// a service may briefly appear in one and not another; the snapshot reconciles by instance id.
+message TopologyResponse {
+  // Wall clock (epoch milliseconds) when this hub process started.
+  int64 hub_started_at_ms = 1;
+  // Wall clock (epoch milliseconds) at snapshot time.
+  int64 now_ms = 2;
+  // The hub's heartbeat eviction threshold in milliseconds (RegisterAck.heartbeat_timeout_ms).
+  int64 heartbeat_timeout_ms = 3;
+  repeated ServiceTopology services = 4;
+  // Sorted by type name.
+  repeated TypeOwnership types = 5;
+  TopologyTotals totals = 6;
+  // Same value as RegisterAck.hub_id.
+  string hub_id = 7;
+}
+
+message ServiceTopology {
+  string service_name = 1;
+  // Sorted by instance_id.
+  repeated InstanceTopology instances = 2;
+}
+
+message InstanceTopology {
+  string instance_id = 1;
+  // Wall clock (epoch milliseconds) when the stream registered.
+  int64 connected_since_ms = 2;
+  // now_ms minus the last heartbeat (or the registration time if none yet).
+  int64 last_heartbeat_age_ms = 3;
+  // True when the last heartbeat is older than a third of the eviction threshold.
+  bool stale = 4;
+  // Pending requests forwarded to this instance (each scatter-gather target included).
+  uint32 in_flight_as_handler = 5;
+  // Pending requests this instance sent (a scatter-gather counts once).
+  uint32 in_flight_as_sender = 6;
+  // Sorted.
+  repeated string command_types = 7;
+  // Sorted.
+  repeated string query_types = 8;
+  // Register.client_version, empty when the client did not send one.
+  string client_version = 10;
+  // Requests the hub may still forward before the next Permits.
+  uint32 permits_available = 11;
+  // Requests waiting in the hub's queue for this instance.
+  uint32 queued = 12;
+  // Register.load_factor as applied (0 reads as 100).
+  uint32 load_factor = 13;
+  // Register.tags.
+  map<string, string> tags = 14;
+  // InstanceStatus.connected_hub_ids as last reported; empty when never reported.
+  repeated string connected_hub_ids = 16;
+  // now_ms minus the time of the last InstanceStatus; -1 when never reported.
+  int64 status_age_ms = 17;
+  // Sorted; the query types of query_types this instance registered as shared.
+  repeated string shared_query_types = 18;
+  // InstanceStatus.processors of the latest report, as the hub keeps them (bounded);
+  // empty when never reported.
+  repeated ProcessorStatus processors = 19;
+}
+
+message TypeOwnership {
+  string type = 1;
+  // Reuses RequestKind (COMMAND or QUERY).
+  RequestKind kind = 2;
+  // Instances currently listing the type (over all owners of a shared type).
+  uint32 live_instances = 4;
+  // No live instance; stays until the owner grace sweep removes the type.
+  bool orphaned = 5;
+  // 0 unless orphaned.
+  int64 orphaned_for_ms = 6;
+  // Registered through Register.shared_query_types: many services may own it.
+  bool shared = 7;
+  // Every owning service, sorted (one entry for an exclusive type).
+  repeated string owner_services = 8;
+}
+
+message TopologyTotals {
+  uint32 services = 1;
+  uint32 instances = 2;
+  uint32 command_types = 3;
+  uint32 query_types = 4;
+  // Requests awaiting their terminal message (queued requests included). A scatter-gather counts
+  // once, not per target.
+  uint32 in_flight = 5;
+  // Requests waiting in per-instance queues, all instances.
+  uint32 queued = 6;
+}
