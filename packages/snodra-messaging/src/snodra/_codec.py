@@ -59,8 +59,8 @@ class JsonCodec:
     A dataclass is an object whose field names are camelCase (``order_id`` is ``orderId``; a field's
     ``metadata={"json": "orderID"}`` names it exactly). Nested dataclasses, ``list``, ``dict[str, X]``, ``X | None``,
     ``str``, ``int``, ``float``, ``bool``, ``bytes`` (base64), ``datetime`` (ISO 8601 UTC), ``uuid.UUID`` and
-    ``enum.Enum`` are read and written; an enum is written by its member value, which a Kotlin service reads only when
-    it equals the name of one of its enum constants. ``None`` fields are written as ``null``, unknown fields are
+    ``enum.Enum`` are read and written; an enum is written by its member value, which another service reads as an enum
+    only when it is the name of one of its constants. ``None`` fields are written as ``null``, unknown fields are
     ignored on read, an absent field takes its default, reads as ``None`` when it is optional (``X | None``) and
     fails otherwise. One trailing underscore of a field name is dropped (``type_`` is ``type``), and two fields on one
     JSON key are a ``TypeError``. A class with ``model_validate`` and ``model_dump``

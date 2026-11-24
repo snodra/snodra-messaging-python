@@ -21,7 +21,7 @@ def test_every_code_reads_as_itself() -> None:
     assert error_from_wire(wire(42, "m"), "x.Y").code == snodra.ErrorCode.HANDLER_ERROR
 
 
-def test_the_messages_the_caller_reads() -> None:  # SG-1: the Kotlin library's texts
+def test_the_messages_the_caller_reads() -> None:  # SG-1
     t = "orders.PlaceOrder"
 
     def msg(c: int, m: str = "hub says") -> str:

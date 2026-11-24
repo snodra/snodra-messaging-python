@@ -300,7 +300,7 @@ async def test_a_refused_register_waits_the_cap_and_is_exposed(hub: FakeHub) -> 
     within(time.monotonic() - closed, 0.8 * 0.2, 0.2 + SETUP)
     revoked = app.rejection
     assert revoked is not None
-    # Once acknowledged, a refusal names the hub by its id, as the Kotlin library does.
+    # Once acknowledged, a refusal names the hub by its id.
     assert (revoked.hub, revoked.code, revoked.message) == ("hub-1", "PERMISSION_DENIED", "access revoked")
 
     # A later accepted Register leaves the latest refusal as it was.
