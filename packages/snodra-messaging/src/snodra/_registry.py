@@ -37,6 +37,8 @@ class Handler:
     """How logs and errors name it: the function's qualified name, without ``<locals>``."""
     guard: Guard | None = None
     """Who may call it; None: anyone, an anonymous caller too."""
+    shared: bool = False
+    """A query type many services may own (``Register.shared_query_types``); a command is never shared."""
 
 
 def label_of(fn: object) -> str:
@@ -56,10 +58,10 @@ class Registry:
         """No handler is registered from now on."""
         self._closed = True
 
-    def add(self, kind: Kind, fn: object, guard: Guard | None = None) -> Handler:
+    def add(self, kind: Kind, fn: object, guard: Guard | None = None, *, shared: bool = False) -> Handler:
         """Registers fn as the kind's handler of the type its first parameter is annotated with, for the callers
-        guard lets through. Raises :class:`RegistrationClosed` once closed and ``TypeError`` for what cannot be served,
-        naming the handler."""
+        guard lets through; a shared query type when shared. Raises :class:`RegistrationClosed` once closed and
+        ``TypeError`` for what cannot be served, naming the handler."""
         label = label_of(fn)
         if self._closed:
             raise RegistrationClosed(f"handler {label}: handlers are registered before the app starts")
@@ -75,7 +77,9 @@ class Registry:
             )
         if (taken := self._handlers[kind].get(name)) is not None:
             raise TypeError(f"handler {label}: type {name} already has the {kind} handler {taken.label}")
-        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard)
+        if shared and kind != "query":
+            raise TypeError(f"handler {label}: a command type is never shared")
+        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard, shared)
         self._handlers[kind][name] = handler
         return handler
 
@@ -84,8 +88,12 @@ class Registry:
         return self._handlers[kind].get(type_)
 
     def types(self, kind: Kind) -> list[str]:
-        """The kind's types, sorted: a ``Register`` list."""
-        return sorted(self._handlers[kind])
+        """The kind's types that are not shared, sorted: ``Register.command_types`` or ``Register.query_types``."""
+        return sorted(t for t, h in self._handlers[kind].items() if not h.shared)
+
+    def shared_types(self) -> list[str]:
+        """The shared query types, sorted: ``Register.shared_query_types``."""
+        return sorted(t for t, h in self._handlers["query"].items() if h.shared)
 
 
 def _message_class(fn: object, label: str) -> type:

@@ -21,6 +21,8 @@ from conformance_service.messages import (
     Relay,
     RelayAnswer,
     Send,
+    SharedQuery,
+    SharedQueryAnswer,
     Sleep,
     SleepAnswer,
     SleepQuery,
@@ -67,6 +69,10 @@ def register_handlers(app: App, settings: Settings) -> Sends:
     @app.query_handler
     async def on_sleep_query(m: SleepQuery) -> SleepAnswer:
         return await sleep(m.ms)
+
+    @app.query_handler(shared=True)  # other services may own it too
+    async def on_shared_query(m: SharedQuery) -> SharedQueryAnswer:
+        return SharedQueryAnswer(settings.service, instance)
 
     @app.command_handler
     async def on_fail(m: Fail) -> None:

@@ -83,6 +83,7 @@ async def test_the_register_lists_the_contracts_unary_types(hub: FakeHub, servic
         "conformance.SleepQuery",
         "conformance.View",
     ]
+    assert list(r.shared_query_types) == ["conformance.SharedQuery"]
 
 
 async def test_echo_answers_what_it_got(hub: FakeHub, service: App) -> None:
@@ -119,6 +120,12 @@ async def test_sleep_sleeps_then_answers(hub: FakeHub, service: App) -> None:
     answer = _answer(await _ask(s, "conformance.Sleep", {}))
     assert isinstance(answer, dict)
     assert answer["sleptMs"] < 100
+
+
+async def test_shared_query_answers_who_answered(hub: FakeHub, service: App) -> None:
+    s = await _stream(hub)
+    answer = _answer(await _ask(s, "conformance.SharedQuery", {}, kind=hub_pb2.QUERY))
+    assert answer == {"service": "conformance-python", "instanceId": "i-1"}
 
 
 async def test_fail_raises_an_application_error(hub: FakeHub, service: App) -> None:

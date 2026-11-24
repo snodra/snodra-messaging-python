@@ -13,6 +13,7 @@ from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
 from snodra._dispatch import Dispatcher
 from snodra._errors import ConfigurationError
+from snodra._gather import Gathered, gather
 from snodra._identity import Guard, IdentityResolver
 from snodra._jwt import JwksVerifier
 from snodra._local import LocalCalls
@@ -121,12 +122,24 @@ class App:
     @overload
     def query_handler(self, fn: H, /) -> H: ...
     @overload
-    def query_handler(self, fn: None = None, /, *, guard: Guard | None = None) -> Callable[[H], H]: ...
-    def query_handler(self, fn: H | None = None, /, *, guard: Guard | None = None) -> H | Callable[[H], H]:
-        """Registers a point query handler, as :meth:`command_handler` registers a command handler."""
-        return self._handler("query", fn, guard)
+    def query_handler(
+        self, fn: None = None, /, *, shared: bool = False, guard: Guard | None = None
+    ) -> Callable[[H], H]: ...
+    def query_handler(
+        self, fn: H | None = None, /, *, shared: bool = False, guard: Guard | None = None
+    ) -> H | Callable[[H], H]:
+        """Registers a point query handler, as :meth:`command_handler` registers a command handler.
 
-    def _handler(self, kind: Kind, fn: H | None, guard: Guard | None) -> H | Callable[[H], H]:
+        ``shared=True`` registers its type as a shared query type (``Register.shared_query_types``): many services may
+        own it, a point query goes to one live instance of any owner, a gather asks all of them. Every owner must
+        register it shared (the hub refuses a type registered exclusive by one owner and shared by another). A point
+        query of a shared type this instance handles still goes through the hub, never in-process, so that the hub
+        spreads it over every owner."""
+        if not isinstance(shared, bool):
+            raise TypeError(f"shared must be True or False, got {shared!r}")
+        return self._handler("query", fn, guard, shared=shared)
+
+    def _handler(self, kind: Kind, fn: H | None, guard: Guard | None, *, shared: bool = False) -> H | Callable[[H], H]:
         if guard is not None and not isinstance(guard, Guard):
             raise TypeError(f"guard must be made by authenticated(), role() or caller_matches(), got {guard!r}")
 
@@ -137,7 +150,7 @@ class App:
                     "configured to verify forwarded tokens: set jwks_url (SNODRA_JWKS_URL) and issuer (SNODRA_ISSUER); "
                     "without them every caller is anonymous"
                 )
-            self._registry.add(kind, f, guard)
+            self._registry.add(kind, f, guard, shared=shared)
             return f
 
         return register if fn is None else register(fn)
@@ -238,6 +251,45 @@ class App:
             retry=retry,
         )
 
+    async def gather(
+        self,
+        query: object,
+        result: type[R],
+        *,
+        max_results: int = 0,
+        timeout: float | None = None,  # noqa: ASYNC109 (the API takes a timeout)
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> Gathered[R]:
+        """Sends a scatter-gather: the query goes to every live instance of every service that owns its type (a shared
+        type; on an exclusive type every instance of its owner), and every answer comes back as a :class:`Part`, in
+        arrival order, until the hub's end. Partial answers are answers: a gather where some targets failed or did
+        not answer in time succeeds, and :class:`Gathered` says what was missing.
+
+        ``max_results`` ends the gather after that many successful parts (0: no limit; the hub cancels the targets
+        still working). ``timeout`` is the deadline of the whole gather: the targets that have not answered by then
+        are counted in ``timed_out``. ``timeout``, ``priority``, ``headers`` and ``retry`` are those of :meth:`send`;
+        a retry sends a new gather, which collects its own parts. A gather always goes through a hub, also when this
+        instance handles the type.
+
+        A target's failure is a part with an ``error`` (:class:`HubError`), and so is an answer that does not decode as
+        ``result`` (:class:`DecodeError`). The gather itself fails with :class:`HubError` (``NO_HANDLER`` when the
+        type has no live target, ``INVALID_REQUEST`` for a command type or a subscription type, ``TIMEOUT`` when the
+        hub's end did not come within its bound for the gather plus 1 s), :class:`NeverSent` or
+        :class:`OutcomeUnknown` (the hub stream broke before the end: the parts received are dropped). A cancellation
+        of the caller stays ``asyncio.CancelledError``."""
+        return await gather(
+            self._sender,
+            query,
+            result,
+            max_results=max_results,
+            timeout=timeout,
+            priority=priority,
+            headers=headers,
+            retry=retry,
+        )
+
     def hub_ids(self) -> list[str]:
         """``RegisterAck.hub_id`` of every acknowledged stream (its address when empty), sorted."""
         return self._pool.hub_ids()
@@ -249,7 +301,8 @@ class App:
         if self._started:
             raise RuntimeError("the app is already started")
         self._registry.close()
-        self._pool.declare(self._registry.types("command"), self._registry.types("query"))
+        registry = self._registry
+        self._pool.declare(registry.types("command"), registry.types("query"), registry.shared_types())
         self._started = True
         self._pool.start()
 

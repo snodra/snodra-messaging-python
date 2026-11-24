@@ -74,9 +74,14 @@ class Pool:
         self.leaving = False
         """The app's shutdown drained its handlers: nothing is sent any more."""
 
-    def declare(self, command_types: list[str], query_types: list[str]) -> None:
+    def declare(self, command_types: list[str], query_types: list[str], shared_query_types: list[str]) -> None:
         """The types every ``Register`` of every stream lists; before :meth:`start`."""
-        for field, types in ((self._register.command_types, command_types), (self._register.query_types, query_types)):
+        r = self._register
+        for field, types in (
+            (r.command_types, command_types),
+            (r.query_types, query_types),
+            (r.shared_query_types, shared_query_types),
+        ):
             del field[:]
             field.extend(types)
 

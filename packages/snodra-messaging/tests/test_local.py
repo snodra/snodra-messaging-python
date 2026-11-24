@@ -15,9 +15,11 @@ from helpers import (
     TP,
     CancelOrder,
     GetOrder,
+    GetStock,
     Jwks,
     Placed,
     PlaceOrder,
+    Stock,
     acknowledged,
     new_app,
     next_reply,
@@ -182,6 +184,22 @@ async def test_always_route_through_hub_sends_own_types_through_the_hub(hub: Fak
     assert r.type == "orders.GetOrder"
     await s.send(hub_pb2.ServerMessage(reply=hub_pb2.Reply(request_id=r.id, payload=b'{"orderId":"o-1","total":4}')))
     assert await query == Placed("o-1", 4)
+
+
+async def test_a_point_query_of_an_own_shared_type_goes_through_the_hub(hub: FakeHub) -> None:
+    app = new_app(hub)
+
+    @app.query_handler(shared=True)
+    async def get_stock(q: GetStock) -> Stock:
+        raise AssertionError("the hub spreads it over every owner")
+
+    await app.start()
+    s = await acknowledged(hub)
+    query = asyncio.create_task(app.query(GetStock("sku-1"), Stock))
+    r = await s.recv_request()
+    assert (r.type, r.kind, r.mode) == ("orders.GetStock", hub_pb2.QUERY, hub_pb2.UNARY)
+    await s.send(hub_pb2.ServerMessage(reply=hub_pb2.Reply(request_id=r.id, payload=b'{"count":5}')))
+    assert await query == Stock(5)
 
 
 async def test_an_in_process_call_has_no_timeout_or_retry(hub: FakeHub) -> None:

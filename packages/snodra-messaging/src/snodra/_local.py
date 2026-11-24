@@ -1,10 +1,11 @@
 """Requests the instance answers itself, in-process, without a hub.
 
 By default a command of a type this instance has a command handler for, and a point query of a type it has a query
-handler for, run here: through the same checks as a forwarded request (the guards, the decoding, the error mapping),
-with the headers a request through the hub would carry, and the caller the hub path would carry. Nothing goes on the
-wire: no permit, no routing key, no timeout of the library's own, no retry. ``Settings.always_route_through_hub``
-sends them through a hub instead.
+handler for that is not shared, run here: through the same checks as a forwarded request (the guards, the decoding,
+the error mapping), with the headers a request through the hub would carry, and the caller the hub path would carry.
+Nothing goes on the wire: no permit, no routing key, no timeout of the library's own, no retry.
+``Settings.always_route_through_hub`` sends them through a hub instead. A query of a shared type and a scatter-gather
+always go through a hub.
 
 See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Requests a service answers itself").
 """
@@ -39,10 +40,12 @@ class LocalCalls:
 
     def handler(self, kind: Literal["command", "query"], type_: str) -> Handler | None:
         """The handler of this instance that answers a call of kind and type_ in-process; None when the call goes
-        through a hub (always with ``always_route_through_hub``)."""
+        through a hub: always with ``always_route_through_hub``, and for a shared query type, which the hub spreads
+        over every owner's instances."""
         if self._settings.always_route_through_hub:
             return None
-        return self._registry.find(kind, type_)
+        handler = self._registry.find(kind, type_)
+        return None if handler is None or handler.shared else handler
 
     async def call(
         self,

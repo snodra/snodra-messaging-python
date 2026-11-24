@@ -451,3 +451,16 @@ class GetOrder:
 @dataclass
 class CancelOrder:
     order_id: str
+
+
+@message_type("orders.GetStock")
+@dataclass
+class GetStock:
+    """A query many services may answer (a shared type)."""
+
+    sku: str
+
+
+@dataclass
+class Stock:
+    count: int

@@ -118,6 +118,14 @@ class OutboundRequest:
         if not self.answer.done():
             self.answer.set_result(outcome)
 
+    def take(self, m: hub_pb2.ServerMessage) -> bool:
+        """A frame from the hub for this request's id: a ``Reply`` or an ``Error`` answers it; False for any other
+        frame, which is no answer to a unary request."""
+        if m.WhichOneof("message") not in ("reply", "error"):
+            return False
+        self.resolve(m)
+        return True
+
 
 class _Stream:
     """One ``Hub.Connect`` stream: its outbound queue, its handshake and the silent-hub watch."""
@@ -774,7 +782,7 @@ class HubConnection:
                         self._hand_over(self._on_request, stream, m.request)
                     case "cancel" if self._on_cancel is not None:
                         self._hand_over(self._on_cancel, stream, m.cancel)
-                    case "reply" | "error" if self._on_answer is not None:
+                    case "reply" | "error" | "part" | "end" if self._on_answer is not None:
                         self._hand_over(self._on_answer, stream, m)
         except grpc.aio.AioRpcError as e:
             return stream.status or _End(e.code(), e.details() or "")

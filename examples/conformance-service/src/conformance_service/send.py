@@ -11,6 +11,7 @@ from typing import Any
 
 from snodra import (
     App,
+    Gathered,
     HubError,
     LostParts,
     NeverSent,
@@ -20,7 +21,7 @@ from snodra import (
     RetryPolicy,
 )
 
-from conformance_service.messages import Echo, EchoQuery, Missing, Outcome, Probe, ProbeQuery, Send
+from conformance_service.messages import Echo, EchoQuery, Missing, Outcome, Probe, ProbeQuery, Send, SharedQuery
 
 _UNARY: dict[str, tuple[type[RawJson], bool]] = {
     "probe": (Probe, False),
@@ -28,8 +29,16 @@ _UNARY: dict[str, tuple[type[RawJson], bool]] = {
     "missing": (Missing, False),
     "echo": (Echo, False),
     "echo-query": (EchoQuery, True),
+    "shared-query": (SharedQuery, True),
 }
 """The unary targets: the message class and whether it is a query."""
+
+_GATHERED: dict[str, type[RawJson]] = {
+    "probe-query": ProbeQuery,
+    "echo-query": EchoQuery,
+    "shared-query": SharedQuery,
+}
+"""The targets of a scatter-gather: the query types."""
 
 KEPT_OUTCOMES = 1024
 """Finished asynchronous sends whose outcome is kept for ``conformance.Outcome``; older ones are forgotten."""
@@ -102,7 +111,9 @@ class Sends:
         started = time.monotonic()
         if m.op == "unary":
             out = await self._unary(m)
-        elif m.op in ("scatter", "stream", "subscribe"):
+        elif m.op == "scatter":
+            out = await self._scatter(m)
+        elif m.op in ("stream", "subscribe"):
             out = _unsupported(f"op {m.op} is not supported by this service yet")
         else:
             out = _unsupported(f"op {m.op} is not a contract op")
@@ -125,6 +136,30 @@ class Sends:
         except Exception as e:
             return {"result": "error", "error": classify(e)}
         return {"result": "ok", "payload": None if reply is None else reply.value}
+
+    async def _scatter(self, m: Send) -> dict[str, Any]:
+        """A scatter-gather of the query target with the library's gather: one part per answer, in arrival order,
+        with the counts."""
+        cls = _GATHERED.get(m.target)
+        if cls is None:
+            return _unsupported(f"target {m.target} is not a query target of this service")
+        try:
+            options = _options(m)
+            del options["routing_key"]  # a gather goes to every target: unkeyed
+            gathered: Gathered[RawJson] = await self._app.gather(
+                cls(m.payload), RawJson, max_results=m.max_results or 0, **options
+            )
+        except Exception as e:
+            return {"result": "error", "error": classify(e)}
+        parts: list[dict[str, Any]] = []
+        for p in gathered.parts:
+            part: dict[str, Any] = {"service": p.service, "instance": p.instance, "ok": p.error is None}
+            if p.error is not None:
+                part["error"] = classify(p.error)
+            else:
+                part["payload"] = None if p.value is None else p.value.value
+            parts.append(part)
+        return {"result": "ok", "parts": parts, "failed": gathered.failed, "timedOut": gathered.timed_out}
 
 
 def _options(m: Send) -> dict[str, Any]:

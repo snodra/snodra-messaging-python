@@ -123,3 +123,13 @@ library does there. Where an entry is settled, its behaviour is this library's r
   header has its id as its correlation id; a request with an empty header keeps the empty string: the handler's
   `current_message().correlation_id` is `""`, and the requests it sends carry `correlationId: ""` on.
 - **Question:** open: should an empty `correlationId` header count as none, so that the request's id stands in?
+
+### SG-10: a scatter-gather a hub answers with `NO_HANDLER`
+
+- **Specification:** `protocol.md` ("Several hubs") says that a unary request a hub answers with `NO_HANDLER` goes to
+  the other live hubs in turn, and that every call kind follows the failover rules; it does not say whether a
+  scatter-gather that a hub answers with `NO_HANDLER` (no live target there) goes to another hub.
+- **This library:** `snodra/_gather.py` (`gather`). A gather moves to another hub only while it was not taken (not
+  written); a hub's `NO_HANDLER` for it is the answer, as for a gather whose type has no live target anywhere. A retry
+  policy may still send a new gather, which picks a hub anew.
+- **Question:** open: should a gather walk the other live hubs after `NO_HANDLER`, as a unary request does?

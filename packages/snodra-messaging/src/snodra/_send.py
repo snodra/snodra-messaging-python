@@ -1,5 +1,5 @@
-"""Sending a command or a point query through the hubs: the request, its timing, the hubs tried in turn, retries, and
-the calls waiting for their answer.
+"""Sending a command, a point query or a scatter-gather through the hubs: the request, its timing, the hubs tried in
+turn, retries, and the calls waiting for their answer.
 
 See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Requests", "Several hubs").
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -93,12 +93,31 @@ class _LostInBuffer:
     """The request was queued, and its stream ended before the writer took it: a move."""
 
 
-_Hop = hub_pb2.ServerMessage | _NotTaken | _LostInBuffer
+@dataclass(frozen=True)
+class Answered:
+    """A request a hub answered: the frame that answered it (a ``Reply``, an ``Error`` or a ``ReplyEnd``) and its
+    entry."""
+
+    message: hub_pb2.ServerMessage
+    entry: OutboundRequest
+
+
+@dataclass(frozen=True)
+class Prepared:
+    """A call's request before its id, and how it is sent."""
+
+    template: hub_pb2.Request
+    chosen: float | None
+    """The call's timeout (None: the hub decides)."""
+    policy: RetryPolicy | None
+
+
+_Hop = Answered | _NotTaken | _LostInBuffer
 
 
 class Sender:
-    """Sends commands and point queries through the hubs and keeps the calls waiting for an answer: one entry per
-    request id, buffered while in a stream's outbound buffer, written once the writer took it."""
+    """Sends commands, point queries and scatter-gathers through the hubs and keeps the calls waiting for an answer:
+    one entry per request id, buffered while in a stream's outbound buffer, written once the writer took it."""
 
     def __init__(self, codec: Codec, settings: Settings, timings: Timings) -> None:
         self._codec = codec
@@ -111,15 +130,23 @@ class Sender:
         self.local: LocalCalls | None = None
         """Answers the calls of the instance's own types in-process; set by the app."""
 
+    @property
+    def codec(self) -> Codec:
+        """Reads and writes the payloads."""
+        return self._codec
+
     def on_answer(self, stream: _Stream, m: hub_pb2.ServerMessage) -> None:
-        """A ``Reply`` or an ``Error`` from a hub (called by the stream's reader): it answers the request of that id
-        sent on that stream; any other is dropped (its caller gave up, or it came from another stream)."""
-        id_ = m.reply.request_id if m.WhichOneof("message") == "reply" else m.error.request_id
+        """A ``Reply``, an ``Error``, a ``ReplyPart`` or a ``ReplyEnd`` from a hub (called by the stream's reader): the
+        request of that id sent on that stream takes it; any other is dropped (its caller gave up, it came from
+        another stream, or it is no answer to that request)."""
+        kind = m.WhichOneof("message")
+        id_ = getattr(m, kind).request_id if kind is not None else ""
         request = self.pending.get(id_)
         if request is None or request.stream is not stream:
-            log.debug("Answer to request %s dropped: nobody waits for it on this stream", id_)
+            log.debug("A %s for request %s dropped: nobody waits for it on this stream", kind, id_)
             return
-        request.resolve(m)
+        if not request.take(m):
+            log.debug("A %s for request %s dropped: no answer to that request", kind, id_)
 
     async def call(
         self,
@@ -136,6 +163,37 @@ class Sender:
         """One call: the request built, sent (retried by the policy), its answer decoded as ``result`` (None: the
         answer is not read). A call of a type this instance handles is answered in-process (see :mod:`snodra._local`):
         its options are checked, and its timeout, retry, routing key and priority do not apply."""
+        p = self.prepare(
+            message,
+            kind,
+            routing_key=routing_key,
+            timeout=timeout,
+            priority=priority,
+            headers=headers,
+            retry=retry,
+        )
+        t = p.template
+        if self.local is not None and (local := self.local.handler(kind, t.type)) is not None:
+            return await self.local.call(local, kind, t.payload, dict(t.headers), result)
+        payload = await self.with_retry(p, self._attempt)
+        if result is None:
+            return None
+        return self._codec.decode(payload or b"{}", result)
+
+    def prepare(
+        self,
+        message: object,
+        kind: Literal["command", "query"],
+        *,
+        routing_key: str | None,
+        timeout: float | None,
+        priority: int | None,
+        headers: Mapping[str, str] | None,
+        retry: RetryPolicy | Literal[False] | None,
+        mode: hub_pb2.RequestMode = hub_pb2.UNARY,
+    ) -> Prepared:
+        """The call's request (without its id) and its timeout and retry policy, once its options are checked; raises
+        before anything is sent for an option it refuses."""
         type_ = type_name(message)
         # The own headers are checked before anything else is built: a reserved name sends nothing.
         request_headers = outgoing_headers(headers, forward_jwt=self._settings.forward_jwt)
@@ -147,22 +205,16 @@ class Sender:
             raise ValueError(f"the priority of {type_} must be a 32-bit integer, got {priority!r}")
         if routing_key is not None and not isinstance(routing_key, str):
             raise TypeError(f"the routing key of {type_} must be a text, got {routing_key!r}")
-        payload = self._codec.encode(message)
-        if self.local is not None and (local := self.local.handler(kind, type_)) is not None:
-            return await self.local.call(local, kind, payload, request_headers, result)
         template = hub_pb2.Request(
             kind=hub_pb2.COMMAND if kind == "command" else hub_pb2.QUERY,
             type=type_,
             routing_key=routing_key or "",
-            payload=payload,
+            payload=self._codec.encode(message),
             headers=request_headers,
             priority=self._settings.priorities.get(type_, 0) if priority is None else priority,
-            mode=hub_pb2.UNARY,
+            mode=mode,
         )
-        payload = await self._with_retry(template, chosen, policy)
-        if result is None:
-            return None
-        return self._codec.decode(payload or b"{}", result)
+        return Prepared(template, chosen, policy)
 
     def _chosen(self, timeout: float | None) -> float | None:
         """The call's timeout: ``timeout``, else ``default_timeout``. 0 (or less) is none, also over the default: the
@@ -184,11 +236,12 @@ class Sender:
             raise TypeError(f"retry must be a RetryPolicy, False or None, got {retry!r}")
         return retry
 
-    async def _with_retry(self, template: hub_pb2.Request, chosen: float | None, policy: RetryPolicy | None) -> bytes:
-        """The answer's payload; attempts follow ``policy`` within one budget, each a fresh id sending what is left of
-        the budget (at least 1 ms)."""
+    async def with_retry[T](self, p: Prepared, run: Callable[[hub_pb2.Request, float | None], Awaitable[T]]) -> T:
+        """What ``run(template, timeout)`` returns; attempts follow the call's policy within one budget, each a fresh
+        id (``run`` routes the template) sending what is left of the budget (at least 1 ms)."""
+        template, chosen, policy = p.template, p.chosen, p.policy
         if policy is None or policy.max_attempts <= 1:
-            return await self._attempt(template, chosen)
+            return await run(template, chosen)
         t = self._timings
         loop = asyncio.get_running_loop()
         ack = None if self.pool is None else self.pool.first_ack()
@@ -198,7 +251,7 @@ class Sender:
         while True:
             remaining = max(deadline - loop.time(), 0.001)
             try:
-                return await self._attempt(template, remaining)
+                return await run(template, remaining)
             except SnodraError as e:
                 if attempt >= policy.max_attempts or not retryable(template.kind, e) or self._leaving():
                     raise
@@ -212,7 +265,7 @@ class Sender:
 
     async def _attempt(self, template: hub_pb2.Request, chosen: float | None) -> bytes:
         """One attempt: the answer's payload, or the error it maps to."""
-        answer = await self._route(template, chosen)
+        answer = (await self.route(template, chosen)).message
         if answer.WhichOneof("message") == "error":
             raise error_from_wire(answer.error, template.type)
         reply = answer.reply
@@ -223,12 +276,20 @@ class Sender:
     def _leaving(self) -> bool:
         return self.pool is not None and self.pool.leaving
 
-    async def _route(self, template: hub_pb2.Request, chosen: float | None) -> hub_pb2.ServerMessage:
+    async def route(
+        self,
+        template: hub_pb2.Request,
+        chosen: float | None,
+        *,
+        entry: Callable[[hub_pb2.ClientMessage], OutboundRequest] = OutboundRequest,
+        walk: bool = True,
+    ) -> Answered:
         """Sends the request, with one fresh id, to the hubs in turn until one answers it, within one deadline (the
-        chosen timeout, else 5 s): a hub that answers ``NO_HANDLER`` or did not take the request is not tried again;
-        when every live hub declined, the last ``NO_HANDLER`` is the answer at once. With no hub to take it, the call
-        waits for the live hubs to change until the deadline; no hop starts after it. Every hop sends the chosen
-        timeout whole."""
+        chosen timeout, else 5 s): a hub that did not take the request is not tried again, nor, with ``walk`` (a unary
+        request), one that answers ``NO_HANDLER``; when every live hub declined, the last ``NO_HANDLER`` is the answer
+        at once. With no hub to take it, the call waits for the live hubs to change until the deadline; no hop starts
+        after it. Every hop sends the chosen timeout whole. ``entry`` makes the request's entry, which takes the hub's
+        frames for its id."""
         t = self._timings
         type_ = template.type
         loop = asyncio.get_running_loop()
@@ -242,7 +303,7 @@ class Sender:
         request.id = new_id()
         tried: set[HubConnection] = set()
         moves = 0
-        declined: hub_pb2.ServerMessage | None = None
+        declined: Answered | None = None
         while True:
             pool = self.pool
             if pool is None or pool.leaving:
@@ -259,7 +320,7 @@ class Sender:
                 # TODO(spec-gap): SG-3
                 text = "no hub connected within" if not tried else "no hub took the request within"
                 raise NeverSent(f"{text} {round(wait * 1000)} ms")
-            hop = await self._hop(conn, request, chosen, deadline)
+            hop = await self._hop(conn, request, chosen, deadline, entry)
             if isinstance(hop, _NotTaken):
                 tried.add(conn)
             elif isinstance(hop, _LostInBuffer):
@@ -268,7 +329,7 @@ class Sender:
                     raise NeverSent(f"'{type_}' not written: {moves} hub streams lost before it was")
                 log.debug("Request %s (%s) lost in a stream's buffer: moving it (%d)", request.id, type_, moves)
                 tried.add(conn)
-            elif hop.WhichOneof("message") == "error" and hop.error.code == hub_pb2.NO_HANDLER:
+            elif walk and _no_handler(hop.message):
                 log.debug(
                     "Hub %s has no handler for request %s (%s): trying another hub", conn.address, request.id, type_
                 )
@@ -277,9 +338,16 @@ class Sender:
             else:
                 return hop
 
-    async def _hop(self, conn: HubConnection, request: hub_pb2.Request, chosen: float | None, deadline: float) -> _Hop:
-        """The request on one hub's live stream, and what came of it; ``TIMEOUT`` after the local guard, outcome
-        unknown when the stream ended after the write."""
+    async def _hop(
+        self,
+        conn: HubConnection,
+        request: hub_pb2.Request,
+        chosen: float | None,
+        deadline: float,
+        entry: Callable[[hub_pb2.ClientMessage], OutboundRequest],
+    ) -> _Hop:
+        """The request on one hub's live stream, and what came of it; ``TIMEOUT`` after the local guard (for a gather,
+        the guard of the whole gather), outcome unknown when the stream ended after the write."""
         stream = conn.live_stream()
         if stream is None:
             return _NotTaken()
@@ -303,7 +371,7 @@ class Sender:
                 raise NeverSent(f"'{request.type}' not sent: the app is shutting down")
             if not stream.writable:
                 return _NotTaken()
-        outbound = OutboundRequest(hub_pb2.ClientMessage(request=request))
+        outbound = entry(hub_pb2.ClientMessage(request=request))
         if not stream.put_request(outbound):
             return _NotTaken()
         self.pending[outbound.id] = outbound
@@ -321,7 +389,12 @@ class Sender:
             if outcome.written:
                 raise OutcomeUnknown(outcome.why)
             return _LostInBuffer()
-        return outcome
+        return Answered(outcome, outbound)
+
+
+def _no_handler(m: hub_pb2.ServerMessage) -> bool:
+    """The hub's ``Error{NO_HANDLER}``: it delivered the request to no handler."""
+    return m.WhichOneof("message") == "error" and m.error.code == hub_pb2.NO_HANDLER
 
 
 async def _woken(changed: asyncio.Event, within: float) -> bool:

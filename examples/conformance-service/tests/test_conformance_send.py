@@ -215,16 +215,86 @@ async def test_an_async_send_and_its_outcome(service: _Service) -> None:
 
 async def test_the_other_ops_are_not_supported_yet(service: _Service) -> None:
     _, s = await service()
-    for op, target in (("scatter", "probe-query"), ("stream", "probe-stream"), ("subscribe", "probe-watch")):
+    for op, target in (("stream", "probe-stream"), ("subscribe", "probe-watch"), ("scatter", "probe")):
         ask = await _ask(s, "conformance.Send", {"op": op, "target": target})
         sent, reply = await _frames(s, ask)
         assert not sent
         outcome = _payload(reply)
         assert outcome["result"] == "unsupported"
         assert outcome["reason"]
-    ask = await _ask(s, "conformance.Send", {"op": "unary", "target": "shared-query"})
+
+
+def _part(id: str, seq: int, instance: str, payload: object = None, error: tuple[int, str] | None = None) -> Any:
+    part = hub_pb2.ReplyPart(
+        request_id=id, seq=seq, responder_service="conformance-runner", responder_instance=instance
+    )
+    if error is None:
+        part.payload = json.dumps(payload).encode()
+    else:
+        part.error.CopyFrom(hub_pb2.Error(request_id=id, code=error[0], message=error[1]))  # type: ignore[arg-type]
+    return hub_pb2.ServerMessage(part=part)
+
+
+async def test_scatter_goes_through_the_librarys_gather(service: _Service) -> None:
+    _, s = await service()
+    ask = await _ask(
+        s,
+        "conformance.Send",
+        {"op": "scatter", "target": "probe-query", "payload": {"k": 1}, "maxResults": 2, "timeoutMs": 3000},
+    )
+    gather = await _next_request(s)
+    assert (gather.type, gather.mode, gather.kind, gather.max_results, gather.timeout_ms, gather.routing_key) == (
+        "conformance.runner.ProbeQuery",
+        hub_pb2.SCATTER_GATHER,
+        hub_pb2.QUERY,
+        2,
+        3000,
+        "",
+    )
+    assert json.loads(gather.payload) == {"k": 1}
+    await s.send(_part(gather.id, 0, "p1", {"target": "p1"}))
+    await s.send(_part(gather.id, 1, "p2", error=(hub_pb2.HANDLER_ERROR, "p2 fails")))
+    await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=gather.id, parts=2, failed=1, timed_out=1)))
     _, reply = await _frames(s, ask)
-    assert _payload(reply)["result"] == "unsupported"
+    outcome = _payload(reply)
+    assert outcome.pop("elapsedMs") >= 0
+    assert outcome == {
+        "result": "ok",
+        "parts": [
+            {"service": "conformance-runner", "instance": "p1", "ok": True, "payload": {"target": "p1"}},
+            {
+                "service": "conformance-runner",
+                "instance": "p2",
+                "ok": False,
+                "error": {"kind": "code", "code": "HANDLER_ERROR", "message": "p2 fails", "details": None},
+            },
+        ],
+        "failed": 1,
+        "timedOut": 1,
+    }
+
+    # No target at all: the gather fails as a whole.
+    ask = await _ask(s, "conformance.Send", {"op": "scatter", "target": "echo-query"})
+    gather = await _next_request(s)
+    assert (gather.type, gather.mode) == ("conformance.EchoQuery", hub_pb2.SCATTER_GATHER)  # its own type too
+    await s.send(hub_error(gather.id, ErrorCode.NO_HANDLER, "nobody"))
+    _, reply = await _frames(s, ask)
+    outcome = _payload(reply)
+    assert (outcome["result"], outcome["error"]["code"]) == ("error", "NO_HANDLER")
+
+
+async def test_shared_query_sends(service: _Service) -> None:
+    _, s = await service()
+    for op, mode in (("unary", hub_pb2.UNARY), ("scatter", hub_pb2.SCATTER_GATHER)):
+        ask = await _ask(s, "conformance.Send", {"op": op, "target": "shared-query"})
+        sent = await _next_request(s)
+        assert (sent.type, sent.mode) == ("conformance.SharedQuery", mode)
+        if op == "unary":
+            await s.send(_reply(sent.id, {"service": "other", "instanceId": "o-1"}))
+        else:
+            await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=sent.id)))
+        _, reply = await _frames(s, ask)
+        assert _payload(reply)["result"] == "ok"
 
 
 async def test_relay_sends_on_and_rethrows(service: _Service) -> None:

@@ -23,6 +23,7 @@ from snodra._errors import (
     SnodraError,
     Unauthenticated,
 )
+from snodra._gather import Gathered, Part
 from snodra._identity import Caller, Guard, authenticated, caller_matches, role
 from snodra._messages import message_type
 from snodra._retry import RetryPolicy
@@ -41,6 +42,7 @@ __all__ = [
     "ConfigurationError",
     "DecodeError",
     "ErrorCode",
+    "Gathered",
     "Guard",
     "HandlerError",
     "HubError",
@@ -50,6 +52,7 @@ __all__ = [
     "MessageInfo",
     "NeverSent",
     "OutcomeUnknown",
+    "Part",
     "PermissionDenied",
     "RawJson",
     "RegistrationClosed",

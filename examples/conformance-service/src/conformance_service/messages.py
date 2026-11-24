@@ -40,6 +40,11 @@ class SleepQuery:
     ms: int = 0
 
 
+@message_type("conformance.SharedQuery")
+class SharedQuery(RawJson):
+    """A query registered in ``Register.shared_query_types``: other services may own it too."""
+
+
 @message_type("conformance.Fail")
 @dataclass
 class Fail:
@@ -147,6 +152,12 @@ class EchoAnswer:
 class SleepAnswer:
     instance_id: str
     slept_ms: int
+
+
+@dataclass
+class SharedQueryAnswer:
+    service: str
+    instance_id: str
 
 
 @dataclass
