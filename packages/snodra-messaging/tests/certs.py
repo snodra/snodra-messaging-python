@@ -1,12 +1,16 @@
 """Test certificates: a CA that issues hub (server) and service (client) certificates.
 
-Keys are RSA 2048; a certificate is valid for one hour from a minute ago unless its end is given.
+Keys are RSA 2048; a certificate is valid for one hour from a minute ago unless its end is given. Making a key
+takes 10 to 60 ms, too long to do on a test's event loop: a background thread keeps a few fresh keys ready
+(generating one releases the GIL), so the functions here stay synchronous and quick. No key is used twice.
 A service certificate names its service the way the hub reads it: one URI SAN
 ``snodra://service/<name>`` (https://snodra.damoreira.com/library-authors/protocol/).
 """
 
 from __future__ import annotations
 
+import queue
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -157,5 +161,17 @@ def make_ca(name: str) -> Ca:
     return Ca(name, key, certificate)
 
 
+_KEYS: queue.Queue[rsa.RSAPrivateKey] = queue.Queue(maxsize=8)
+
+
+def _make_keys() -> None:
+    while True:
+        _KEYS.put(rsa.generate_private_key(public_exponent=65537, key_size=2048))
+
+
+threading.Thread(target=_make_keys, name="certs:keys", daemon=True).start()
+
+
 def _new_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    """A fresh key from the pool; it waits only when more keys are asked for at once than the pool holds."""
+    return _KEYS.get()

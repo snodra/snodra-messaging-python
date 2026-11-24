@@ -12,7 +12,7 @@ import grpc
 import pytest
 from certs import ServerTls, make_ca
 from cryptography import x509
-from fakehub import FakeHub, ack, cancel, flow, forward, hub_error
+from fakehub import FakeHub, FakeStream, ack, cancel, flow, forward, hub_error
 from snodra._hubpb import hub_pb2, hub_pb2_grpc
 
 _Frame = hub_pb2.ServerMessage | grpc.aio.AioRpcError | None  # None: the hub ended the stream with OK
@@ -146,7 +146,8 @@ async def test_a_stream_is_scripted_frame_by_frame(hub: FakeHub, dial: Dial) -> 
     assert (await s.recv_register()).service_name == "orders-service"
     assert (await s.recv()).WhichOneof("message") == "heartbeat"  # consume it before the ack (see the comment at ack)
     await s.ack(ack("hub-1"))
-    assert (await c.read()).register_ack.hub_id == "hub-1"  # the early heartbeat was not echoed
+    assert (await c.read()).register_ack.hub_id == "hub-1"  # the ack first,
+    assert (await c.read()).heartbeat.sent_at_ms == 1  # then the echo of the early heartbeat, as snodra-server
     await c.write(heartbeat(7))
     assert (await c.read()).heartbeat.sent_at_ms == 7  # echoed after the ack
     await s.close(grpc.StatusCode.ALREADY_EXISTS, "taken")
@@ -317,7 +318,8 @@ async def test_no_echo_before_the_ack(hub: FakeHub, dial: Dial) -> None:
     assert (await s.recv()).heartbeat.sent_at_ms == 1
     await c.nothing(0.2)
     await s.ack(ack("hub-1"))
-    assert (await c.read()).register_ack.hub_id == "hub-1"  # no echo of heartbeat 1 came first
+    assert (await c.read()).register_ack.hub_id == "hub-1"  # no echo of heartbeat 1 came first:
+    assert (await c.read()).heartbeat.sent_at_ms == 1  # it follows the ack
 
     c2 = await dial(hub.address)
     await c2.write(register("orders-service", "i-2"))
@@ -326,6 +328,62 @@ async def test_no_echo_before_the_ack(hub: FakeHub, dial: Dial) -> None:
     s2.echo_heartbeats(True)
     await c2.write(heartbeat(2))
     assert (await c2.read()).heartbeat.sent_at_ms == 2  # echoed before any ack
+
+
+async def test_a_silent_hub_drops_the_held_echoes(hub: FakeHub, dial: Dial) -> None:
+    c = await dial(hub.address)
+    await c.write(register("orders-service", "i-1"))
+    await c.write(heartbeat(1))
+    s = await hub.next_stream()
+    await s.recv_register()
+    assert (await s.recv()).heartbeat.sent_at_ms == 1
+    s.echo_heartbeats(False)
+    await s.ack(ack("hub-1"))
+    await c.write(heartbeat(2))
+    assert (await s.recv()).heartbeat.sent_at_ms == 2
+    await s.send(flow("r", 1))
+    assert (await c.read()).register_ack.hub_id == "hub-1"
+    assert (await c.read()).flow.request_id == "r"  # neither heartbeat was echoed
+
+
+async def test_every_heartbeat_after_the_register_is_echoed_whatever_the_script_does(hub: FakeHub, dial: Dial) -> None:
+    # Whether the pump or the script runs first, the client sees the ack and then every echo, in order.
+    c = await dial(hub.address)
+    await c.write(register("orders-service", "i-1"))
+    s = await hub.next_stream()
+    await s.recv_register()
+    for ms in (1, 2, 3):
+        await c.write(heartbeat(ms))
+    await s.ack(ack("hub-1"))
+    assert (await c.read()).register_ack.hub_id == "hub-1"
+    assert [(await c.read()).heartbeat.sent_at_ms for _ in range(3)] == [1, 2, 3]
+
+
+async def test_the_reader_never_waits_on_a_client_that_does_not_read(hub: FakeHub) -> None:
+    # A raw call nobody reads from: the hub's writes back up, its echoes are dropped, and recv keeps working.
+    async with grpc.aio.insecure_channel(hub.address) as channel:
+        stub = hub_pb2_grpc.HubStub(channel)  # type: ignore[no-untyped-call]
+        call: grpc.aio.StreamStreamCall[hub_pb2.ClientMessage, hub_pb2.ServerMessage] = stub.Connect()
+        await call.write(register("orders-service", "i-1"))
+        s = await hub.next_stream()
+        await s.recv_register()
+        await s.ack(ack("hub-1"))
+        big = forward(hub_pb2.Request(id="r", payload=b"x" * (1 << 20)))
+        flooding = asyncio.create_task(_flood(s, big), name="test:flood")
+        try:
+            for ms in range(1, 201):
+                await call.write(heartbeat(ms))
+                assert (await s.recv()).heartbeat.sent_at_ms == ms
+            assert not flooding.done()  # the writes are stuck: the client reads nothing
+        finally:
+            flooding.cancel()
+            await asyncio.gather(flooding, return_exceptions=True)
+            call.cancel()
+
+
+async def _flood(s: FakeStream, frame: hub_pb2.ServerMessage) -> None:
+    while True:
+        await s.send(frame)
 
 
 async def test_echo_can_be_switched_off_after_the_ack(hub: FakeHub, dial: Dial) -> None:
@@ -409,7 +467,8 @@ async def test_nothing_fails_on_an_ended_stream(hub: FakeHub, dial: Dial) -> Non
         await asyncio.sleep(0)  # let the wait begin; the outcome does not depend on it
         c2.cancel()
         start = time.monotonic()
-        with pytest.raises(AssertionError, match="stream ended: CANCELLED"):
+        # The text shows it failed on the end of the frames, before the hub could tell how the client ended.
+        with pytest.raises(AssertionError, match="stream ended: the client half-closed or left"):
             await waiting
         assert time.monotonic() - start < 2.0
     finally:
@@ -424,13 +483,127 @@ async def test_half_closed(hub: FakeHub, dial: Dial) -> None:
     await s.recv_register()
     with pytest.raises(AssertionError, match="did not half-close within"):
         await s.half_closed(0.05)
+    await s.ack(ack("hub-1"))
     await c.done_writing()
     await s.half_closed(5.0)
-    # The hub can still write after the client half-closed, and the client still reads.
-    await s.ack(ack("hub-1"))
+    # As snodra-server, the hub ends a half-closed stream with OK; what was written before reaches the client.
     assert (await c.read()).register_ack.hub_id == "hub-1"
-    await s.close(grpc.StatusCode.OK, "")
     assert await c.status() == grpc.StatusCode.OK
+    assert "stream ended: the client half-closed" in await raises_at_once(s.recv)
+    with pytest.raises(AssertionError, match="stream ended"):
+        await s.send(flow("r", 1))
+    await s.close(grpc.StatusCode.ABORTED, "late")  # too late: a no-op
+
+
+async def test_a_half_close_before_any_frame_is_refused(hub: FakeHub, dial: Dial) -> None:
+    c = await dial(hub.address)
+    await c.done_writing()
+    s = await hub.next_stream()
+    await s.half_closed(5.0)
+    assert await c.status() == grpc.StatusCode.FAILED_PRECONDITION
+    assert "stream ended: FAILED_PRECONDITION: first message must be Register" in await raises_at_once(s.recv)
+
+
+def _types(
+    commands: Sequence[str] = (),
+    queries: Sequence[str] = (),
+    shared: Sequence[str] = (),
+    subscriptions: Sequence[str] = (),
+    *,
+    service: str = "orders-service",
+    instance: str = "i-1",
+    permits: int = 1,
+) -> hub_pb2.ClientMessage:
+    return hub_pb2.ClientMessage(
+        register=hub_pb2.Register(
+            service_name=service,
+            instance_id=instance,
+            initial_permits=permits,
+            command_types=commands,
+            query_types=queries,
+            shared_query_types=shared,
+            subscription_query_types=subscriptions,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("later", "details"),
+    [
+        (_types(["orders.X"], ["orders.X"]), "type orders.X listed as both command and query"),
+        (
+            _types([], ["orders.X"], ["orders.X"]),
+            "type orders.X listed as a shared query type and as a command or exclusive query",
+        ),
+        (
+            _types(["orders.X"], [], ["orders.X"]),
+            "type orders.X listed as a shared query type and as a command or exclusive query",
+        ),
+        (
+            _types(["orders.Watch"], [], [], ["orders.Watch"]),
+            "type orders.Watch listed as a subscription type but not as a query type",
+        ),
+        (  # an empty Register that keeps its subscription types
+            _types([], [], [], ["orders.Watch"]),
+            "type orders.Watch listed as a subscription type but not as a query type",
+        ),
+        (  # the hub's order: the kinds first, then the subscriptions, which it reads sorted
+            _types(["orders.X"], ["orders.X"], [], ["orders.B", "orders.A"]),
+            "type orders.X listed as both command and query",
+        ),
+        (
+            _types([], ["orders.B"], [], ["orders.B", "orders.C", "orders.A"]),
+            "type orders.A listed as a subscription type but not as a query type",
+        ),
+    ],
+    ids=[
+        "command-and-query",
+        "shared-and-exclusive",
+        "shared-and-command",
+        "subscription-a-command",
+        "empty-keeping-subscriptions",
+        "kinds-before-subscriptions",
+        "subscriptions-sorted",
+    ],
+)
+async def test_every_register_has_its_type_lists_checked(
+    hub: FakeHub, dial: Dial, later: hub_pb2.ClientMessage, details: str
+) -> None:
+    c = await dial(hub.address)
+    await c.write(_types([], ["orders.Watch"], [], ["orders.Watch"]))
+    s = await hub.next_stream()
+    await s.recv_register()
+    await s.ack(ack("hub-1"))
+    await c.write(later)
+    assert await s.recv() == later
+    assert f"stream ended: INVALID_ARGUMENT: {details}" in await raises_at_once(s.recv)
+    assert (await c.read()).register_ack.hub_id == "hub-1"
+    with pytest.raises(grpc.aio.AioRpcError) as e:
+        await c.read()
+    assert (e.value.code(), e.value.details()) == (grpc.StatusCode.INVALID_ARGUMENT, details)
+
+
+async def test_the_first_register_has_its_type_lists_checked_too(hub: FakeHub, dial: Dial) -> None:
+    c = await dial(hub.address)
+    await c.write(_types(["orders.X"], ["orders.X"]))
+    assert await c.status() == grpc.StatusCode.INVALID_ARGUMENT
+    s = await hub.next_stream()
+    await s.recv_register()
+    assert "type orders.X listed as both command and query" in await raises_at_once(s.recv)
+
+
+async def test_a_later_register_is_checked_for_its_types_only(hub: FakeHub, dial: Dial) -> None:
+    # As snodra-server: the identity and the permits are read from the first Register only.
+    c = await dial(hub.address)
+    await c.write(_types([], ["orders.Watch"], [], ["orders.Watch"]))
+    s = await hub.next_stream()
+    await s.recv_register()
+    await c.write(_types(service="", instance="", permits=0))  # an empty Register: a graceful stop
+    assert (await s.recv_register()).command_types == []
+    await s.nothing(0.1)
+    await c.write(_types(["orders.PlaceOrder"], ["orders.Watch"], ["orders.Stock"], ["orders.Watch"]))
+    assert list((await s.recv_register()).shared_query_types) == ["orders.Stock"]
+    await s.nothing(0.1)
 
 
 async def test_recv_after_the_client_left_fails(hub: FakeHub, dial: Dial) -> None:
@@ -593,3 +766,5 @@ def test_issued_certificates() -> None:
     assert expired.not_valid_before_utc < expired.not_valid_after_utc
     soon = ca.issue_client("orders-service", not_after=now + timedelta(seconds=30)).certificate
     assert soon.not_valid_before_utc <= now
+    keys = {k.public_key().public_numbers().n for k in (ca.key, ca.issue_client("a").key, ca.issue_client("b").key)}
+    assert len(keys) == 3  # no key is used twice

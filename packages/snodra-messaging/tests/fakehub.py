@@ -3,22 +3,34 @@
 A test starts a :class:`FakeHub`, lets the library under test connect, takes each stream with
 :meth:`FakeHub.next_stream`, reads what the library wrote (:meth:`FakeStream.recv` and the ``recv_<kind>``
 helpers) and writes what a hub would (:meth:`FakeStream.send`, :meth:`FakeStream.ack`,
-:meth:`FakeStream.close`). The hub times nothing itself: no eviction, no handshake deadline, no queue. Every wait
-here is bounded and the bound only stops a hang; a step that does not happen fails with ``AssertionError``.
+:meth:`FakeStream.close`). The hub times nothing itself: no eviction, no handshake deadline, no request queue. Every
+wait here is bounded and the bound only stops a hang; a step that does not happen fails with ``AssertionError``.
 
 Where the library relies on it the hub behaves as snodra-server (see "How the runner's hub differs from
-snodra-server" in https://snodra.damoreira.com/library-authors/conformance/): a first frame that is not a
-``Register`` closes the stream ``FAILED_PRECONDITION``; an empty service name or instance id, ``initial_permits`` 0,
-the reserved service name or instance prefix, or a subscription type that is not one of the ``Register``'s query
-types close it ``INVALID_ARGUMENT``. The refused stream is still handed to the script, its offending frame
-readable, and the script learns of the end at once. The ``RegisterAck`` goes out only when the script sends it and
-heartbeats are echoed only after it.
+snodra-server" in https://snodra.damoreira.com/library-authors/conformance/), with snodra-server's codes and texts:
+
+- The first frame: one that is not a ``Register``, or a half-close before any frame, closes the stream
+  ``FAILED_PRECONDITION``; an empty service name or instance id, an instance id starting with ``snodra-server/``,
+  the service name ``snodra-server`` or ``initial_permits`` 0 closes it ``INVALID_ARGUMENT``.
+- Every ``Register``, the first and each later one, in this order: a type listed both as a command and as a query,
+  a type listed both as a shared query and as a command or exclusive query, and a subscription type that is not one
+  of the same ``Register``'s query types close the stream ``INVALID_ARGUMENT``.
+- A refused stream is still handed to the script, its offending frame readable; the script learns of the end before
+  the client does.
+- The ``RegisterAck`` goes out only when the script sends it. A heartbeat is echoed once the stream is acknowledged:
+  one that arrives before the ack is held and its echo written right after the ack. An echo the client does not
+  take is dropped once 64 frames wait to be written, as snodra-server drops it when its buffer is full.
+- A client that half-closes gets the end of the stream with ``OK``. grpc.aio shows a client that cancels its call as
+  the end of its frames too, exactly as a half-close, and only cancels the handler a moment later (well under a
+  millisecond); nothing else tells them apart. So the hub waits 50 ms after the end of the frames: a cancellation
+  within it is a client that left (``CANCELLED``), else it is a half-close and the stream ends ``OK`` (snodra-server
+  ends it at once). A library that half-closes and gives up waiting for the end within 50 ms is seen as having left.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import itertools
 import time
 from collections import deque
 from typing import Final
@@ -37,9 +49,14 @@ KINDS: Final = frozenset(f.name for f in hub_pb2.ClientMessage.DESCRIPTOR.oneofs
 
 _QUIET: Final = frozenset({"heartbeat", "status"})
 _EOF_GRACE: Final = 0.05
-"""How long after the end of the client's frames its cancellation may still follow (see ``FakeStream._pump``)."""
+"""How long after the end of the client's frames its cancellation may still follow (see the module docstring)."""
+_ECHO_BACKLOG: Final = 64
+"""Echoes are dropped while this many frames wait to be written."""
 _HUB_SERVICE: Final = "snodra-server"
 _HUB_INSTANCE_PREFIX: Final = "snodra-server/"
+_NOT_A_REGISTER: Final = "first message must be Register"
+
+_Refusal = tuple[grpc.StatusCode, str]
 
 
 class _End:
@@ -47,6 +64,13 @@ class _End:
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
+
+
+class _Eof:
+    """The end of the client's frames, before the hub knows whether it half-closed or left."""
+
+
+_EOF: Final = _Eof()
 
 
 def _kind(m: hub_pb2.ClientMessage) -> str:
@@ -57,27 +81,67 @@ def _show(m: hub_pb2.ClientMessage) -> str:
     return text_format.MessageToString(m, as_one_line=True)
 
 
-def _check_first(m: hub_pb2.ClientMessage) -> tuple[grpc.StatusCode, str] | None:
-    """The status snodra-server closes a stream with for its first frame, or None when it accepts it."""
+def _check_first(m: hub_pb2.ClientMessage) -> _Refusal | None:
+    """snodra-server's handshake checks of a stream's first frame (before the type lists)."""
     if m.WhichOneof("message") != "register":
-        return grpc.StatusCode.FAILED_PRECONDITION, "first message must be Register"
+        return grpc.StatusCode.FAILED_PRECONDITION, _NOT_A_REGISTER
     r = m.register
     if not r.instance_id or not r.service_name:
         return grpc.StatusCode.INVALID_ARGUMENT, "Register.instance_id and Register.service_name must not be empty"
     if r.instance_id.startswith(_HUB_INSTANCE_PREFIX):
-        return grpc.StatusCode.INVALID_ARGUMENT, f"Register.instance_id must not start with {_HUB_INSTANCE_PREFIX}"
+        return (
+            grpc.StatusCode.INVALID_ARGUMENT,
+            f"Register.instance_id must not start with {_HUB_INSTANCE_PREFIX}: the hub's own requests use it",
+        )
     if r.service_name == _HUB_SERVICE:
-        return grpc.StatusCode.INVALID_ARGUMENT, f"Register.service_name must not be {_HUB_SERVICE}"
+        return (
+            grpc.StatusCode.INVALID_ARGUMENT,
+            f"Register.service_name must not be {_HUB_SERVICE}: the hub's own requests use it",
+        )
     if r.initial_permits == 0:
         return grpc.StatusCode.INVALID_ARGUMENT, "Register.initial_permits must be at least 1"
-    queries = set(r.query_types) | set(r.shared_query_types)
-    for t in r.subscription_query_types:
-        if t not in queries:
-            return grpc.StatusCode.INVALID_ARGUMENT, f"subscription type {t} is not one of the query types"
     return None
 
 
+def _check_types(r: hub_pb2.Register) -> _Refusal | None:
+    """snodra-server's checks of a ``Register``'s type lists, run on every ``Register``, in its order."""
+    seen: dict[str, tuple[str, bool]] = {}  # type -> (kind, shared)
+    listed = itertools.chain(
+        ((t, "command", False) for t in r.command_types),
+        ((t, "query", False) for t in r.query_types),
+        ((t, "query", True) for t in r.shared_query_types),
+    )
+    for t, kind, shared in listed:
+        prev_kind, prev_shared = seen.setdefault(t, (kind, shared))
+        if prev_shared != shared:
+            return (
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"type {t} listed as a shared query type and as a command or exclusive query",
+            )
+        if prev_kind != kind:
+            return grpc.StatusCode.INVALID_ARGUMENT, f"type {t} listed as both command and query"
+    for t in sorted(set(r.subscription_query_types)):
+        if seen.get(t, ("", False))[0] != "query":
+            return (
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"type {t} listed as a subscription type but not as a query type",
+            )
+    return None
+
+
+def _check(m: hub_pb2.ClientMessage, first: bool) -> _Refusal | None:
+    refusal = _check_first(m) if first else None
+    if refusal is None and m.WhichOneof("message") == "register":
+        refusal = _check_types(m.register)
+    return refusal
+
+
+def _echo(sent_at_ms: int) -> hub_pb2.ServerMessage:
+    return hub_pb2.ServerMessage(heartbeat=hub_pb2.Heartbeat(sent_at_ms=sent_at_ms))
+
+
 _Context = grpc.aio.ServicerContext[hub_pb2.ClientMessage, hub_pb2.ServerMessage]
+_Outgoing = tuple[hub_pb2.ServerMessage, "asyncio.Future[None] | None"]
 
 
 class FakeStream:
@@ -94,22 +158,24 @@ class FakeStream:
         """Every ``InstanceStatus`` with its arrival time (``time.monotonic()``)."""
 
         self._context = context
-        self._inbox: asyncio.Queue[hub_pb2.ClientMessage | _End] = asyncio.Queue()
+        self._inbox: asyncio.Queue[hub_pb2.ClientMessage | _Eof | _End] = asyncio.Queue()
         self._kept: deque[hub_pb2.ClientMessage] = deque()  # frames nothing() let pass, for recv
+        self._outbox: asyncio.Queue[_Outgoing] = asyncio.Queue()  # one writer, as grpc.aio requires
         self._ended: str | None = None
         self._eof = False  # the client wrote its last frame; whether it half-closed or left is decided after
         self._ended_now = asyncio.Event()
         self._half_closed = asyncio.Event()
-        self._closing: asyncio.Future[tuple[grpc.StatusCode, str]] = asyncio.get_running_loop().create_future()
-        self._served = asyncio.Event()  # the RPC handler returned: nothing can be written any more
-        self._write_lock = asyncio.Lock()  # one write at a time, as grpc.aio requires
+        self._closing: asyncio.Future[_Refusal] = asyncio.get_running_loop().create_future()
+        self._served = asyncio.Event()  # the RPC handler is done: nothing can be written any more
         self._acked = False
-        self._echo: bool | None = None  # None: echo after the ack
+        self._held: list[int] = []  # heartbeats (sent_at_ms) to echo right after the ack
+        self._echo: bool | None = None  # None: echo once acknowledged
 
     # The hub's side.
 
     async def _serve(self) -> None:
         pump = asyncio.create_task(self._pump(), name=f"fakehub:stream-{self.index}")
+        writer = asyncio.create_task(self._writer(), name=f"fakehub:writer-{self.index}")
         try:
             code, message = await self._closing
             self._end(f"{code.name}: {message}")
@@ -117,9 +183,13 @@ class FakeStream:
             self._end("CANCELLED: the client left or the hub stopped")
             raise
         finally:
-            pump.cancel()
-            await asyncio.gather(pump, return_exceptions=True)
-            self._served.set()
+            try:
+                pump.cancel()
+                writer.cancel()
+                await asyncio.gather(pump, writer, return_exceptions=True)
+            finally:
+                self._served.set()
+                self._fail_unwritten()
         if code is not grpc.StatusCode.OK:
             self._context.set_code(code)
             self._context.set_details(message)
@@ -134,38 +204,80 @@ class FakeStream:
             except Exception as e:  # the RPC is over; the handler reports why when it is cancelled
                 self._end(f"the read failed: {e!r}")
                 return
-            if not isinstance(m, hub_pb2.ClientMessage):  # grpc.aio.EOF
+            if not isinstance(m, hub_pb2.ClientMessage):  # grpc.aio.EOF: a half-close, or a client that left
                 self._eof = True
-                # A cancelled client reads as an EOF too, and its handler is cancelled a loop step later, taking
-                # this task with it; an EOF that outlives the grace is a half-close.
-                await asyncio.sleep(_EOF_GRACE)
+                self._inbox.put_nowait(_EOF)
+                await asyncio.sleep(_EOF_GRACE)  # a client that left gets this task cancelled meanwhile
                 self._half_closed.set()
-                self._end("the client half-closed")
+                if first:
+                    code, message = grpc.StatusCode.FAILED_PRECONDITION, _NOT_A_REGISTER
+                    self._end(f"{code.name}: {message} (the client half-closed before any frame)")
+                else:
+                    code, message = grpc.StatusCode.OK, ""
+                    self._end("the client half-closed")
+                self._request_close(code, message)
                 return
-            await self._observe(m)
+            self._observe(m)
             self._inbox.put_nowait(m)
-            if first:
-                first = False
-                refusal = _check_first(m)
-                if refusal is not None:
-                    code, message = refusal
-                    self._end(f"{code.name}: {message}")  # the script learns of it before the client does
-                    self._request_close(code, message)
-                    return
+            refusal = _check(m, first)
+            first = False
+            if refusal is not None:
+                code, message = refusal
+                self._end(f"{code.name}: {message}")  # the script learns of it before the client does
+                self._request_close(code, message)
+                return
 
-    async def _observe(self, m: hub_pb2.ClientMessage) -> None:
-        """Records heartbeats and statuses and echoes a heartbeat when the mode says so, before the frame reaches
-        the script: a script that has taken a heartbeat knows whether it was echoed."""
+    def _observe(self, m: hub_pb2.ClientMessage) -> None:
+        """Records heartbeats and statuses and decides a heartbeat's echo before the frame reaches the script: a
+        script that has taken a heartbeat knows what became of its echo."""
         match m.WhichOneof("message"):
             case "heartbeat":
                 self.heartbeats.append(time.monotonic())
-                async with self._write_lock:
-                    if self._echo or (self._echo is None and self._acked):
-                        echo = hub_pb2.ServerMessage(heartbeat=hub_pb2.Heartbeat(sent_at_ms=m.heartbeat.sent_at_ms))
-                        with contextlib.suppress(Exception):  # the stream is ending; the script learns it from recv
-                            await self._context.write(echo)
+                if self._echo is False:
+                    return
+                if self._echo or self._acked:
+                    self._put_echo(m.heartbeat.sent_at_ms)
+                else:
+                    self._held.append(m.heartbeat.sent_at_ms)
             case "status":
                 self.statuses.append((time.monotonic(), m.status))
+
+    def _put_echo(self, sent_at_ms: int) -> None:
+        if not self._served.is_set() and self._outbox.qsize() < _ECHO_BACKLOG:
+            self._outbox.put_nowait((_echo(sent_at_ms), None))
+
+    async def _writer(self) -> None:
+        while True:
+            m, written = await self._outbox.get()
+            try:
+                await self._context.write(m)
+            except Exception as e:
+                if written is not None and not written.done():
+                    written.set_exception(AssertionError(f"stream ended: the write failed: {e!r}"))
+            else:
+                if written is not None and not written.done():
+                    written.set_result(None)
+
+    def _fail_unwritten(self) -> None:
+        while not self._outbox.empty():
+            _, written = self._outbox.get_nowait()
+            if written is not None and not written.done():
+                written.set_exception(AssertionError(f"stream ended before the frame was written: {self._ended}"))
+
+    def _put(self, m: hub_pb2.ServerMessage) -> asyncio.Future[None]:
+        if self._served.is_set():
+            raise AssertionError(f"stream ended: {self._ended}; nothing can be sent")
+        written: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._outbox.put_nowait((m, written))
+        return written
+
+    @staticmethod
+    async def _written(written: asyncio.Future[None]) -> None:
+        try:
+            async with asyncio.timeout(BOUND):
+                await written
+        except TimeoutError:
+            raise AssertionError(f"a frame was not written within {BOUND} s (does the client read?)") from None
 
     def _end(self, reason: str) -> None:
         """Marks the stream ended (the first reason wins); frames already received stay readable."""
@@ -178,27 +290,21 @@ class FakeStream:
         if not self._closing.done():
             self._closing.set_result((code, message))
 
-    async def _write(self, m: hub_pb2.ServerMessage) -> None:
-        if self._served.is_set():
-            raise AssertionError(f"stream ended: {self._ended}; nothing can be sent")
-        try:
-            await self._context.write(m)
-        except Exception as e:
-            raise AssertionError(f"stream ended: the write failed: {e!r}") from e
-
     async def _take(self, deadline: float, timeout_text: str) -> hub_pb2.ClientMessage:
-        if self._kept:
-            return self._kept.popleft()
-        if self._ended is not None and self._inbox.empty():
-            raise AssertionError(f"stream ended: {self._ended}")
-        try:
-            async with asyncio.timeout_at(deadline):
-                item = await self._inbox.get()
-        except TimeoutError:
-            raise AssertionError(timeout_text) from None
-        if isinstance(item, _End):
-            raise AssertionError(f"stream ended: {item.reason}")
-        return item
+        while True:
+            if self._kept:
+                return self._kept.popleft()
+            if self._ended is not None and self._inbox.empty():
+                raise AssertionError(f"stream ended: {self._ended}")
+            try:
+                async with asyncio.timeout_at(deadline):
+                    item = await self._inbox.get()
+            except TimeoutError:
+                raise AssertionError(timeout_text) from None
+            if isinstance(item, _End):
+                raise AssertionError(f"stream ended: {item.reason}")
+            if isinstance(item, hub_pb2.ClientMessage):
+                return item
 
     # The script's side.
 
@@ -248,10 +354,11 @@ class FakeStream:
         return (await self._recv_kind("credentials", within)).credentials
 
     async def nothing(self, seconds: float, *kinds: str) -> None:
-        """Fails if a frame of one of kinds arrives within seconds, or if the stream ended before or meanwhile (an
-        absence on an ended stream proves nothing). Kinds are the names of ``ClientMessage``'s oneof; with none,
-        every kind but heartbeat and status. Frames of other kinds stay available to ``recv``. This is the one step
-        that waits for time to pass, because it asserts an absence."""
+        """Fails if a frame of one of kinds arrives within seconds, or if the client's frames ended before or meanwhile
+        (an absence on an ended stream proves nothing): at once when the end comes, a half-close or a client that left
+        alike. Kinds are the names of ``ClientMessage``'s oneof; with none, every kind but heartbeat and status.
+        Frames of other kinds stay available to ``recv``. This is the one step that waits for time to pass, because
+        it asserts an absence."""
         unknown = sorted(set(kinds) - KINDS)
         if unknown:
             raise AssertionError(f"unknown frame kind {unknown}; known: {sorted(KINDS)}")
@@ -266,6 +373,9 @@ class FakeStream:
                 break
             if isinstance(item, _End):
                 raise AssertionError(f"stream ended: {item.reason} (an absence on an ended stream proves nothing)")
+            if isinstance(item, _Eof):
+                self._alive()
+                continue
             if _kind(item) in watched:
                 raise AssertionError(f"unexpected {_kind(item)} frame within {seconds} s: {_show(item)}")
             self._kept.append(item)
@@ -277,21 +387,23 @@ class FakeStream:
             raise AssertionError(f"stream ended: {reason} (an absence on an ended stream proves nothing)")
 
     async def send(self, message: hub_pb2.ServerMessage) -> None:
-        """Writes a frame to the library."""
-        async with self._write_lock:
-            await self._write(message)
+        """Writes a frame to the library and waits until it is written."""
+        await self._written(self._put(message))
 
     async def ack(self, ack: hub_pb2.RegisterAck) -> None:
-        """Writes a ``RegisterAck``; from then on heartbeats are echoed (unless ``echo_heartbeats`` says otherwise).
-        A heartbeat is judged when it arrives, so a script that wants one before the ack consumes it with ``recv``
-        first."""
-        async with self._write_lock:
-            await self._write(hub_pb2.ServerMessage(register_ack=ack))
-            self._acked = True
+        """Writes a ``RegisterAck``, then the echoes of the heartbeats that arrived before it (unless
+        ``echo_heartbeats(False)``), and from then on echoes every heartbeat, as snodra-server."""
+        pending = [self._put(hub_pb2.ServerMessage(register_ack=ack))]
+        self._acked = True
+        held, self._held = self._held, []
+        if self._echo is not False:
+            pending += [self._put(_echo(ms)) for ms in held]
+        for written in pending:
+            await self._written(written)
 
     def echo_heartbeats(self, on: bool) -> None:
-        """Overrides the default (echo only after the ack, as snodra-server): True echoes every heartbeat that
-        arrives from now on, False none."""
+        """Overrides the default (echo once acknowledged, as snodra-server): True echoes every heartbeat that arrives
+        from now on, at once, even before the ack; False echoes none (a silent hub), held ones included."""
         self._echo = on
 
     async def close(self, code: grpc.StatusCode, message: str) -> None:
@@ -305,9 +417,7 @@ class FakeStream:
 
     async def half_closed(self, within: float) -> None:
         """Fails unless the library half-closed its side within ``within``; fails at once if the stream ended
-        otherwise. grpc.aio shows a client that left as the end of its frames, as a half-close, then cancels the
-        call: the end of the frames counts as a half-close once 50 ms pass without that cancellation, so a library
-        that half-closes and leaves within 50 ms is seen as having left."""
+        otherwise. The answer comes 50 ms after the half-close (see the module docstring)."""
         try:
             async with asyncio.timeout(within):
                 await self._ended_now.wait()
