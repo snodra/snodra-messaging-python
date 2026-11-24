@@ -1,8 +1,12 @@
 """One HTTP exchange of the library: its answer, its bounds, and the deadline of the thread that runs it."""
 
 import asyncio
+import http.client
 import json
+import socket
 import ssl
+from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from helpers import Jwks, TokenAnswer, TokenEndpoint, eventually
@@ -67,9 +71,47 @@ def test_the_connections_use_only_public_http_client_api() -> None:
         assert "connect" in vars(_http._Attach)  # the socket is taken in the documented connect()
 
 
+def test_the_tls_socket_is_taken_before_the_handshake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A peer that stalls the handshake can be cut: the TCP socket reaches the cut before the TLS wrap."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    cut = _http._Cut()
+    conn = _http._HTTPSConnection(
+        "127.0.0.1", listener.getsockname()[1], cut=cut, context=ssl.create_default_context(), timeout=2.0
+    )
+    taken: list[bool] = []
+
+    def spy(self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+        taken.append(cut._socket is sock)  # the socket the cut holds, before the handshake
+        raise OSError("the handshake is not performed here")
+
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", spy)
+    try:
+        with pytest.raises(OSError, match="the handshake is not performed here"):
+            conn.connect()
+    finally:
+        conn.close()
+        listener.close()
+    assert taken == [True]
+
+
 async def test_a_deadline_cut_ends_the_exchange_at_once(jwks: Jwks) -> None:
-    jwks.delay = 1.0
+    jwks.delay = 0.35  # the answer comes after the deadline
     started = asyncio.get_running_loop().time()
     with pytest.raises(TimeoutError, match=r"^no answer within 0\.2 s$"):
         await _http.exchange(jwks.url, read=_answer, timeout=0.2, max_bytes=1024)
     assert asyncio.get_running_loop().time() - started < 0.6
+    # A read nothing else bounds ends at the cut itself, and the answer written after it cannot reach the socket: the
+    # server's own write fails. Without the cut this read would return that answer and no failure would be recorded.
+    jwks.write_failed = False
+    cut = _http._Cut()
+    parts = urlsplit(jwks.url)
+    conn = _http._HTTPConnection(parts.hostname or "", parts.port, cut=cut, timeout=5.0)
+    try:
+        await asyncio.to_thread(conn.connect)
+        await asyncio.to_thread(conn.request, "GET", parts.path)
+        cut.cut()  # what the exchange's deadline does
+        with pytest.raises(http.client.RemoteDisconnected):
+            await asyncio.to_thread(conn.getresponse)
+    finally:
+        conn.close()
+    await eventually(lambda: jwks.write_failed, within=0.5)

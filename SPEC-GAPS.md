@@ -144,5 +144,5 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **This library:** at most one renewal per second whatever the lifetime: `snodra/_credentials.py`
   (`MIN_RENEWAL_INTERVAL`, applied in `TokenProvider._publish`). A token shorter-lived than that is handed out until
   the next renewal; one a hub refuses with `UNAUTHENTICATED` is fetched again at once, not held back.
-- **Question:** open to the owner: should the floor stay (it keeps a sub-second token from fetching in a hot loop), or
-  should such a token be renewed at its margin, as the reference implementation does?
+- **Question:** open: should the floor stay (it keeps a sub-second token from fetching in a hot loop), or should such
+  a token be renewed at its margin, as the reference implementation does?

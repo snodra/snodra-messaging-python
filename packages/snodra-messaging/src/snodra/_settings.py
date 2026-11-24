@@ -147,13 +147,14 @@ class Settings:
                 raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be a URL or None, got {url!r}")
             url = url.strip()
             parts = urlsplit(url)
-            if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
-                raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be an http:// or https:// URL, got {url!r}")
             if parts.username is not None or parts.password is not None:
+                # Before the scheme check: a URL with credentials is never written into an error, whatever its scheme.
                 raise ConfigurationError(
                     "jwks_url (SNODRA_JWKS_URL) must carry no userinfo: the credentials of the issuer's endpoint are "
                     "not read from a URL"
                 )
+            if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+                raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be an http:// or https:// URL, got {url!r}")
             object.__setattr__(self, "jwks_url", url)
             if not isinstance(issuer, str) or not issuer.strip():
                 raise ConfigurationError(
@@ -353,15 +354,16 @@ def _checked_grant(grant: ClientCredentials) -> ClientCredentials:
             raise ConfigurationError(f"ClientCredentials.{name} must be a text, got a {type(value).__name__}")
     url = grant.token_url.strip()
     parts = urlsplit(url)
+    if parts.username is not None or parts.password is not None:
+        # Before the scheme check: a URL with credentials is never written into an error, whatever its scheme.
+        raise ConfigurationError(
+            "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must carry no userinfo: the client is "
+            "authenticated by client_id and its secret, not by a URL"
+        )
     if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
         raise ConfigurationError(
             "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must be an http:// or https:// URL, "
             f"got {url!r}"
-        )
-    if parts.username is not None or parts.password is not None:
-        raise ConfigurationError(
-            "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must carry no userinfo: the client is "
-            "authenticated by client_id and its secret, not by a URL"
         )
     if parts.scheme.lower() == "http":
         log.warning(

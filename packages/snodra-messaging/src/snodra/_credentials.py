@@ -201,6 +201,8 @@ class TokenFileCredentials(HubCredentials):
 
     A tick never waits on the file: it starts one read (task ``snodra:token-file``) when none is under way, and a
     changed token is followed (``ClientMessage.credentials``) as soon as the read came back, however slow the mount.
+    A connect waits for the read under way rather than starting a second one, so reads never overlap and the newest
+    token read is the one adopted.
     """
 
     kind = "token (file)"
@@ -224,12 +226,16 @@ class TokenFileCredentials(HubCredentials):
         self._task: asyncio.Task[None] | None = None
 
     async def for_register(self) -> hub_pb2.Credentials:
-        self._adopt(await asyncio.to_thread(self._read))
+        task = self._task
+        if task is None or task.done():
+            task = self._start()
+        await asyncio.wait({task})  # the read under way, or the one just started: one read at a time
+        self._reap()
         return self._current
 
     async def on_tick(self) -> hub_pb2.Credentials | None:
         if self._task is None or self._task.done():  # one read at a time, however many ticks pass meanwhile
-            self._task = asyncio.create_task(self._reread(), name="snodra:token-file")
+            self._start()
         return None  # a changed token goes out when its read comes back (latest/listen)
 
     def latest(self) -> hub_pb2.Credentials | None:
@@ -239,10 +245,27 @@ class TokenFileCredentials(HubCredentials):
         self._listeners.append(changed)
 
     async def close(self) -> None:
-        task, self._task = self._task, None
+        task = self._task
         if task is not None and not task.done():
             task.cancel()
             await asyncio.wait({task})
+        self._reap()
+
+    def _start(self) -> asyncio.Task[None]:
+        """Starts the read of the files (one at a time: the caller checked that none is under way)."""
+        self._reap()  # a finished read's failure, so no "Task exception was never retrieved"
+        task = asyncio.create_task(self._reread(), name="snodra:token-file")
+        self._task = task
+        return task
+
+    def _reap(self) -> None:
+        """The task of the last read once it is done, its exception read here (logged, never left unretrieved)."""
+        task = self._task
+        if task is None or not task.done():
+            return
+        self._task = None
+        if not task.cancelled() and (e := task.exception()) is not None:
+            log.warning("Reading the hub token file %s failed: %r", self._path, e)
 
     async def _reread(self) -> None:
         self._adopt(await asyncio.to_thread(self._read))

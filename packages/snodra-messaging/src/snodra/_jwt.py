@@ -90,7 +90,7 @@ class JwksVerifier:
         self._fetch_timeout = fetch_timeout
         self._leeway = leeway
         self._max_bytes = max_bytes
-        self.first_retry = min(first_retry, min_refresh)
+        self.first_retry = max(0.0, min(first_retry, min_refresh))
         """The wait after a first load that failed, before trying again (doubling, capped at ``min_refresh``)."""
         self._failures = 0
         """How many first loads failed in a row: the retry wait doubles with each."""

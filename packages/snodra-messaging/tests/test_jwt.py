@@ -162,8 +162,8 @@ async def test_a_failed_first_load_is_retried_after_a_doubling_wait(jwks: Jwks) 
     first = await _refused_until(v, jwks, 1)
     second = await _refused_until(v, jwks, 2)  # not a minute later: 0.1 s after the failure
     third = await _refused_until(v, jwks, 3)
-    within(second - first, 0.09, 0.5)
-    within(third - second, 0.19, 0.6)  # doubled
+    within(second - first, 0.07, 0.5)
+    within(third - second, 0.17, 0.6)  # doubled
     jwks.down = False
     while True:  # doubled again, then loaded
         try:

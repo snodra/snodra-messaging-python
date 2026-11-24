@@ -4,6 +4,7 @@ renewal, its retirement after UNAUTHENTICATED, an endpoint that fails), and the 
 See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Credentials").
 """
 
+import asyncio
 import base64
 import itertools
 import json
@@ -375,7 +376,37 @@ async def test_a_hung_token_file_never_delays_heartbeats(
     assert (await s.recv_credentials(within=1.0)).token == "t-2"  # followed once the read came back
 
 
+async def test_a_connect_waits_for_the_read_under_way(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file = tmp_path / "token"
+    file.write_text("t-1\n")
+    credentials = _credentials.TokenFileCredentials(str(file))
+    release = threading.Event()
+    reads = 0
+    read = _credentials.TokenFileCredentials._read
+
+    def hung(self: _credentials.TokenFileCredentials) -> str:
+        nonlocal reads
+        reads += 1
+        release.wait(5.0)  # a mount that does not answer
+        return read(self)
+
+    monkeypatch.setattr(_credentials.TokenFileCredentials, "_read", hung)
+    await credentials.on_tick()  # a tick starts the read, which hangs
+    await eventually(lambda: reads == 1)
+    file.write_text("t-2\n")
+    register = asyncio.create_task(credentials.for_register())
+    try:
+        await asyncio.sleep(0.05)
+        assert reads == 1  # the connect waits for the read under way instead of starting a second one
+        assert not register.done()
+    finally:
+        release.set()
+    assert (await register).token == "t-2"  # and the newest read is the one adopted
+    await credentials.close()
+
+
 async def test_short_lived_tokens_are_renewed_at_most_once_a_second(hub: FakeHub) -> None:
+    assert _credentials.MIN_RENEWAL_INTERVAL == 1.0  # the shipped floor, not just its effect below
     calls = 0
 
     class Source:

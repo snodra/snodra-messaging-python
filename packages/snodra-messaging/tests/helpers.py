@@ -129,6 +129,9 @@ async def next_reply(s: FakeStream, within: float = 5.0) -> hub_pb2.Reply:
 ISSUER: Final = "https://issuer.test"
 """The issuer of the tokens :class:`Jwks` mints."""
 
+_CUT_PROBE: Final = 0.02
+"""How long a delayed JWKS answer waits before its body, so that a client that gave up is seen as gone."""
+
 _RSA_KEYS: list[rsa.RSAPrivateKey] = []
 
 
@@ -171,8 +174,15 @@ class _JwksHandler(http.server.BaseHTTPRequestHandler):
         jwks = self.server.jwks
         jwks.paths.append(self.path)
         jwks.fetches += 1
-        if jwks.delay > 0:
-            time.sleep(jwks.delay)
+        try:
+            if jwks.delay > 0:
+                time.sleep(jwks.delay)
+            self._answer(jwks)
+        except OSError:  # the client cut the connection first: nothing can be written any more
+            jwks.write_failed = True
+            self.close_connection = True
+
+    def _answer(self, jwks: Jwks) -> None:
         if jwks.down:
             self.send_error(503, "down")
             return
@@ -190,6 +200,10 @@ class _JwksHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        if jwks.delay > 0:
+            # A client that gave up during the delay closed its socket: the headers went out, its reset comes back,
+            # and the body write below is the one that fails (that is how ``write_failed`` is observed).
+            time.sleep(_CUT_PROBE)
         self.wfile.write(body)
 
     def _dribble(self, jwks: Jwks) -> None:
@@ -232,8 +246,9 @@ class Jwks:
 
     ``delay`` (seconds) holds every answer back; ``down`` answers 503; ``redirect`` answers ``/jwks`` with a 302 to
     that location; ``dribble`` sends the body one byte every 20 ms and sets ``dribble_cut`` when the client cuts the
-    connection; ``fetches`` counts the requests and ``paths`` lists their paths; ``published`` is the JWKS's keys,
-    which a test may change."""
+    connection; ``write_failed`` is set when an answer, its delay over, could not be written because the client cut the
+    connection meanwhile; ``fetches`` counts the requests and ``paths`` lists their paths; ``published`` is the JWKS's
+    keys, which a test may change."""
 
     def __init__(self) -> None:
         self.key = rsa_key(0)
@@ -245,6 +260,7 @@ class Jwks:
         self.redirect: str | None = None
         self.dribble = False
         self.dribble_cut = False
+        self.write_failed = False
         self.fetches = 0
         self.paths: list[str] = []
         self._server = _JwksServer(self)

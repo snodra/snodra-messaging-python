@@ -19,6 +19,7 @@ import socket
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -57,7 +58,13 @@ async def exchange[T](
     """``read`` of the answer to a request at url (``http://`` or ``https://``), all of it (connecting, the request,
     the answer and ``read``) in a thread, within ``timeout`` seconds: ``TimeoutError`` after it. A redirect is an answer
     like any other (``read`` sees its status). ``https://`` trusts the system's certificate authorities and those of
-    ``ca_file`` (PEM), read for this exchange. A body over ``max_bytes`` is :class:`TooLarge`."""
+    ``ca_file`` (PEM), read for this exchange. A body over ``max_bytes`` is :class:`TooLarge`.
+
+    A URL of another scheme is refused here, before any handler or proxy sees it: ``ftp_proxy`` and ``all_proxy`` must
+    not turn it into an HTTP proxy request."""
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"no handler for a URL of scheme {scheme!r}: an exchange is http:// or https://")
     cut = _Cut()
     try:
         async with asyncio.timeout(timeout):
@@ -200,7 +207,20 @@ class _HTTPConnection(_Attach, http.client.HTTPConnection):
 
 
 class _HTTPSConnection(_Attach, http.client.HTTPSConnection):
-    pass
+    """The TCP socket is taken before the TLS handshake, so a peer that stalls the handshake is cut at the deadline,
+    and the proxy tunnel (plaintext, on that same socket) is set up as ``http.client`` does it."""
+
+    _tunnel_host: str | None  # set by http.client when a proxy CONNECT tunnel is needed
+    _context: ssl.SSLContext  # the SSL context of the connection
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)  # the TCP socket, and the proxy tunnel on it
+        sock = self.sock
+        assert sock is not None  # http.client's connect() left it there
+        self._cut.attach(sock)  # before the handshake: a peer that stalls it is cut at the deadline
+        server_hostname = self._tunnel_host if self._tunnel_host else self.host
+        # The wrap ``http.client.HTTPSConnection.connect`` does once its TCP connect returned.
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
 
 
 class _HTTPHandler(urllib.request.HTTPHandler):
