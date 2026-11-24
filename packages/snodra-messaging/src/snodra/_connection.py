@@ -22,6 +22,7 @@ import grpc.aio
 
 from snodra._backoff import jitter, next_wait
 from snodra._hubpb import hub_pb2, hub_pb2_grpc
+from snodra._permits import PermitLedger
 from snodra._timings import Timings
 
 log = logging.getLogger(__name__)
@@ -98,6 +99,8 @@ class _Stream:
         # The silent-hub watch, armed by the ack: the last sign of life (loop time) and the heartbeats written since.
         self.last_echo = 0.0
         self.unanswered = 0
+        self.permits = PermitLedger(register.initial_permits)
+        """The permits the hub holds for this stream, and those to give back on it."""
 
     def put(self, m: hub_pb2.ClientMessage) -> bool:
         """Queues m for the writer; False when the stream takes nothing more."""
@@ -187,6 +190,8 @@ class HubConnection:
         timings: Timings,
         on_change: Callable[[], None],
         on_rejection: Callable[[Rejection], None],
+        on_request: Callable[[_Stream, hub_pb2.Request], None] | None = None,
+        on_cancel: Callable[[_Stream, hub_pb2.Cancel], None] | None = None,
     ) -> None:
         self.address = address
         self._register = register
@@ -194,6 +199,8 @@ class HubConnection:
         self._timings = timings
         self._on_change = on_change
         self._on_rejection = on_rejection
+        self._on_request = on_request
+        self._on_cancel = on_cancel
         self._options = [
             ("grpc.keepalive_time_ms", round(timings.keepalive_time * 1000)),
             ("grpc.keepalive_timeout_ms", round(timings.keepalive_timeout * 1000)),
@@ -406,8 +413,21 @@ class HubConnection:
                             self._on_change()
                     case "heartbeat":
                         stream.on_echo(loop.time())
+                    case "request" if self._on_request is not None:  # also before the ack
+                        self._hand_over(self._on_request, stream, m.request)
+                    case "cancel" if self._on_cancel is not None:
+                        self._hand_over(self._on_cancel, stream, m.cancel)
         except grpc.aio.AioRpcError as e:
             return _End(e.code(), e.details() or "")
+
+    def _hand_over(self, to: Callable[[_Stream, Any], None], stream: _Stream, frame: Any) -> None:
+        """A frame for the dispatcher; a failure there is logged, never the end of the read loop."""
+        try:
+            to(stream, frame)
+        except Exception:
+            log.exception(
+                "Hub stream to %s: a %s frame could not be handled; dropped", self.address, type(frame).__name__
+            )
 
     async def _beat(self, stream: _Stream) -> _End:
         """Heartbeats: every ``heartbeat_before_ack`` until the ack, every ack interval after it. Returns why the

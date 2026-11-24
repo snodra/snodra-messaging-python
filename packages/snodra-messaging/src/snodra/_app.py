@@ -5,27 +5,38 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar, overload
 
+from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
+from snodra._dispatch import Dispatcher
 from snodra._pool import Pool
+from snodra._registry import Kind, Registry
 from snodra._settings import Settings
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
 
+H = TypeVar("H", bound=Callable[..., Awaitable[Any]])
+
 
 class App:
-    """One service instance: its hub connections.
+    """One service instance: its handlers and its hub connections.
 
-    ``start`` opens a connection per hub; ``shutdown`` leaves the hubs in order
-    (https://snodra.damoreira.com/library-authors/protocol/, "Shutting down"). ``run`` does both around the process's
-    life, and ``async with app:`` around a block.
+    Handlers are registered before ``start`` (``command_handler``, ``query_handler``); ``start`` opens a connection
+    per hub; ``shutdown`` leaves the hubs in order (https://snodra.damoreira.com/library-authors/protocol/, "Shutting
+    down"). ``run`` does both around the process's life, and ``async with app:`` around a block. ``codec`` reads and
+    writes the payloads (:class:`JsonCodec` by default).
     """
 
-    def __init__(self, settings: Settings, *, _timings: Timings | None = None) -> None:
+    def __init__(self, settings: Settings, *, codec: Codec | None = None, _timings: Timings | None = None) -> None:
         self._settings = settings
-        self._pool = Pool(settings, DEFAULT_TIMINGS if _timings is None else _timings)
+        self._timings = DEFAULT_TIMINGS if _timings is None else _timings
+        self._codec: Codec = JsonCodec() if codec is None else codec
+        self._registry = Registry()
+        self._dispatcher = Dispatcher(self._registry, self._codec, settings.max_concurrent, self._timings)
+        self._pool = Pool(settings, self._timings, self._dispatcher)
         self._started = False
         self._shutting_down = False
         self._stop = asyncio.Event()  # a signal, or shutdown: run() stops waiting
@@ -41,6 +52,32 @@ class App:
         """The latest refusal of this instance's registration by any hub; never cleared."""
         return self._pool.rejection
 
+    @overload
+    def command_handler(self, fn: H, /) -> H: ...
+    @overload
+    def command_handler(self, fn: None = None, /) -> Callable[[H], H]: ...
+    def command_handler(self, fn: H | None = None, /) -> H | Callable[[H], H]:
+        """Registers a command handler, bare (``@app.command_handler``) or called (``@app.command_handler()``): an
+        ``async def`` whose first parameter is annotated with a ``@message_type`` class, the type it handles; what it
+        returns is the reply (``None`` answers ``{}``). Raises ``TypeError`` for what cannot be served and
+        :class:`RegistrationClosed` after ``start``, naming the handler. Returns the function unchanged."""
+        return self._handler("command", fn)
+
+    @overload
+    def query_handler(self, fn: H, /) -> H: ...
+    @overload
+    def query_handler(self, fn: None = None, /) -> Callable[[H], H]: ...
+    def query_handler(self, fn: H | None = None, /) -> H | Callable[[H], H]:
+        """Registers a point query handler, as :meth:`command_handler` registers a command handler."""
+        return self._handler("query", fn)
+
+    def _handler(self, kind: Kind, fn: H | None) -> H | Callable[[H], H]:
+        def register(f: H) -> H:
+            self._registry.add(kind, f)
+            return f
+
+        return register if fn is None else register(fn)
+
     def hub_ids(self) -> list[str]:
         """``RegisterAck.hub_id`` of every acknowledged stream (its address when empty), sorted."""
         return self._pool.hub_ids()
@@ -51,6 +88,8 @@ class App:
             raise RuntimeError("the app was shut down")
         if self._started:
             raise RuntimeError("the app is already started")
+        self._registry.close()
+        self._pool.declare(self._registry.types("command"), self._registry.types("query"))
         self._started = True
         self._pool.start()
 
@@ -92,8 +131,10 @@ class App:
 
     async def shutdown(self, timeout: float = 15.0) -> None:  # noqa: ASYNC109 (the API takes a timeout)
         """Leaves the hubs in order and stops every connection, within ``timeout``: a ``Register`` with no types on
-        every live stream (its ack awaited for at most 1 s), then each stream half-closed and its end awaited (at most
-        2 s). A second call returns at once.
+        every live stream (its ack awaited for at most 1 s), then the handlers in flight drained (awaited for at most
+        5 s, then cancelled and never awaited again), then each stream half-closed and its end awaited (at most 2 s).
+        A handler still running when ``timeout`` is reached is cancelled and left behind: one warning names it. A
+        second call returns at once.
 
         The unexpected error that crashed a connection (a library bug, logged at error level when it happened) is
         raised here once everything is stopped, unless another exception or a cancellation is already propagating
@@ -110,13 +151,14 @@ class App:
             if self._started:
                 try:
                     async with asyncio.timeout(budget):
-                        await self._pool.leave()
+                        await self._pool.leave(drain=lambda: self._dispatcher.drain(self._timings.handler_drain))
                 except TimeoutError:
                     log.warning("Leaving the hubs took longer than %.2f s: the streams are cut", budget)
         except BaseException:
             propagating = True
             raise
         finally:
+            self._dispatcher.abandon()  # the handlers the drain did not reach: cancelled, never awaited
             try:
                 await self._pool.close()
             except Exception:

@@ -5,6 +5,7 @@ from importlib.metadata import version
 from snodra._app import App
 from snodra._codec import Codec, JsonCodec, RawJson
 from snodra._connection import Rejection
+from snodra._context import MessageInfo, current_message
 from snodra._errors import (
     ConfigurationError,
     DecodeError,
@@ -37,6 +38,7 @@ __all__ = [
     "InvalidRequest",
     "JsonCodec",
     "LostParts",
+    "MessageInfo",
     "NeverSent",
     "OutcomeUnknown",
     "PermissionDenied",
@@ -48,5 +50,6 @@ __all__ = [
     "SnodraError",
     "Unauthenticated",
     "__version__",
+    "current_message",
     "message_type",
 ]

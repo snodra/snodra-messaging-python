@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 from snodra._connection import HubConnection, Rejection, settle
+from snodra._dispatch import Dispatcher
 from snodra._hubpb import hub_pb2
 from snodra._meta import client_version
 from snodra._settings import Settings, hub_targets
@@ -29,9 +31,10 @@ def build_register(settings: Settings) -> hub_pb2.Register:
 class Pool:
     """The connections of one instance and what they know together: the acknowledged hubs, the latest refusal."""
 
-    def __init__(self, settings: Settings, timings: Timings) -> None:
+    def __init__(self, settings: Settings, timings: Timings, dispatcher: Dispatcher | None = None) -> None:
         self._timings = timings
         register = build_register(settings)
+        self._register = register
         self.connections = [
             HubConnection(
                 target,
@@ -40,12 +43,20 @@ class Pool:
                 timings=timings,
                 on_change=self._changed,
                 on_rejection=self._rejected,
+                on_request=None if dispatcher is None else dispatcher.on_request,
+                on_cancel=None if dispatcher is None else dispatcher.on_cancel,
             )
             for target in hub_targets(settings.hubs)
         ]
         self.rejection: Rejection | None = None
         """The latest refusal by any hub; never cleared."""
         self._acknowledged = asyncio.Event()
+
+    def declare(self, command_types: list[str], query_types: list[str]) -> None:
+        """The types every ``Register`` of every stream lists; before :meth:`start`."""
+        for field, types in ((self._register.command_types, command_types), (self._register.query_types, query_types)):
+            del field[:]
+            field.extend(types)
 
     def start(self) -> None:
         for c in self.connections:
@@ -60,9 +71,10 @@ class Pool:
             self._acknowledged.clear()
             await self._acknowledged.wait()
 
-    async def leave(self) -> None:
-        """Leaves every hub in order: the empty ``Register`` (its acks awaited for ``deregister_wait`` at most), then
-        the half-close (the hub's end awaited for ``close_wait`` at most). Nothing reconnects after it."""
+    async def leave(self, drain: Callable[[], Awaitable[None]] | None = None) -> None:
+        """Leaves every hub in order: the empty ``Register`` (its acks awaited for ``deregister_wait`` at most), the
+        drain of the handlers in flight, then the half-close (the hub's end awaited for ``close_wait`` at most).
+        Nothing reconnects after it."""
         t = self._timings
         for c in self.connections:
             c.stop_reconnecting()
@@ -74,6 +86,8 @@ class Pool:
                         await f
             except TimeoutError:
                 log.debug("Not every hub acknowledged the empty Register within %.2f s", t.deregister_wait)
+        if drain is not None:
+            await drain()
         for c in self.connections:
             c.half_close()
         try:

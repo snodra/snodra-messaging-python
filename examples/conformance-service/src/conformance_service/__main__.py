@@ -11,13 +11,16 @@ import sys
 from snodra import App
 
 from conformance_service.env import settings_from_env
+from conformance_service.handlers import register_handlers
 
 SHUTDOWN_BUDGET = 4.0
 """Seconds the shutdown may take: inside the runner's 5 s after SIGTERM."""
 
 
 async def main() -> None:
-    app = App(settings_from_env(os.environ))
+    settings = settings_from_env(os.environ)
+    app = App(settings)
+    register_handlers(app, settings)
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):

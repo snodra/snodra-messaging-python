@@ -11,3 +11,4 @@ def test_default_timings() -> None:
         5.0,
     )
     assert (t.deregister_wait, t.subscription_end, t.handler_drain, t.close_wait) == (1.0, 2.0, 5.0, 2.0)
+    assert (t.permit_batch, t.permit_flush_after) == (16, 0.05)

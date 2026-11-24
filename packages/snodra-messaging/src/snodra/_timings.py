@@ -29,6 +29,10 @@ class Timings:
     """Shutdown: the longest wait for the handlers in flight."""
     close_wait: float
     """Shutdown: the longest wait for the hub to finish a stream after the half-close."""
+    permit_batch: int
+    """Permits go back at once when this many are pending (or while the hub holds few of the stream's)."""
+    permit_flush_after: float
+    """Pending permits go back at the latest this long after the first of them."""
 
 
 DEFAULT_TIMINGS: Final = Timings(
@@ -41,5 +45,7 @@ DEFAULT_TIMINGS: Final = Timings(
     subscription_end=2.0,
     handler_drain=5.0,
     close_wait=2.0,
+    permit_batch=16,
+    permit_flush_after=0.05,
 )
 """The shipped timings."""
