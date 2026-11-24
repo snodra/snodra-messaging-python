@@ -69,10 +69,17 @@ async def test_the_register_lists_the_contracts_unary_types(hub: FakeHub, servic
         "conformance.Done",
         "conformance.Echo",
         "conformance.Fail",
+        "conformance.Relay",
+        "conformance.Send",
         "conformance.Sleep",
         "conformance.Strict",
     ]
-    assert list(r.query_types) == ["conformance.EchoQuery", "conformance.SleepQuery", "conformance.View"]
+    assert list(r.query_types) == [
+        "conformance.EchoQuery",
+        "conformance.Outcome",
+        "conformance.SleepQuery",
+        "conformance.View",
+    ]
 
 
 async def test_echo_answers_what_it_got(hub: FakeHub, service: App) -> None:

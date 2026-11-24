@@ -79,6 +79,36 @@ class _HalfClose:
 _HALF_CLOSE: Final = _HalfClose()
 
 
+@dataclass(frozen=True)
+class Lost:
+    """A request's stream ended before its answer: ``written`` once the writer had taken it (the hub may have it),
+    else it never left the buffer."""
+
+    written: bool
+    why: str
+    """Why the stream ended, for example ``hub stream closed: UNAVAILABLE (restart)``."""
+
+
+class OutboundRequest:
+    """A request a caller queued on a stream: buffered until the stream's writer takes it, written from then on (handed
+    to the transport). Its ``answer`` is resolved once: with the hub's ``Reply`` or ``Error`` frame, or with
+    :class:`Lost` when the stream ends first."""
+
+    def __init__(self, message: hub_pb2.ClientMessage) -> None:
+        self.message = message
+        self.id: str = message.request.id
+        self.stream: _Stream | None = None
+        """The stream it was queued on."""
+        self.written = False
+        self.withdrawn = False
+        """Its caller gave up while it was buffered: the writer skips it."""
+        self.answer: asyncio.Future[hub_pb2.ServerMessage | Lost] = asyncio.get_running_loop().create_future()
+
+    def resolve(self, outcome: hub_pb2.ServerMessage | Lost) -> None:
+        if not self.answer.done():
+            self.answer.set_result(outcome)
+
+
 class _Stream:
     """One ``Hub.Connect`` stream: its outbound queue, its handshake and the silent-hub watch."""
 
@@ -86,7 +116,7 @@ class _Stream:
         self, register: hub_pb2.Register, interval: float, permit_batch: int = DEFAULT_TIMINGS.permit_batch
     ) -> None:
         self.register = register
-        self.out: asyncio.Queue[hub_pb2.ClientMessage | _HalfClose] = asyncio.Queue()
+        self.out: asyncio.Queue[hub_pb2.ClientMessage | _HalfClose | OutboundRequest] = asyncio.Queue()
         self.writable = True
         """False once half-closed or ended: nothing more is queued."""
         self.ack: hub_pb2.RegisterAck | None = None
@@ -103,6 +133,13 @@ class _Stream:
         self.unanswered = 0
         self.permits = PermitLedger(register.initial_permits, batch=permit_batch)
         """The permits the hub holds for this stream, and those to give back on it."""
+        self.requests: dict[str, OutboundRequest] = {}
+        """The requests queued on the stream whose callers wait for their answer, by id."""
+        self.buffered = 0
+        """The requests in the outbound buffer, not yet taken by the writer."""
+        self.why = "hub connection stopped"
+        """Why the stream ended (set when it ends): what a request written to it fails with."""
+        self._room: list[asyncio.Future[None]] = []
 
     def put(self, m: hub_pb2.ClientMessage) -> bool:
         """Queues m for the writer; False when the stream takes nothing more."""
@@ -110,6 +147,58 @@ class _Stream:
             return False
         self.out.put_nowait(m)
         return True
+
+    def put_request(self, request: OutboundRequest) -> bool:
+        """Queues a request for the writer; False when the stream takes nothing more. The caller keeps the buffer's
+        bound (:meth:`room`)."""
+        if not self.writable:
+            return False
+        request.stream = self
+        self.requests[request.id] = request
+        self.out.put_nowait(request)
+        self.buffered += 1
+        return True
+
+    def room(self) -> asyncio.Future[None]:
+        """Done when a buffered request left the buffer, or the stream ended or stops taking requests."""
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        if not self.writable:
+            waiter.set_result(None)
+        else:
+            self._room.append(waiter)
+        return waiter
+
+    def wake_all(self) -> None:
+        """Wakes every call waiting for room."""
+        waiters, self._room = self._room, []
+        for w in waiters:
+            if not w.done():
+                w.set_result(None)
+
+    def took(self, request: OutboundRequest) -> bool:
+        """The writer took the request from the buffer: True when it is to be written (now it counts as written),
+        False when its caller withdrew it."""
+        if request.withdrawn:
+            return False
+        request.written = True
+        self._left_buffer()
+        return True
+
+    def forget(self, request: OutboundRequest) -> None:
+        """Its caller is done with the request: still buffered, it is withdrawn (never written)."""
+        if self.requests.get(request.id) is request:
+            del self.requests[request.id]
+        if not request.written and not request.withdrawn:
+            request.withdrawn = True
+            self._left_buffer()
+
+    def _left_buffer(self) -> None:
+        self.buffered -= 1
+        while self._room:
+            w = self._room.pop(0)
+            if not w.done():
+                w.set_result(None)
+                return
 
     def write_register(self, *, empty: bool) -> None:
         """The stream's ``Register`` (with no types when empty), then a heartbeat."""
@@ -169,6 +258,11 @@ class _Stream:
         self.writable = False
         self.ended.set()
         self._release(lambda n: True)
+        # The requests still waiting for an answer: written ones have an unknown outcome, buffered ones never left.
+        requests, self.requests = self.requests, {}
+        for r in requests.values():
+            r.resolve(Lost(r.written, self.why))
+        self.wake_all()
 
     def _release(self, due: Callable[[int], bool]) -> None:
         keep: list[tuple[int, asyncio.Future[None]]] = []
@@ -194,6 +288,7 @@ class HubConnection:
         on_rejection: Callable[[Rejection], None],
         on_request: Callable[[_Stream, hub_pb2.Request], None] | None = None,
         on_cancel: Callable[[_Stream, hub_pb2.Cancel], None] | None = None,
+        on_answer: Callable[[_Stream, hub_pb2.ServerMessage], None] | None = None,
     ) -> None:
         self.address = address
         self._register = register
@@ -203,6 +298,8 @@ class HubConnection:
         self._on_rejection = on_rejection
         self._on_request = on_request
         self._on_cancel = on_cancel
+        self._on_answer = on_answer
+        self._gate: asyncio.Event | None = None  # the writer waits on it before writing a frame (a test hook)
         self._options = [
             ("grpc.keepalive_time_ms", round(timings.keepalive_time * 1000)),
             ("grpc.keepalive_timeout_ms", round(timings.keepalive_timeout * 1000)),
@@ -223,6 +320,29 @@ class HubConnection:
         if s is None or s.ack is None:
             return None
         return s.ack.hub_id or self.address
+
+    def live_stream(self) -> _Stream | None:
+        """The current stream when a request may be sent on it: acknowledged, taking frames, the connection not
+        stopping; else None."""
+        s = self._stream
+        if s is None or s.ack is None or not s.writable or self._stopping:
+            return None
+        return s
+
+    def wake_waiters(self) -> None:
+        """Wakes the calls waiting for room on the current stream."""
+        if self._stream is not None:
+            self._stream.wake_all()
+
+    def _block_writer(self, on: bool) -> None:
+        """A test hook: while on, the writer of the connection's streams writes nothing (a frame it took is held,
+        not written)."""
+        if on:
+            if self._gate is None:
+                self._gate = asyncio.Event()
+        elif self._gate is not None:
+            self._gate.set()
+            self._gate = None
 
     @property
     def crash(self) -> BaseException | None:
@@ -356,7 +476,9 @@ class HubConnection:
             beats = asyncio.create_task(self._beat(stream), name=f"snodra:heartbeat:{self.address}")
             tasks = [writer, reader, beats]
             done, _ = await asyncio.wait((reader, beats), return_when=asyncio.FIRST_COMPLETED)
-            return (reader if reader in done else beats).result()
+            end = (reader if reader in done else beats).result()
+            stream.why = f"hub stream closed: {end.code.name} ({end.message})"
+            return end
         finally:
             # What needs no wait first, so that a cancellation cannot skip it; then the tasks and the channel, awaited
             # to their end even when a cancellation lands meanwhile (it is raised after).
@@ -384,9 +506,15 @@ class HubConnection:
         try:
             while True:
                 m = await stream.out.get()
+                if (gate := self._gate) is not None:
+                    await gate.wait()
                 if isinstance(m, _HalfClose):
                     await call.done_writing()
                     return
+                if isinstance(m, OutboundRequest):
+                    if not stream.took(m):
+                        continue  # its caller gave up while it was buffered
+                    m = m.message
                 await call.write(m)
         except Exception as e:  # the call ended: the reader reports why
             log.debug("Hub stream to %s: a write failed: %r", self.address, e)
@@ -419,6 +547,8 @@ class HubConnection:
                         self._hand_over(self._on_request, stream, m.request)
                     case "cancel" if self._on_cancel is not None:
                         self._hand_over(self._on_cancel, stream, m.cancel)
+                    case "reply" | "error" if self._on_answer is not None:
+                        self._hand_over(self._on_answer, stream, m)
         except grpc.aio.AioRpcError as e:
             return _End(e.code(), e.details() or "")
 

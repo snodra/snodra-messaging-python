@@ -63,6 +63,71 @@ class View(RawJson):
 
 
 @dataclass
+class RetryOption:
+    """A retry policy for one call."""
+
+    max_attempts: int
+    initial_backoff_ms: int | None = None
+
+
+@message_type("conformance.Send")
+@dataclass
+class Send:
+    """Makes the library send a request as an application would, and reports the outcome (command)."""
+
+    op: str
+    target: str
+    payload: Any = None
+    routing_key: str | None = None
+    timeout_ms: int | None = None
+    headers: dict[str, str] | None = None
+    retry: RetryOption | None = None
+    initial_credit: int | None = None
+    max_results: int | None = None
+    read: int | None = None
+    read_delay_ms: int | None = None
+    async_: bool = False
+
+
+@message_type("conformance.Outcome")
+@dataclass
+class Outcome:
+    """The outcome of an asynchronous ``conformance.Send``, waiting up to ``waitMs`` (query)."""
+
+    op_id: str
+    wait_ms: int = 0
+
+
+@message_type("conformance.Relay")
+@dataclass
+class Relay:
+    """Sends ``payload`` on as a command to the runner's ``Probe`` (``probe``) or ``Missing`` (``missing``)."""
+
+    target: str = "probe"
+    payload: Any = None
+
+
+@message_type("conformance.runner.Probe")
+class Probe(RawJson):
+    """The runner's command; its payload is the runner's script, passed unchanged."""
+
+
+@message_type("conformance.runner.ProbeQuery")
+class ProbeQuery(RawJson):
+    """The runner's query."""
+
+
+@message_type("conformance.runner.Missing")
+class Missing(RawJson):
+    """A command nobody handles."""
+
+
+@dataclass
+class RelayAnswer:
+    reply: Any
+
+
+@dataclass
 class EchoAnswer:
     payload: Any
     headers: dict[str, str]

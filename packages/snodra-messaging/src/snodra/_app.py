@@ -5,20 +5,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar, overload
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, Literal, TypeVar, overload
 
 from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
 from snodra._dispatch import Dispatcher
 from snodra._pool import Pool
 from snodra._registry import Kind, Registry
+from snodra._retry import RetryPolicy
+from snodra._send import Sender
 from snodra._settings import Settings
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
 
 H = TypeVar("H", bound=Callable[..., Awaitable[Any]])
+R = TypeVar("R")
 
 
 class App:
@@ -36,7 +39,9 @@ class App:
         self._codec: Codec = JsonCodec() if codec is None else codec
         self._registry = Registry()
         self._dispatcher = Dispatcher(self._registry, self._codec, settings.max_concurrent, self._timings)
-        self._pool = Pool(settings, self._timings, self._dispatcher)
+        self._sender = Sender(self._codec, settings, self._timings)
+        self._pool = Pool(settings, self._timings, self._dispatcher, on_answer=self._sender.on_answer)
+        self._sender.pool = self._pool
         self._started = False
         self._shutting_down = False
         self._stop = asyncio.Event()  # a signal, or shutdown: run() stops waiting
@@ -77,6 +82,91 @@ class App:
             return f
 
         return register if fn is None else register(fn)
+
+    @overload
+    async def send(
+        self,
+        command: object,
+        result: None = None,
+        *,
+        routing_key: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 (the API takes a timeout)
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> None: ...
+    @overload
+    async def send(
+        self,
+        command: object,
+        result: type[R],
+        *,
+        routing_key: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 (the API takes a timeout)
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> R: ...
+    async def send(
+        self,
+        command: object,
+        result: type[R] | None = None,
+        *,
+        routing_key: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 (the API takes a timeout)
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> R | None:
+        """Sends a command (an instance of a ``@message_type`` class) through a hub to the service that handles its
+        type, and returns the answer decoded as ``result`` (None without a ``result``: the answer is not read).
+
+        ``routing_key``: commands of a type with the same key go to the same instance. ``timeout`` (seconds) is sent
+        as ``Request.timeout_ms`` (else ``Settings.default_timeout``; without one the hub applies its own), and bounds
+        how long the call waits for a hub: without one, 5 s. ``priority``: ``Request.priority`` (else
+        ``Settings.priorities``, else 0). ``retry``: a :class:`RetryPolicy` (else ``Settings.default_retry``;
+        ``False``: none).
+
+        Raises :class:`NeverSent` when no hub took the request (the handler never ran: sending it again is safe),
+        :class:`OutcomeUnknown` when the hub stream broke after the request was written (the handler may have run),
+        :class:`HubError` for an error code from the hub or the handler (``TIMEOUT`` also when no answer came
+        within the hub's bound for the request plus 1 s), ``DecodeError`` when the answer is not a ``result``. A
+        cancellation of the caller (``asyncio.timeout``, a task group) stays ``asyncio.CancelledError``."""
+        return await self._sender.call(  # type: ignore[return-value]
+            command,
+            result,
+            "command",
+            routing_key=routing_key,
+            timeout=timeout,
+            priority=priority,
+            headers=headers,
+            retry=retry,
+        )
+
+    async def query(
+        self,
+        query: object,
+        result: type[R],
+        *,
+        routing_key: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 (the API takes a timeout)
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> R:
+        """Sends a point query through a hub to an instance that handles its type and returns the answer decoded as
+        ``result``; the options and the errors are those of :meth:`send` (the hub ignores the routing key of a
+        query). A retry policy also retries a query after an unknown outcome."""
+        return await self._sender.call(  # type: ignore[return-value]
+            query,
+            result,
+            "query",
+            routing_key=routing_key,
+            timeout=timeout,
+            priority=priority,
+            headers=headers,
+            retry=retry,
+        )
 
     def hub_ids(self) -> list[str]:
         """``RegisterAck.hub_id`` of every acknowledged stream (its address when empty), sorted."""

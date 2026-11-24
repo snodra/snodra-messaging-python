@@ -23,6 +23,7 @@ from snodra._errors import (
     Unauthenticated,
 )
 from snodra._messages import message_type
+from snodra._retry import RetryPolicy
 from snodra._settings import Settings
 
 __version__: str = version("snodra-messaging")
@@ -46,6 +47,7 @@ __all__ = [
     "RegistrationClosed",
     "Rejection",
     "ReservedHeader",
+    "RetryPolicy",
     "Settings",
     "SnodraError",
     "Unauthenticated",

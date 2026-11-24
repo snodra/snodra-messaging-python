@@ -33,6 +33,18 @@ class Timings:
     """Permits go back at once when this many are pending (or while the hub holds few of the stream's)."""
     permit_flush_after: float
     """Pending permits go back at the latest this long after the first of them."""
+    guard_margin: float
+    """A request is given up locally this long after the hub's bound for it, so the hub's ``TIMEOUT`` comes first."""
+    fallback_max_timeout: float
+    """The hub's bound for a request when its ``RegisterAck`` names no ``max_timeout_ms``."""
+    default_deadline: float
+    """A call's deadline when neither the call nor the settings chose a timeout."""
+    retry_min_remaining: float
+    """A retry starts only with at least this much of the budget left after its wait (or the initial backoff)."""
+    outbound_limit: int
+    """Requests waiting in a stream's outbound buffer at most; a call beyond waits for room."""
+    max_unwritten_moves: int
+    """How often a request lost in a stream's buffer moves to another stream before it fails as never sent."""
 
 
 DEFAULT_TIMINGS: Final = Timings(
@@ -47,5 +59,11 @@ DEFAULT_TIMINGS: Final = Timings(
     close_wait=2.0,
     permit_batch=16,
     permit_flush_after=0.05,
+    guard_margin=1.0,
+    fallback_max_timeout=60.0,
+    default_deadline=5.0,
+    retry_min_remaining=0.25,
+    outbound_limit=256,
+    max_unwritten_moves=8,
 )
 """The shipped timings."""

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from snodra import Settings
+from snodra import ConfigurationError, RetryPolicy, Settings
 
 DEFAULT_CAPACITY = 64
 """The handlers the instance runs at once when ``CONFORMANCE_CAPACITY`` is not set."""
@@ -25,4 +25,21 @@ def settings_from_env(environ: Mapping[str, str]) -> Settings:
         values["hubs"] = tuple(h.strip() for h in hubs.split(",") if h.strip())
     capacity = get("CONFORMANCE_CAPACITY")
     values["max_concurrent"] = DEFAULT_CAPACITY if capacity is None else int(capacity)
+    values["default_retry"] = _retry(get)
     return Settings(**values)
+
+
+def _retry(get: Callable[[str], str | None]) -> RetryPolicy | None:
+    """The policy of every send: ``CONFORMANCE_RETRY_MAX_ATTEMPTS`` attempts, the first backoff
+    ``CONFORMANCE_RETRY_INITIAL_BACKOFF_MS`` (100 by default); None when the first is not set."""
+    attempts = get("CONFORMANCE_RETRY_MAX_ATTEMPTS")
+    if attempts is None:
+        return None
+    if not (attempts.isascii() and attempts.isdigit()) or int(attempts) < 1:
+        raise ConfigurationError(f"CONFORMANCE_RETRY_MAX_ATTEMPTS must be a positive integer, got {attempts!r}")
+    backoff = get("CONFORMANCE_RETRY_INITIAL_BACKOFF_MS") or "100"
+    if not (backoff.isascii() and backoff.isdigit()):
+        raise ConfigurationError(
+            f"CONFORMANCE_RETRY_INITIAL_BACKOFF_MS must be a non-negative integer, got {backoff!r}"
+        )
+    return RetryPolicy(max_attempts=int(attempts), initial_backoff=int(backoff) / 1000)

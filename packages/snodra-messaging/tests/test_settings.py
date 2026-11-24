@@ -1,7 +1,7 @@
 import uuid
 
 import pytest
-from snodra import ConfigurationError, Settings
+from snodra import ConfigurationError, RetryPolicy, Settings
 
 
 def _refused(variable: str, **fields: object) -> None:
@@ -145,5 +145,74 @@ def test_from_env_reads_the_process_environment(monkeypatch: pytest.MonkeyPatch)
     ],
 )
 def test_from_env_refuses_bad_values(variable: str, value: str) -> None:
+    with pytest.raises(ConfigurationError, match=variable):
+        Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service", variable: value})
+
+
+def test_the_sending_settings() -> None:
+    s = Settings(service="orders-service")
+    assert (s.default_timeout, s.default_retry, dict(s.priorities)) == (None, None, {})
+    policy = RetryPolicy(max_attempts=5)
+    s = Settings(
+        service="orders-service", default_timeout=2.5, default_retry=policy, priorities={"orders.PlaceOrder": 3}
+    )
+    assert (s.default_timeout, s.default_retry, dict(s.priorities)) == (2.5, policy, {"orders.PlaceOrder": 3})
+    _refused("SNODRA_SERVER_REQUEST_TIMEOUT_MS", default_timeout=0)
+    _refused("SNODRA_SERVER_REQUEST_TIMEOUT_MS", default_timeout=-1.0)
+    _refused("SNODRA_SERVER_REQUEST_TIMEOUT_MS", default_timeout=float("inf"))
+    _refused("SNODRA_SERVER_REQUEST_TIMEOUT_MS", default_timeout=True)
+    _refused("SNODRA_SERVER_RETRY", default_retry=3)
+    _refused("SNODRA_SERVER_PRIORITIES", priorities={"orders.PlaceOrder": 2**31})
+    _refused("SNODRA_SERVER_PRIORITIES", priorities={"orders.PlaceOrder": True})
+    _refused("SNODRA_SERVER_PRIORITIES", priorities={"": 1})
+
+
+def test_the_sending_settings_from_env() -> None:
+    base = {"SNODRA_SERVICE_NAME": "orders-service"}
+    s = Settings.from_env(base | {"SNODRA_SERVER_REQUEST_TIMEOUT_MS": "0", "SNODRA_SERVER_RETRY_MAX_ATTEMPTS": "5"})
+    assert (s.default_timeout, s.default_retry) == (None, None)  # 0 is none; retry is off unless enabled
+    s = Settings.from_env(
+        base
+        | {
+            "SNODRA_SERVER_REQUEST_TIMEOUT_MS": "1500",
+            "SNODRA_SERVER_RETRY_ENABLED": "true",
+            "SNODRA_SERVER_PRIORITIES": "orders.PlaceOrder=5, orders.GetOrder=-2,",
+        }
+    )
+    assert s.default_timeout == 1.5
+    assert s.default_retry == RetryPolicy(max_attempts=3, initial_backoff=0.1, multiplier=2.0, max_backoff=2.0)
+    assert dict(s.priorities) == {"orders.PlaceOrder": 5, "orders.GetOrder": -2}
+    s = Settings.from_env(
+        base
+        | {
+            "SNODRA_SERVER_RETRY_ENABLED": "TRUE",
+            "SNODRA_SERVER_RETRY_MAX_ATTEMPTS": "4",
+            "SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS": "50",
+            "SNODRA_SERVER_RETRY_MULTIPLIER": "1.5",
+            "SNODRA_SERVER_RETRY_MAX_BACKOFF_MS": "800",
+        }
+    )
+    assert s.default_retry == RetryPolicy(max_attempts=4, initial_backoff=0.05, multiplier=1.5, max_backoff=0.8)
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("SNODRA_SERVER_REQUEST_TIMEOUT_MS", "-1"),
+        ("SNODRA_SERVER_REQUEST_TIMEOUT_MS", "soon"),
+        ("SNODRA_SERVER_RETRY_ENABLED", "yes please"),
+        ("SNODRA_SERVER_RETRY_MAX_ATTEMPTS", "0"),
+        ("SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS", "-5"),
+        ("SNODRA_SERVER_RETRY_MULTIPLIER", "0.5"),
+        ("SNODRA_SERVER_RETRY_MULTIPLIER", "inf"),
+        ("SNODRA_SERVER_RETRY_MULTIPLIER", "two"),
+        ("SNODRA_SERVER_RETRY_MAX_BACKOFF_MS", "x"),
+        ("SNODRA_SERVER_PRIORITIES", "orders.PlaceOrder"),
+        ("SNODRA_SERVER_PRIORITIES", "orders.PlaceOrder=high"),
+        ("SNODRA_SERVER_PRIORITIES", "orders.PlaceOrder=99999999999"),
+    ],
+)
+def test_the_sending_settings_from_env_refuse_bad_values(variable: str, value: str) -> None:
+    # A retry variable is checked even while retry is off.
     with pytest.raises(ConfigurationError, match=variable):
         Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service", variable: value})

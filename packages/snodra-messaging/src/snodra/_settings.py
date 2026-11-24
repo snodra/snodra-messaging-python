@@ -5,15 +5,19 @@ from __future__ import annotations
 import math
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final
 
 from snodra._errors import ConfigurationError
 from snodra._ids import new_id
+from snodra._retry import RetryPolicy
 
 _UINT32_MAX: Final = 2**32 - 1
+_INT32: Final = range(-(2**31), 2**31)
+_TRUE: Final = frozenset({"true", "1", "yes", "on"})
+_FALSE: Final = frozenset({"false", "0", "no", "off"})
 _STATIC: Final = "static://"
 _DNS: Final = "dns:///"
 _DNS_TARGET: Final = re.compile(r"dns:///([^/:]+|\[[^/\]]+\]):(\d+)")
@@ -41,6 +45,14 @@ class Settings:
     """``Register.load_factor`` (``SNODRA_SERVER_LOAD_FACTOR``); 0 reads as 100 at the hub."""
     tags: Mapping[str, str] = field(default_factory=dict)
     """``Register.tags`` (``SNODRA_SERVER_TAGS``, ``key=value,key=value``)."""
+    default_timeout: float | None = None
+    """The timeout of a call that chose none (``SNODRA_SERVER_REQUEST_TIMEOUT_MS``, 0 for none); without one the hub
+    applies its own per type and the call waits at most 5 s for a hub."""
+    default_retry: RetryPolicy | None = None
+    """The retry policy of a call that chose none (``SNODRA_SERVER_RETRY_ENABLED`` and ``SNODRA_SERVER_RETRY_*``);
+    None: no retry."""
+    priorities: Mapping[str, int] = field(default_factory=dict)
+    """``Request.priority`` per type, for a call that chose none (``SNODRA_SERVER_PRIORITIES``, ``type=n,type=n``)."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.service, str) or not self.service.strip():
@@ -70,6 +82,22 @@ class Settings:
             if not isinstance(k, str) or not k.strip() or not isinstance(v, str):
                 raise ConfigurationError(f"tags (SNODRA_SERVER_TAGS): {k!r}={v!r} is not a non-empty name and a text")
         object.__setattr__(self, "tags", MappingProxyType(dict(self.tags)))
+        timeout = self.default_timeout
+        if timeout is not None and (not _is_number(timeout) or not math.isfinite(timeout) or timeout <= 0):
+            raise ConfigurationError(
+                "default_timeout (SNODRA_SERVER_REQUEST_TIMEOUT_MS) must be a positive number of seconds or None, "
+                f"got {timeout!r}"
+            )
+        if self.default_retry is not None and not isinstance(self.default_retry, RetryPolicy):
+            raise ConfigurationError(
+                f"default_retry (SNODRA_SERVER_RETRY_*) must be a RetryPolicy or None, got {self.default_retry!r}"
+            )
+        for k, n in self.priorities.items():
+            if not isinstance(k, str) or not k.strip() or not _is_int(n) or n not in _INT32:
+                raise ConfigurationError(
+                    f"priorities (SNODRA_SERVER_PRIORITIES): {k!r}={n!r} is not a type name and a 32-bit integer"
+                )
+        object.__setattr__(self, "priorities", MappingProxyType(dict(self.priorities)))
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> Settings:
@@ -102,6 +130,14 @@ class Settings:
             values["load_factor"] = _env_int("SNODRA_SERVER_LOAD_FACTOR", v)
         if (v := get("SNODRA_SERVER_TAGS")) is not None:
             values["tags"] = _env_pairs("SNODRA_SERVER_TAGS", v)
+        if (v := get("SNODRA_SERVER_REQUEST_TIMEOUT_MS")) is not None:
+            ms = _env_int("SNODRA_SERVER_REQUEST_TIMEOUT_MS", v)
+            values["default_timeout"] = ms / 1000 if ms > 0 else None
+        retry = _env_retry(get)
+        if retry is not None:
+            values["default_retry"] = retry
+        if (v := get("SNODRA_SERVER_PRIORITIES")) is not None:
+            values["priorities"] = _env_priorities("SNODRA_SERVER_PRIORITIES", v)
         values |= overrides
         if "service" not in values:
             raise ConfigurationError("the service name (service, SNODRA_SERVICE_NAME) is required")
@@ -186,3 +222,47 @@ def _env_pairs(name: str, value: str) -> dict[str, str]:
             raise ConfigurationError(f"{name}: entry {entry!r} is not key=value")
         pairs[k.strip()] = v.strip()
     return pairs
+
+
+def _env_retry(get: Callable[[str], str | None]) -> RetryPolicy | None:
+    """The policy of ``SNODRA_SERVER_RETRY_*``, None unless ``SNODRA_SERVER_RETRY_ENABLED`` is true; every variable
+    is checked even while retry is off."""
+    enabled = get("SNODRA_SERVER_RETRY_ENABLED")
+    on = False
+    if enabled is not None:
+        if enabled.lower() not in _TRUE | _FALSE:
+            raise ConfigurationError(f"SNODRA_SERVER_RETRY_ENABLED must be true or false, got {enabled!r}")
+        on = enabled.lower() in _TRUE
+    fields: dict[str, Any] = {}
+    if (v := get("SNODRA_SERVER_RETRY_MAX_ATTEMPTS")) is not None:
+        fields["max_attempts"] = _env_int("SNODRA_SERVER_RETRY_MAX_ATTEMPTS", v)
+    if (v := get("SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS")) is not None:
+        fields["initial_backoff"] = _env_int("SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS", v) / 1000
+    if (v := get("SNODRA_SERVER_RETRY_MULTIPLIER")) is not None:
+        try:
+            fields["multiplier"] = float(v)
+        except ValueError:
+            raise ConfigurationError(f"SNODRA_SERVER_RETRY_MULTIPLIER must be a number, got {v!r}") from None
+    if (v := get("SNODRA_SERVER_RETRY_MAX_BACKOFF_MS")) is not None:
+        fields["max_backoff"] = _env_int("SNODRA_SERVER_RETRY_MAX_BACKOFF_MS", v) / 1000
+    try:
+        policy = RetryPolicy(**fields)
+    except ValueError as e:
+        names = {
+            "max_attempts": "SNODRA_SERVER_RETRY_MAX_ATTEMPTS",
+            "initial_backoff": "SNODRA_SERVER_RETRY_INITIAL_BACKOFF_MS",
+            "multiplier": "SNODRA_SERVER_RETRY_MULTIPLIER",
+            "max_backoff": "SNODRA_SERVER_RETRY_MAX_BACKOFF_MS",
+        }
+        variable = next((env for name, env in names.items() if f"RetryPolicy.{name} " in str(e)), "SNODRA_SERVER_RETRY")
+        raise ConfigurationError(f"{variable}: {e}") from None
+    return policy if on else None
+
+
+def _env_priorities(name: str, value: str) -> dict[str, int]:
+    priorities: dict[str, int] = {}
+    for k, v in _env_pairs(name, value).items():
+        if not re.fullmatch(r"[+-]?\d+", v) or int(v) not in _INT32:
+            raise ConfigurationError(f"{name}: the priority of {k} must be a 32-bit integer, got {v!r}")
+        priorities[k] = int(v)
+    return priorities
