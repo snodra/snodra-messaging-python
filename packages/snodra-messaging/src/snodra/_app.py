@@ -224,7 +224,9 @@ class App:
         every live stream (its ack awaited for at most 1 s), then the handlers in flight drained (awaited for at most
         5 s, then cancelled and never awaited again), then each stream half-closed and its end awaited (at most 2 s).
         A handler still running when ``timeout`` is reached is cancelled and left behind: one warning names it. A
-        second call returns at once.
+        second call returns at once. The handlers being drained can still send commands and queries; once the drain
+        is over nothing is sent: a call fails as :class:`NeverSent`, and one still waiting for its answer as
+        :class:`OutcomeUnknown` ("hub connection stopped").
 
         The unexpected error that crashed a connection (a library bug, logged at error level when it happened) is
         raised here once everything is stopped, unless another exception or a cancellation is already propagating

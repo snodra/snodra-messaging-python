@@ -192,6 +192,17 @@ class _Stream:
             request.withdrawn = True
             self._left_buffer()
 
+    def stop_requests(self, why: str) -> None:
+        """The connection stops: every waiting request ends now. One still buffered is withdrawn (never written,
+        never sent); a written one has an unknown outcome (``why``)."""
+        requests, self.requests = self.requests, {}
+        for r in requests.values():
+            if not r.written and not r.withdrawn:
+                r.withdrawn = True
+                self._left_buffer()
+            r.resolve(Lost(r.written, why))
+        self.wake_all()
+
     def _left_buffer(self) -> None:
         self.buffered -= 1
         while self._room:
@@ -322,17 +333,17 @@ class HubConnection:
         return s.ack.hub_id or self.address
 
     def live_stream(self) -> _Stream | None:
-        """The current stream when a request may be sent on it: acknowledged, taking frames, the connection not
-        stopping; else None."""
+        """The current stream when a request may be sent on it: acknowledged and taking frames (not half-closed);
+        else None."""
         s = self._stream
-        if s is None or s.ack is None or not s.writable or self._stopping:
+        if s is None or s.ack is None or not s.writable:
             return None
         return s
 
-    def wake_waiters(self) -> None:
-        """Wakes the calls waiting for room on the current stream."""
+    def stop_requests(self, why: str) -> None:
+        """Ends the requests waiting on the current stream (see :meth:`_Stream.stop_requests`)."""
         if self._stream is not None:
-            self._stream.wake_all()
+            self._stream.stop_requests(why)
 
     def _block_writer(self, on: bool) -> None:
         """A test hook: while on, the writer of the connection's streams writes nothing (a frame it took is held,

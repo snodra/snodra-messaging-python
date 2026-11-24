@@ -12,7 +12,7 @@ from dataclasses import replace
 
 import grpc
 import pytest
-from fakehub import FakeHub, FakeStream, ack, hub_error
+from fakehub import FakeHub, FakeStream, ack, forward, hub_error
 from helpers import (
     SCALED,
     CancelOrder,
@@ -22,6 +22,8 @@ from helpers import (
     acknowledged,
     assert_no_library_tasks,
     eventually,
+    new_app,
+    next_reply,
     start_app,
     within,
 )
@@ -504,11 +506,13 @@ async def test_an_answer_counts_only_from_the_stream_the_request_was_written_to(
     assert await call == Placed("o-1", 1)
 
 
-async def test_a_stopping_connection_is_never_picked(hub: FakeHub) -> None:
+async def test_a_half_closed_stream_is_never_picked(hub: FakeHub) -> None:
     app = await start_app(hub)
     await acknowledged(hub)
     await eventually(lambda: app._pool.pick() is not None)
     _connection(app).stop_reconnecting()
+    assert app._pool.pick() is not None  # no reconnect any more, but the stream still takes requests
+    _connection(app).half_close()
     assert app._pool.pick() is None
 
 
@@ -658,16 +662,56 @@ async def test_shutdown_wakes_a_send_waiting_for_room(hub: FakeHub) -> None:
         conn._block_writer(False)
 
 
-async def test_no_request_goes_to_a_stopping_connection(hub: FakeHub) -> None:
+async def test_a_handler_being_drained_can_still_send(hub: FakeHub) -> None:
+    # The empty Register takes the instance out of the routing; the handlers still running finish their work, sends to
+    # other services included, until the streams are closed after the drain.
+    app = new_app(hub)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @app.command_handler
+    async def place_order(cmd: PlaceOrder) -> Placed:
+        started.set()
+        await release.wait()
+        order = await app.query(GetOrder(cmd.order_id), Placed, timeout=2.0)
+        return Placed(cmd.order_id, order.total + 1)
+
+    await app.start()
+    s = await acknowledged(hub)
+    request = hub_pb2.Request(
+        id="r-1", kind=hub_pb2.COMMAND, type="orders.PlaceOrder", payload=b'{"orderId":"o-1","lines":[]}'
+    )
+    await s.send(forward(request))
+    await asyncio.wait_for(started.wait(), 1.0)
+    shutdown = asyncio.create_task(app.shutdown())
+    assert not (await s.recv_register()).command_types  # the empty Register first
+    release.set()
+    nested = await s.recv_request()  # sent during the drain
+    assert nested.type == "orders.GetOrder"
+    await s.send(_reply(nested.id, b'{"orderId":"o-1","total":41}'))
+    answer = await next_reply(s)
+    assert answer.request_id == "r-1"
+    assert json.loads(answer.payload) == {"orderId": "o-1", "total": 42}
+    await shutdown
+    assert not _pending(app)
+
+
+async def test_a_send_after_the_drain_is_never_sent(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
     app = await start_app(hub)
     s = await acknowledged(hub)
-    shutdown = asyncio.create_task(app.shutdown())
-    assert not (await s.recv_register()).command_types  # the empty Register
+    drain = app._dispatcher.drain
+    after: list[asyncio.Task[None]] = []
+
+    async def drain_then_send(timeout: float) -> None:  # noqa: ASYNC109 (the drain's bound)
+        await drain(timeout)
+        after.append(asyncio.create_task(app.send(PLACE, timeout=1.0)))  # runs once the drain is over
+
+    monkeypatch.setattr(app._dispatcher, "drain", drain_then_send)
     started = time.monotonic()
+    await app.shutdown()
     with pytest.raises(NeverSent, match=r"^'orders.PlaceOrder' not sent: the app is shutting down$"):
-        await app.send(PLACE, timeout=1.0)
-    assert time.monotonic() - started < 0.1
-    await shutdown
+        await after[0]
+    assert time.monotonic() - started < 0.6  # at once, not at the call's deadline
     assert not await _requests_until_end(s)
     with pytest.raises(NeverSent, match="shutting down"):
         await app.send(PLACE, timeout=1.0)
@@ -680,7 +724,7 @@ async def test_a_written_request_is_outcome_unknown_at_shutdown(hub: FakeHub) ->
     call = asyncio.create_task(app.send(PLACE, timeout=5.0))
     await s.recv_request()
     await app.shutdown()
-    with pytest.raises(OutcomeUnknown, match=r"^hub stream closed: "):
+    with pytest.raises(OutcomeUnknown, match=r"^hub connection stopped$"):
         await call
     assert not _pending(app)
 

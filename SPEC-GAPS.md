@@ -64,9 +64,8 @@ behaviour is the specification. The code carries a `# TODO(spec-gap): SG-<n>` co
 - **Other libraries:** the Go library writes `no hub took '<type>' within <duration>` in Go's form (`5s`).
 - **This library:** `snodra/_send.py` (`Sender._route`) uses Kotlin's texts with the duration in milliseconds:
   `no hub connected within 300 ms`, `no hub took the request within 300 ms`, and
-  `'orders.PlaceOrder' not written: 9 hub streams lost before it was`. A call made while the app shuts down fails at
-  once with `'<type>' not sent: the app is shutting down`, which has no Kotlin counterpart (the Kotlin library waits
-  for a hub until the deadline then).
+  `'orders.PlaceOrder' not written: 9 hub streams lost before it was`. A call made once the shutdown drained the
+  handlers fails at once with `'<type>' not sent: the app is shutting down`.
 - **Question:** settled: follows the Kotlin library, the duration written in milliseconds as Python has no standard
   text form of a duration.
 

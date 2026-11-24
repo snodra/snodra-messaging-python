@@ -61,7 +61,7 @@ class Pool:
         self._change = asyncio.Event()  # set, and replaced, whenever the acknowledged hubs change
         self._turn = 0  # the round-robin turn of unkeyed requests, shared by every call
         self.leaving = False
-        """The app is shutting down: nothing is sent any more."""
+        """The app's shutdown drained its handlers: nothing is sent any more."""
 
     def declare(self, command_types: list[str], query_types: list[str]) -> None:
         """The types every ``Register`` of every stream lists; before :meth:`start`."""
@@ -107,10 +107,9 @@ class Pool:
 
     async def leave(self, drain: Callable[[], Awaitable[None]] | None = None) -> None:
         """Leaves every hub in order: the empty ``Register`` (its acks awaited for ``deregister_wait`` at most), the
-        drain of the handlers in flight, then the half-close (the hub's end awaited for ``close_wait`` at most).
-        Nothing reconnects after it."""
+        drain of the handlers in flight (which may still send requests), then the end of sending and the half-close
+        (the hub's end awaited for ``close_wait`` at most). Nothing reconnects after it."""
         t = self._timings
-        self._stop_sending()
         for c in self.connections:
             c.stop_reconnecting()
         acks = [f for c in self.connections if (f := c.deregister()) is not None]
@@ -123,6 +122,8 @@ class Pool:
                 log.debug("Not every hub acknowledged the empty Register within %.2f s", t.deregister_wait)
         if drain is not None:
             await drain()
+        # The handlers drained may still have sent requests until here; from now on nothing is sent.
+        self._stop_sending()
         for c in self.connections:
             c.half_close()
         try:
@@ -152,12 +153,13 @@ class Pool:
         self._change = asyncio.Event()
 
     def _stop_sending(self) -> None:
-        """Nothing is sent from now on: the calls waiting for a hub or for room in a buffer are woken."""
+        """Nothing is sent from now on: the calls waiting for a hub or for room in a buffer are woken, a request still
+        buffered fails as never sent and a written one as an unknown outcome ("hub connection stopped")."""
         if not self.leaving:
             self.leaving = True
             self._signal_change()
             for c in self.connections:
-                c.wake_waiters()
+                c.stop_requests("hub connection stopped")
 
     def _rejected(self, rejection: Rejection) -> None:
         self.rejection = rejection
