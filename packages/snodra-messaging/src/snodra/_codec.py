@@ -9,6 +9,7 @@ import dataclasses
 import datetime as dt
 import enum
 import json
+import math
 import re
 import types
 import typing
@@ -58,8 +59,11 @@ class JsonCodec:
     A dataclass is an object whose field names are camelCase (``order_id`` is ``orderId``; a field's
     ``metadata={"json": "orderID"}`` names it exactly). Nested dataclasses, ``list``, ``dict[str, X]``, ``X | None``,
     ``str``, ``int``, ``float``, ``bool``, ``bytes`` (base64), ``datetime`` (ISO 8601 UTC), ``uuid.UUID`` and
-    ``enum.Enum`` (its value) are read and written. ``None`` fields are written as ``null``, unknown fields are
-    ignored on read, a missing field takes its default or fails. A class with ``model_validate`` and ``model_dump``
+    ``enum.Enum`` are read and written; an enum is written by its member value, which a Kotlin service reads only when
+    it equals the name of one of its enum constants. ``None`` fields are written as ``null``, unknown fields are
+    ignored on read, an absent field takes its default, reads as ``None`` when it is optional (``X | None``) and
+    fails otherwise. One trailing underscore of a field name is dropped (``type_`` is ``type``), and two fields on one
+    JSON key are a ``TypeError``. A class with ``model_validate`` and ``model_dump``
     (a Pydantic model) is read and written through them. ``RawJson`` holds any document.
     """
 
@@ -70,15 +74,15 @@ class JsonCodec:
 
     def decode(self, data: bytes, into: type[T]) -> T:
         name = _name(into)
-        if (into is type(None) or into is None) and not data:
-            return None  # type: ignore[return-value]
+        if into is type(None) and not data:
+            return None
         try:
             document = _loads(data)
         except (UnicodeDecodeError, ValueError, RecursionError) as e:
             raise DecodeError(f"Cannot decode payload as {name}: not a JSON document ({_reason(e)})") from None
-        if into is type(None) or into is None:
+        if into is type(None):
             if isinstance(document, dict):
-                return None  # type: ignore[return-value]
+                return None
             raise DecodeError(f"Cannot decode payload as {name}: expected an empty object")
         if document is None:
             raise DecodeError(f"Cannot decode payload as {name}: null")
@@ -110,8 +114,15 @@ def _no_constant(name: str) -> Any:
     raise ValueError(f"{name} is not JSON")
 
 
+def _finite_float(text: str) -> float:
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError("a number out of range")
+    return number
+
+
 def _loads(data: bytes) -> Any:
-    return json.loads(data.decode("utf-8"), parse_constant=_no_constant)
+    return json.loads(data.decode("utf-8"), parse_constant=_no_constant, parse_float=_finite_float)
 
 
 def _dumps(document: Any) -> bytes:
@@ -131,7 +142,24 @@ def wire_name(f: dataclasses.Field[Any]) -> str:
     named = f.metadata.get(_JSON_KEY)
     if isinstance(named, str) and named:
         return named
-    return _camel(f.name)
+    name = f.name[:-1] if f.name.endswith("_") and f.name.strip("_") else f.name
+    return _camel(name)
+
+
+_names_checked: set[type] = set()
+
+
+def _check_names(cls: type) -> None:
+    """Two fields on one JSON key are a definition error, found when the class is first used."""
+    if cls in _names_checked:
+        return
+    seen: dict[str, str] = {}
+    for f in dataclasses.fields(cls):
+        key = wire_name(f)
+        if key in seen:
+            raise TypeError(f"{cls.__qualname__}: the fields '{seen[key]}' and '{f.name}' are both JSON key '{key}'")
+        seen[key] = f.name
+    _names_checked.add(cls)
 
 
 def _camel(name: str) -> str:
@@ -150,6 +178,14 @@ def _format_datetime(value: dt.datetime) -> str:
         fraction = f"{micro:06d}"
         text += "." + (fraction[:3] if fraction[3:] == "000" else fraction)
     return text + "Z"
+
+
+def _stable(items: list[Any]) -> list[Any]:
+    """A set's elements in a fixed order: sorted when they sort, else by their JSON text."""
+    try:
+        return sorted(items)
+    except TypeError:
+        return sorted(items, key=lambda v: json.dumps(v, separators=(",", ":"), sort_keys=True))
 
 
 def _has_model_protocol(cls: type) -> bool:
@@ -173,8 +209,11 @@ def _to_json(value: Any) -> Any:
     if not isinstance(value, type) and _has_model_protocol(type(value)):
         return value.model_dump(mode="json", by_alias=True)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        _check_names(type(value))
         return {wire_name(f): _to_json(getattr(value, f.name)) for f in dataclasses.fields(value)}
-    if isinstance(value, list | tuple | set | frozenset):
+    if isinstance(value, set | frozenset):
+        return _stable([_to_json(v) for v in value])
+    if isinstance(value, list | tuple):
         return [_to_json(v) for v in value]
     if isinstance(value, dict):
         out: dict[str, Any] = {}
@@ -298,7 +337,13 @@ def _from_json(value: Any, hint: Any, path: str) -> Any:
         raise _Bad(path, f"expected an integer, found {_kind(value)}")
     if hint is float:
         if isinstance(value, int | float) and not isinstance(value, bool):
-            return float(value)
+            try:
+                number = float(value)
+            except OverflowError:
+                raise _Bad(path, "the number is out of range") from None
+            if not math.isfinite(number):
+                raise _Bad(path, "the number is out of range")
+            return number
         raise _Bad(path, f"expected a number, found {_kind(value)}")
     if hint is str:
         if isinstance(value, str):
@@ -354,6 +399,7 @@ def _object(value: Any, path: str) -> dict[str, Any]:
 
 def _dataclass(value: Any, cls: type, path: str) -> Any:
     obj = _object(value, path)
+    _check_names(cls)
     hints = _hints(cls)
     kwargs: dict[str, Any] = {}
     for f in dataclasses.fields(cls):
@@ -363,5 +409,11 @@ def _dataclass(value: Any, cls: type, path: str) -> Any:
         if key in obj:
             kwargs[f.name] = _from_json(obj[key], hints[f.name], _join(path, key))
         elif f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
-            raise _Bad(path, f"missing field '{key}'")
+            if not _is_optional(hints[f.name]):
+                raise _Bad(path, f"missing field '{key}'")
+            kwargs[f.name] = None
     return cls(**kwargs)
+
+
+def _is_optional(hint: Any) -> bool:
+    return typing.get_origin(hint) in (typing.Union, types.UnionType) and type(None) in typing.get_args(hint)

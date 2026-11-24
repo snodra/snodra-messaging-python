@@ -31,9 +31,10 @@ behaviour is the specification. The code carries a `# TODO(spec-gap): SG-<n>` co
 - **This library:** `snodra/_errors.py` (`error_from_wire`, `error_to_wire`) uses the same texts. `ValueError` plays
   `IllegalArgumentException`, which is Python's own choice; `HandlerError(message, details=...)` and `InvalidRequest`
   have no Kotlin counterpart that a handler raises (the Kotlin library answers `INVALID_REQUEST` itself), so they map to
-  `HANDLER_ERROR` with JSON details and to `INVALID_REQUEST`. Every line break in a message becomes one space; details
+  `HANDLER_ERROR` with JSON details and to `INVALID_REQUEST`. Every line break in a message becomes one space (the conformance contract's rule for `L1-HANDLER-ERRORS`, not Kotlin's); details
   are set only with `HANDLER_ERROR`; a failure of a call the handler made is its own `HANDLER_ERROR`.
-- **Question:** settled: follows the Kotlin library.
+- **Question:** settled: follows the Kotlin library for the texts and the exception mapping; the line-break rule comes
+  from the conformance contract.
 
 ### SG-7: JSON details of the default payload codec
 
@@ -43,14 +44,20 @@ behaviour is the specification. The code carries a `# TODO(spec-gap): SG-<n>` co
 - **Kotlin library (the reference):** Jackson with the Kotlin module (`snodra-messaging@ecc4207:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/codec/JsonCodec.kt:11-31`):
   a `null` field is written as `null`; the JSON literal `null` as a whole payload fails, an empty payload decodes to
   `Unit`; an enum is its name; an `Instant` is written with 0, 3, 6 or 9 fraction digits and always `Z`; a byte array is
-  standard base64; with Jackson's default coercions it also reads `1.0` or the text `"1"` into an integer field.
+  standard base64; with Jackson's default coercions it also reads `1.0`, `1.5` (truncated to 1) and the text `"1"` into an integer field,
+  a number or a boolean into a string field, `1` and `"true"` into a boolean field, and `"1.5"` into a double. A field
+  typed as nullable and absent reads as `null`.
 - **Other libraries:** not compared.
 - **This library:** `snodra/_codec.py`. It writes `null` fields, fails on the whole-payload `null`, and reads an empty
-  payload as no value only into `None`. An enum is its value (a Python enum's members carry values, not names; the names
-  of Kotlin enums equal the values used on the wire). A `datetime` is written in UTC with 0, 3 or 6 fraction digits (a
+  payload as no value only into `None`. A `datetime` is written in UTC with 0, 3 or 6 fraction digits (a
   naive `datetime` is refused) and read with or without up to 9 fraction digits (the digits beyond microseconds are
   dropped) and a `Z` or an offset, never without a zone. `bytes` is standard base64. It is stricter than Kotlin on
-  numbers: an integer field takes only a JSON integer (never `1.0`, `"1"` or `true`), a float field an integer or a float
-  (never a string). `NaN` and `Infinity` are refused both ways. Python integers have no range, so a value beyond signed
+  coercions: an integer field takes only a JSON integer (never `1.0`, `1.5`, `"1"` or `true`), a float field an integer or
+  a float (never a string), a string field only a string, a boolean field only a boolean. An absent field of an optional
+  type (`X | None`) reads as `None` as the Kotlin reader does; any other absent field without a default fails. A number
+  too large for a float (`1e999`, a 400-digit integer) is refused on read, `NaN` and `Infinity` on read and write. An
+  enum is written by its member value: it is readable by a Kotlin service only when the value equals the name of its enum
+  constant. A `set` is written sorted (or, when its elements do not sort, by their JSON text) so equal sets give equal
+  bytes. One trailing underscore of a field name is dropped (`type_` is `type`). Python integers have no range, so a value beyond signed
   64 bits is written as it is.
-- **Question:** settled: follows the Kotlin library, except the stricter numbers, which the owner may relax.
+- **Question:** open: should the numeric, textual and boolean coercions the Kotlin reader accepts (see above) be read too?

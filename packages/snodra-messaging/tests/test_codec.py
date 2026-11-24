@@ -293,3 +293,69 @@ def test_text_is_written_as_utf8() -> None:
 def test_codec_protocol_is_satisfied() -> None:
     codec: snodra.Codec = JsonCodec()
     assert codec.decode(codec.encode(Counted(1)), Counted) == Counted(1)
+
+
+def test_exact_bytes() -> None:
+    value = PlaceOrder("o-1", [Line("sku-1", 2)], placed_at=datetime(2026, 10, 28, 14, 3, 22, tzinfo=UTC))
+    assert JsonCodec().encode(value).decode() == (
+        '{"orderId":"o-1","lines":[{"sku":"sku-1","quantity":2}],"note":null,"placedAt":"2026-10-28T14:03:22Z"}'
+    )
+
+
+def test_numbers_out_of_range_are_decode_errors() -> None:
+    @dataclass
+    class F:
+        x: float
+
+    for bad in (b'{"x":1' + b"0" * 400 + b"}", b'{"x":1e999}', b'{"x":-1e999}'):
+        with pytest.raises(DecodeError):
+            JsonCodec().decode(bad, F)
+    for inf in (float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite"):
+            JsonCodec().encode(F(inf))
+
+
+def test_an_absent_optional_field_reads_as_none() -> None:
+    @dataclass
+    class Opt:
+        a: str
+        b: int | None
+
+    assert JsonCodec().decode(b'{"a":"x"}', Opt) == Opt("x", None)
+    with pytest.raises(DecodeError):
+        JsonCodec().decode(b'{"b":1}', Opt)
+
+
+def test_field_names_acronyms_digits_and_trailing_underscore() -> None:
+    @dataclass
+    class N:
+        http_url: str = "a"
+        line_2: str = "b"
+        type_: str = "c"
+
+    assert JsonCodec().encode(N()).decode() == '{"httpUrl":"a","line2":"b","type":"c"}'
+    assert JsonCodec().decode(b'{"httpUrl":"x","line2":"y","type":"z"}', N) == N("x", "y", "z")
+
+
+def test_two_fields_on_one_key_are_a_definition_error() -> None:
+    @dataclass
+    class Clash:
+        a_b: int = 1
+        aB: int = 2
+
+    with pytest.raises(TypeError, match="aB"):
+        JsonCodec().encode(Clash())
+    with pytest.raises(TypeError, match="aB"):
+        JsonCodec().decode(b"{}", Clash)
+
+
+def test_sets_are_written_in_a_stable_order() -> None:
+    @dataclass
+    class S:
+        tags: set[str] | frozenset[int]
+
+    c = JsonCodec()
+    assert c.encode(S({"b", "a", "c"})).decode() == '{"tags":["a","b","c"]}'
+    assert c.encode(S(frozenset({3, 1, 2}))).decode() == '{"tags":[1,2,3]}'
+    assert c.encode(S({1, "a"})).decode() in ('{"tags":["a",1]}', '{"tags":[1,"a"]}')  # type: ignore[arg-type]
+    assert c.encode(S({1, "a"})) == c.encode(S({"a", 1}))  # type: ignore[arg-type]
