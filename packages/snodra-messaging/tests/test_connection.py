@@ -4,6 +4,7 @@ Time comes from the fake hub: the heartbeat interval of its ``RegisterAck`` and 
 ``helpers.SCALED``. Every bound below is the rule's, with room for the connection set-up of a new stream.
 """
 
+import asyncio
 import itertools
 import logging
 import time
@@ -13,7 +14,7 @@ import grpc
 import pytest
 from fakehub import FakeHub, FakeStream, ack
 from helpers import SCALED, eventually, start_app, within
-from snodra import Rejection
+from snodra import Rejection, _backoff, _connection
 from snodra._connection import _Stream
 from snodra._hubpb import hub_pb2
 from snodra._meta import client_version
@@ -227,7 +228,21 @@ async def test_reconnects_after_the_hub_went_away(hub: FakeHub) -> None:
     assert app.hub_ids() == ["hub-1"]
 
 
-async def test_the_backoff_resets_after_an_ack(hub: FakeHub) -> None:
+def _record_waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Records the base of every reconnect wait the connections choose (before the jitter)."""
+    bases: list[float] = []
+    real = _backoff.jitter
+
+    def recording(base: float, hi: float, unit: float) -> float:
+        bases.append(base)
+        return real(base, hi, unit)
+
+    monkeypatch.setattr(_connection, "jitter", recording)
+    return bases
+
+
+async def test_the_backoff_resets_after_an_ack(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
+    bases = _record_waits(monkeypatch)
     app = await start_app(hub)
     for _ in range(2):  # two closures before any ack: the next wait is 0.2 s
         s = await _opened(hub)
@@ -238,7 +253,9 @@ async def test_the_backoff_resets_after_an_ack(hub: FakeHub) -> None:
     await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
     closed = time.monotonic()
     await hub.next_stream()
-    within(time.monotonic() - closed, 0.8 * 0.05, 1.2 * 0.05 + 0.03)
+    assert bases == [0.05, 0.1, 0.05]  # without the reset the third would be 0.2
+    # Without the reset the wait would be at least 0.16 s; the bound leaves room for the reconnect under load.
+    within(time.monotonic() - closed, 0.8 * 0.05, 0.13)
 
 
 async def test_unavailable_is_an_ordinary_closure(hub: FakeHub) -> None:
@@ -352,6 +369,7 @@ async def test_an_attempt_that_crashed_after_its_ack_resets_the_backoff(
         raise RuntimeError("a bug in the read loop")
 
     monkeypatch.setattr(_Stream, "on_echo", crash)  # the echo that follows the ack ends the attempt with a bug
+    bases = _record_waits(monkeypatch)
     app = await start_app(hub)
     for _ in range(2):  # two closures before any ack: the next wait would be 0.2 s
         s = await _opened(hub)
@@ -361,7 +379,8 @@ async def test_an_attempt_that_crashed_after_its_ack_resets_the_backoff(
     acked = time.monotonic()
     s2 = await hub.next_stream()
     assert s2.index == 3
-    within(time.monotonic() - acked, 0.0, 1.2 * 0.05 + 0.03)
+    assert bases == [0.05, 0.1, 0.05]  # without the reset the third would be 0.2
+    within(time.monotonic() - acked, 0.0, 0.13)  # at least 0.16 s without the reset
     assert app.rejection is None
 
 
@@ -381,3 +400,32 @@ async def test_one_connection_per_address(hub: FakeHub) -> None:
     assert len(app._connections()) == 1
     await _opened(hub)
     await hub.no_stream_within(0.1)
+
+
+async def test_settle_reads_the_results_it_waited_for(caplog: pytest.LogCaptureFixture) -> None:
+    async def failing() -> None:
+        raise OSError("channel close failed")
+
+    task = asyncio.create_task(failing(), name="snodra:clean-up:test")
+    with caplog.at_level(logging.WARNING, logger="snodra"):
+        await _connection.settle([task])
+    assert task.done()
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+        "Task snodra:clean-up:test failed: OSError('channel close failed')"
+    ]
+
+
+async def test_settle_keeps_what_it_leaves_behind_until_it_ends() -> None:
+    release = asyncio.Event()
+
+    task = asyncio.create_task(release.wait(), name="snodra:clean-up:test")
+    waiter = asyncio.create_task(_connection.settle([task], bound=0.05))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert task in _connection._LEFT_BEHIND  # held by the library until it ends
+    release.set()
+    await asyncio.wait_for(task, 1.0)
+    await asyncio.sleep(0)  # its done-callback runs
+    assert task not in _connection._LEFT_BEHIND

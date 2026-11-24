@@ -87,7 +87,7 @@ class Pool:
         """Ends every connection and its tasks, all at once; waits for them even when cancelled meanwhile (then
         re-raised), and raises the error that crashed a connection, if one did."""
         tasks = [t for c in self.connections if (t := c.cancel()) is not None]
-        await settle(tasks)
+        await settle(tasks, log_errors=False)  # a crash is logged by its connection and raised below
         for c in self.connections:
             if (e := c.crash) is not None:
                 raise e

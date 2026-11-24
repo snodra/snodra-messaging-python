@@ -42,6 +42,9 @@ _TYPE_LISTS: Final = ("command_types", "query_types", "shared_query_types", "sub
 CLEAN_UP_BOUND: Final = 2.0
 """After a cancellation, how long a clean-up still waits for the tasks it ends before it gives up on them."""
 
+_LEFT_BEHIND: Final[set[asyncio.Future[Any]]] = set()
+"""The tasks a clean-up gave up waiting for, held until they end."""
+
 _Call = grpc.aio.StreamStreamCall[hub_pb2.ClientMessage, hub_pb2.ServerMessage]
 
 
@@ -273,15 +276,6 @@ class HubConnection:
             self._task.cancel()
         return self._task
 
-    async def close(self) -> None:
-        """Stops the connection and waits for its task (and its stream's clean-up) to end, even when cancelled
-        meanwhile (then re-raised); raises the error that crashed the task, if one did."""
-        task = self.cancel()
-        if task is not None:
-            await settle([task])
-        if (e := self.crash) is not None:
-            raise e
-
     # The connection's task.
 
     async def _run(self) -> None:
@@ -455,9 +449,13 @@ class HubConnection:
             stream.heartbeat()
 
 
-async def settle(tasks: Collection[asyncio.Future[Any]], bound: float = CLEAN_UP_BOUND) -> None:
-    """Waits until every task is done, without raising their errors. A cancellation of the caller meanwhile does not
-    stop the wait: it goes on for at most ``bound`` seconds more, then the cancellation is raised."""
+async def settle(
+    tasks: Collection[asyncio.Future[Any]], bound: float = CLEAN_UP_BOUND, *, log_errors: bool = True
+) -> None:
+    """Waits until every task is done, without raising their errors (each one is read, and logged at warning level
+    unless ``log_errors`` is false: the caller reports them). A cancellation of the caller meanwhile does not stop the
+    wait: it goes on for at most ``bound`` seconds more, then the cancellation is raised; a task still running then is
+    held until it ends."""
     pending = {t for t in tasks if not t.done()}
     loop = asyncio.get_running_loop()
     cancelled: asyncio.CancelledError | None = None
@@ -466,6 +464,9 @@ async def settle(tasks: Collection[asyncio.Future[Any]], bound: float = CLEAN_UP
         timeout = None if deadline is None else deadline - loop.time()
         if timeout is not None and timeout <= 0:
             log.warning("%d task(s) still running %.1f s after a cancellation: left behind", len(pending), bound)
+            for t in pending:
+                _LEFT_BEHIND.add(t)
+                t.add_done_callback(_ended_behind if log_errors else _LEFT_BEHIND.discard)
             break
         try:
             _, pending = await asyncio.wait(pending, timeout=timeout)
@@ -473,5 +474,20 @@ async def settle(tasks: Collection[asyncio.Future[Any]], bound: float = CLEAN_UP
             cancelled = cancelled or e
             if deadline is None:
                 deadline = loop.time() + bound
+    for t in tasks:
+        if t.done() and log_errors:
+            _read_result(t)
     if cancelled is not None:
         raise cancelled
+
+
+def _read_result(t: asyncio.Future[Any]) -> None:
+    """Reads a done task's outcome, so that its error is logged here rather than reported as never retrieved."""
+    if not t.cancelled() and (e := t.exception()) is not None:
+        name = t.get_name() if isinstance(t, asyncio.Task) else repr(t)
+        log.warning("Task %s failed: %r", name, e)
+
+
+def _ended_behind(t: asyncio.Future[Any]) -> None:
+    _LEFT_BEHIND.discard(t)
+    _read_result(t)

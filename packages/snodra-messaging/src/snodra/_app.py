@@ -61,7 +61,9 @@ class App:
 
     async def run(self) -> None:
         """Starts, serves until SIGTERM or SIGINT (where the event loop takes signal handlers), a ``shutdown`` from
-        elsewhere or the cancellation of the task, then shuts down (``shutdown(15.0)``)."""
+        elsewhere or the cancellation of the task, then shuts down (``shutdown(15.0)``). A cancelled ``run`` ends
+        cancelled: the unexpected error that crashed a connection is then only logged (at error level, when it
+        happened); after a signal it is raised, as by ``shutdown``."""
         await self.start()
         loop = asyncio.get_running_loop()
         previous: dict[signal.Signals, Any] = {}
@@ -72,34 +74,55 @@ class App:
             except (NotImplementedError, RuntimeError, ValueError):  # Windows, or not the main thread
                 continue
             previous[sig] = before
+        propagating = False
         try:
             await self._stop.wait()
+        except BaseException:
+            propagating = True
+            raise
         finally:
             for sig, before in previous.items():
                 loop.remove_signal_handler(sig)
-                if before is not None:  # the handler found, not the default
+                # The handler found is restored, the default one too; None is a handler installed outside Python,
+                # which signal.signal cannot reinstall: the default stays then.
+                if before is not None:
                     signal.signal(sig, before)
-            await self.shutdown(15.0)
+            await self._shutdown(15.0, raise_crash=not propagating)
             await self._down.wait()  # a shutdown that another task started
 
     async def shutdown(self, timeout: float = 15.0) -> None:  # noqa: ASYNC109 (the API takes a timeout)
         """Leaves the hubs in order and stops every connection, within ``timeout``: a ``Register`` with no types on
         every live stream (its ack awaited for at most 1 s), then each stream half-closed and its end awaited (at most
-        2 s). A second call returns at once."""
+        2 s). A second call returns at once.
+
+        The unexpected error that crashed a connection (a library bug, logged at error level when it happened) is
+        raised here once everything is stopped, unless another exception or a cancellation is already propagating
+        out of the shutdown: that one is never replaced."""
+        await self._shutdown(timeout, raise_crash=True)
+
+    async def _shutdown(self, budget: float, *, raise_crash: bool) -> None:
         if self._shutting_down:
             return
         self._shutting_down = True
         self._stop.set()
+        propagating = False
         try:
             if self._started:
                 try:
-                    async with asyncio.timeout(timeout):
+                    async with asyncio.timeout(budget):
                         await self._pool.leave()
                 except TimeoutError:
-                    log.warning("Leaving the hubs took longer than %.2f s: the streams are cut", timeout)
+                    log.warning("Leaving the hubs took longer than %.2f s: the streams are cut", budget)
+        except BaseException:
+            propagating = True
+            raise
         finally:
             try:
                 await self._pool.close()
+            except Exception:
+                if raise_crash and not propagating:
+                    raise
+                log.debug("A connection crashed (logged when it happened); not raised over what propagates")
             finally:
                 self._down.set()
 
@@ -107,8 +130,11 @@ class App:
         await self.start()
         return self
 
-    async def __aexit__(self, *exc: object) -> None:
-        await self.shutdown()
+    async def __aexit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
+        """Shuts down (``shutdown(15.0)``); the unexpected error that crashed a connection is raised only when the
+        block ended without an exception: the block's own exception is never replaced (the crash was logged at error
+        level when it happened)."""
+        await self._shutdown(15.0, raise_crash=exc_type is None)
 
     def _connections(self) -> list[HubConnection]:
         """The hub connections (for tests)."""

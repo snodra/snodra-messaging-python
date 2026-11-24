@@ -272,6 +272,57 @@ async def test_a_crashed_connection_is_logged_and_surfaced(
     assert_no_library_tasks()
 
 
+async def _crashed(hub: FakeHub, app: App) -> None:
+    """Lets the app's connection crash (its backoff is broken by the caller) and waits until it did."""
+    s = await hub.next_stream()
+    await s.recv_register()
+    await s.close(grpc.StatusCode.UNAVAILABLE, "restart")  # the loop crashes computing its wait
+    await eventually(lambda: app._connections()[0].crash is not None)
+
+
+def _broken(base: float, hi: float, unit: float) -> float:
+    raise RuntimeError("broken backoff")
+
+
+async def test_a_cancelled_run_stays_cancelled_after_a_crash(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_connection, "jitter", _broken)
+    app = new_app(hub)
+    running = asyncio.create_task(app.run())
+    await _crashed(hub, app)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert running.cancelled()
+    assert_no_library_tasks()
+
+
+async def test_a_body_exception_is_kept_after_a_crash(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_connection, "jitter", _broken)
+    app = new_app(hub)
+
+    async def body() -> None:
+        async with app:
+            await _crashed(hub, app)
+            raise ValueError("the body failed")
+
+    with pytest.raises(ValueError, match="the body failed"):
+        await body()
+    assert_no_library_tasks()
+
+
+async def test_a_clean_exit_raises_the_crash(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_connection, "jitter", _broken)
+    app = new_app(hub)
+
+    async def body() -> None:
+        async with app:
+            await _crashed(hub, app)
+
+    with pytest.raises(RuntimeError, match="broken backoff"):
+        await body()
+    assert_no_library_tasks()
+
+
 async def test_run_restores_the_signal_handlers_it_found(hub: FakeHub) -> None:
     def mine(signum: int, frame: object) -> None:
         pass
