@@ -1,7 +1,16 @@
 import uuid
 
 import pytest
-from snodra import ConfigurationError, RetryPolicy, Settings
+from snodra import (
+    ClientCertificate,
+    ClientCredentials,
+    ConfigurationError,
+    RetryPolicy,
+    Settings,
+    TLSConfig,
+    Token,
+    TokenFile,
+)
 
 
 def _refused(variable: str, **fields: object) -> None:
@@ -301,5 +310,92 @@ def test_the_identity_and_routing_settings_from_env() -> None:
     ],
 )
 def test_the_identity_settings_from_env_refuse_bad_values(env: dict[str, str], variable: str) -> None:
+    with pytest.raises(ConfigurationError, match=variable):
+        Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service"} | env)
+
+
+def test_the_credential_settings() -> None:
+    s = Settings(service="orders-service", credentials=Token(" t-1 "))
+    assert (s.credentials, s.tls, s.client_certificate) == (Token("t-1"), None, None)
+    s = Settings(service="orders-service", client_certificate=ClientCertificate("c.pem", "k.pem"))
+    assert s.tls == TLSConfig()  # a client certificate implies TLS
+    s = Settings(service="orders-service", tls=TLSConfig(" ca.pem ", " hub.test "))
+    assert s.tls == TLSConfig("ca.pem", "hub.test")
+    _refused("SNODRA_SERVER_TOKEN", credentials=Token("  "))
+    _refused("SNODRA_SERVER_TOKEN_FILE", credentials=TokenFile(" "))
+    _refused("SNODRA_SERVER_OAUTH2_TOKEN_URI", credentials=ClientCredentials("idp.test/token", "c", "s"))
+    _refused("SNODRA_SERVER_OAUTH2_TOKEN_URI", credentials=ClientCredentials("ftp://idp.test/token", "c", "s"))
+    _refused("SNODRA_SERVER_OAUTH2_CLIENT_ID", credentials=ClientCredentials("https://idp.test/token", " ", "s"))
+    _refused("SNODRA_SERVER_OAUTH2_CLIENT_SECRET", credentials=ClientCredentials("https://idp.test/token", "c"))
+    _refused("SNODRA_SERVER_TLS", tls="on")
+    _refused("SNODRA_SERVER_TLS_CLIENT_CERT", client_certificate=ClientCertificate(" ", "k.pem"))
+    _refused("SNODRA_SERVER_TLS_CLIENT_KEY", client_certificate=ClientCertificate("c.pem", ""))
+
+
+def test_the_credential_settings_from_env() -> None:
+    base = {"SNODRA_SERVICE_NAME": "orders-service"}
+    assert Settings.from_env(base | {"SNODRA_SERVER_TOKEN": "t-1"}).credentials == Token("t-1")
+    s = Settings.from_env(base | {"SNODRA_SERVER_TOKEN": "t-1", "SNODRA_SERVER_TOKEN_FILE": "/run/token"})
+    assert s.credentials == TokenFile("/run/token")  # the file wins
+    s = Settings.from_env(
+        base
+        | {
+            "SNODRA_SERVER_OAUTH2_TOKEN_URI": "https://idp.test/token",
+            "SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE": "/run/secret",
+            "SNODRA_SERVER_OAUTH2_SCOPE": "hub",
+            "SNODRA_SERVER_OAUTH2_CA": "/run/idp-ca.pem",
+        }
+    )
+    assert s.credentials == ClientCredentials(
+        "https://idp.test/token",
+        "orders-service",  # the service name by default
+        client_secret_file="/run/secret",
+        scope="hub",
+        ca_file="/run/idp-ca.pem",
+    )
+    s = Settings.from_env(
+        base
+        | {
+            "SNODRA_SERVER_OAUTH2_TOKEN_URI": "https://idp.test/token",
+            "SNODRA_SERVER_OAUTH2_CLIENT_ID": "orders-client",
+            "SNODRA_SERVER_OAUTH2_CLIENT_SECRET": "s",
+        }
+    )
+    assert s.credentials == ClientCredentials("https://idp.test/token", "orders-client", "s")
+    s = Settings.from_env(
+        base | {"SNODRA_SERVER_TLS": "true", "SNODRA_SERVER_TLS_CA": "ca.pem", "SNODRA_SERVER_TLS_SERVER_NAME": "hub"}
+    )
+    assert (s.tls, s.client_certificate) == (TLSConfig("ca.pem", "hub"), None)
+    s = Settings.from_env(base | {"SNODRA_SERVER_TLS_CLIENT_CERT": "c.pem", "SNODRA_SERVER_TLS_CLIENT_KEY": "k.pem"})
+    assert (s.tls, s.client_certificate) == (TLSConfig(), ClientCertificate("c.pem", "k.pem"))
+    assert Settings.from_env(base | {"SNODRA_SERVER_TLS": "false"}).tls is None
+
+
+@pytest.mark.parametrize(
+    ("env", "variable"),
+    [
+        ({"SNODRA_SERVER_OAUTH2_CLIENT_ID": "c"}, "SNODRA_SERVER_OAUTH2_TOKEN_URI"),
+        ({"SNODRA_SERVER_OAUTH2_SCOPE": "hub"}, "SNODRA_SERVER_OAUTH2_TOKEN_URI"),
+        ({"SNODRA_SERVER_TLS_CA": "ca.pem"}, "SNODRA_SERVER_TLS"),
+        ({"SNODRA_SERVER_TLS_SERVER_NAME": "hub"}, "SNODRA_SERVER_TLS"),
+        ({"SNODRA_SERVER_TLS": "yes please"}, "SNODRA_SERVER_TLS"),
+        ({"SNODRA_SERVER_TLS_CLIENT_CERT": "c.pem"}, "SNODRA_SERVER_TLS_CLIENT_KEY"),
+        ({"SNODRA_SERVER_TLS_CLIENT_KEY": "k.pem"}, "SNODRA_SERVER_TLS_CLIENT_CERT"),
+        (
+            {"SNODRA_SERVER_TLS": "false", "SNODRA_SERVER_TLS_CLIENT_CERT": "c", "SNODRA_SERVER_TLS_CLIENT_KEY": "k"},
+            "SNODRA_SERVER_TLS",
+        ),
+        (
+            {"SNODRA_SERVER_TOKEN": "t", "SNODRA_SERVER_OAUTH2_TOKEN_URI": "https://idp.test/t"},
+            "SNODRA_SERVER_OAUTH2_TOKEN_URI",
+        ),
+        (
+            {"SNODRA_SERVER_TOKEN": "t", "SNODRA_SERVER_TLS_CLIENT_CERT": "c", "SNODRA_SERVER_TLS_CLIENT_KEY": "k"},
+            "SNODRA_SERVER_TLS_CLIENT_CERT",
+        ),
+        ({"SNODRA_SERVER_OAUTH2_TOKEN_URI": "https://idp.test/t"}, "SNODRA_SERVER_OAUTH2_CLIENT_SECRET"),
+    ],
+)
+def test_the_credential_settings_from_env_refuse_bad_values(env: dict[str, str], variable: str) -> None:
     with pytest.raises(ConfigurationError, match=variable):
         Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service"} | env)

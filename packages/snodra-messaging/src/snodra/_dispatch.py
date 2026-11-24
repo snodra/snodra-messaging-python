@@ -113,6 +113,10 @@ class Dispatcher:
         self._running[key] = run
         run.task.add_done_callback(lambda t: self._ended(key, run, t))
 
+    def serving(self, arrival: Arrival) -> bool:
+        """True while a request that arrived on arrival is being served."""
+        return any(a is arrival for a, _ in self._running)
+
     def on_cancel(self, arrival: Arrival, cancel: hub_pb2.Cancel) -> None:
         """The hub gave up on a request this instance serves: its handler is cancelled and nothing is answered; a
         ``Cancel`` for a request that already ended is ignored."""

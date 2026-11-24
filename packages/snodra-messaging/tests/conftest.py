@@ -6,6 +6,7 @@ import pytest
 from fakehub import FakeHub
 from helpers import jwks as jwks
 from helpers import stop_apps
+from helpers import token_endpoint as token_endpoint
 
 
 @pytest.fixture(autouse=True)

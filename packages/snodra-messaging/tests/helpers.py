@@ -295,6 +295,116 @@ async def jwks() -> AsyncIterator[Jwks]:
         await asyncio.to_thread(issuer.stop)
 
 
+# An OAuth2 token endpoint for the tests (client credentials), answering a script.
+
+
+@dataclass
+class TokenAnswer:
+    """One answer of :class:`TokenEndpoint`: after ``delay`` seconds, ``status``; a 200 carries ``access_token``
+    (``token``, or the next ``jwt-<n>`` when None) and ``expires_in`` (left out when None); another status carries the
+    OAuth2 ``error`` when one is given."""
+
+    status: int = 200
+    token: str | None = None
+    expires_in: float | None = 60
+    error: str | None = None
+    delay: float = 0.0
+
+
+@dataclass(frozen=True)
+class TokenRequest:
+    """A request the endpoint received, and when (``time.monotonic()``)."""
+
+    at: float
+    method: str
+    headers: dict[str, str]
+    body: bytes
+
+
+class _TokenHandler(http.server.BaseHTTPRequestHandler):
+    server: _TokenServer
+
+    def do_POST(self) -> None:
+        self._answer("POST")
+
+    def do_GET(self) -> None:
+        self._answer("GET")
+
+    def _answer(self, method: str) -> None:
+        endpoint = self.server.endpoint
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        endpoint.requests.append(TokenRequest(time.monotonic(), method, dict(self.headers.items()), body))
+        answer = endpoint.script.pop(0) if endpoint.script else endpoint.default
+        if answer.delay > 0:
+            time.sleep(answer.delay)
+        doc: dict[str, Any] = {}
+        if answer.status == 200:
+            token = answer.token or f"jwt-{len(endpoint.issued) + 1}"
+            endpoint.issued.append(token)
+            doc = {"access_token": token, "token_type": "Bearer"}
+            if answer.expires_in is not None:
+                doc["expires_in"] = answer.expires_in
+        elif answer.error is not None:
+            doc = {"error": answer.error, "error_description": "refused by the test"}
+        out = json.dumps(doc).encode()
+        self.send_response(answer.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+class _TokenServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, endpoint: TokenEndpoint) -> None:
+        super().__init__(("127.0.0.1", 0), _TokenHandler)
+        self.endpoint = endpoint
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name, self.server_port = str(host), port
+
+
+class TokenEndpoint:
+    """A token endpoint served by a local HTTP server in a thread, at :attr:`url`: each request takes the first answer
+    of ``script`` (``default`` once it is empty); ``requests`` records every request, ``issued`` every token given."""
+
+    def __init__(self) -> None:
+        self.script: list[TokenAnswer] = []
+        self.default = TokenAnswer()
+        self.requests: list[TokenRequest] = []
+        self.issued: list[str] = []
+        self._server = _TokenServer(self)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, args=(0.05,), name="tests:token-endpoint", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host!s}:{port}/token"
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture
+async def token_endpoint() -> AsyncIterator[TokenEndpoint]:
+    """A :class:`TokenEndpoint`, stopped when the test ends."""
+    endpoint = await asyncio.to_thread(TokenEndpoint)
+    try:
+        yield endpoint
+    finally:
+        await asyncio.to_thread(endpoint.stop)
+
+
 TP: Final = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
 """A valid W3C traceparent."""

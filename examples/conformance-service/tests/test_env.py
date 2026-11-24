@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 from conformance_service.env import settings_from_env
-from snodra import ConfigurationError
+from snodra import ClientCertificate, ClientCredentials, ConfigurationError, TLSConfig, Token
 
 
 def test_env_maps_onto_settings() -> None:
@@ -45,3 +45,34 @@ def test_the_service_routes_every_call_through_the_hub_and_reads_the_callers_iss
     assert (s.jwks_url, s.issuer) == ("http://127.0.0.1:9000/jwks", "http://127.0.0.1:9000/conformance")
     with pytest.raises(ConfigurationError, match="SNODRA_ISSUER"):  # the URL without the issuer
         settings_from_env(base | {"CONFORMANCE_JWKS_URL": "http://127.0.0.1:9000/jwks"})
+
+
+def test_the_service_reads_its_credentials() -> None:
+    base = {"CONFORMANCE_SERVICE_NAME": "conformance-python"}
+    s = settings_from_env(base)
+    assert (s.credentials, s.tls, s.client_certificate) == (None, None, None)
+    assert settings_from_env(base | {"CONFORMANCE_HUB_TOKEN": "t-1"}).credentials == Token("t-1")
+    s = settings_from_env(
+        base
+        | {
+            "CONFORMANCE_OAUTH2_TOKEN_URL": "http://127.0.0.1:9000/token",
+            "CONFORMANCE_OAUTH2_CLIENT_ID": "conformance-python",
+            "CONFORMANCE_OAUTH2_CLIENT_SECRET": "s",
+        }
+    )
+    assert s.credentials == ClientCredentials("http://127.0.0.1:9000/token", "conformance-python", "s")
+    s = settings_from_env(base | {"CONFORMANCE_TLS_CA": "/tmp/ca.pem", "CONFORMANCE_TLS_SERVER_NAME": "hub.test"})
+    assert (s.tls, s.client_certificate) == (TLSConfig("/tmp/ca.pem", "hub.test"), None)
+    s = settings_from_env(
+        base
+        | {
+            "CONFORMANCE_TLS_CA": "/tmp/ca.pem",
+            "CONFORMANCE_TLS_SERVER_NAME": "hub.test",
+            "CONFORMANCE_TLS_CLIENT_CERT": "/tmp/c.pem",
+            "CONFORMANCE_TLS_CLIENT_KEY": "/tmp/k.pem",
+        }
+    )
+    assert (s.tls, s.client_certificate) == (
+        TLSConfig("/tmp/ca.pem", "hub.test"),
+        ClientCertificate("/tmp/c.pem", "/tmp/k.pem"),
+    )

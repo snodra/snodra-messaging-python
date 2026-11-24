@@ -1,10 +1,12 @@
 """The connection to one hub: its ``Hub.Connect`` streams, one after another.
 
 A connection runs the state machine of https://snodra.damoreira.com/docs/library-authors/writing-a-library/ ("A
-connection to one hub") as one task, ``snodra:connection:<address>``. Each attempt opens a channel and a stream, writes
-the ``Register`` and a ``Heartbeat``, and runs three tasks of its own until the stream ends: the writer (the one task
-that writes to the stream), the reader, and the heartbeats (which also close a stream that gets no ``RegisterAck``
-within the handshake timeout, and a silent hub's). Then it waits its backoff and opens the next stream.
+connection to one hub") as one task, ``snodra:connection:<address>``. Each attempt takes the instance's credential (a
+stream is never opened without it), opens a channel (TLS when configured, presenting the client certificate the files
+hold now) and a stream, writes the ``Register`` and a ``Heartbeat``, and runs three tasks of its own until the stream
+ends: the writer (the one task that writes to the stream), the reader, and the heartbeats (which also close a stream
+that gets no ``RegisterAck`` within the handshake timeout, and a silent hub's, and follow a changed credential). Then
+it waits its backoff and opens the next stream.
 """
 
 from __future__ import annotations
@@ -20,7 +22,9 @@ from typing import Any, Final, cast
 import grpc
 import grpc.aio
 
+from snodra import _tls
 from snodra._backoff import jitter, next_wait
+from snodra._credentials import HubCredentials, NoToken
 from snodra._hubpb import hub_pb2, hub_pb2_grpc
 from snodra._permits import PermitLedger
 from snodra._timings import DEFAULT_TIMINGS, Timings
@@ -45,6 +49,12 @@ CLEAN_UP_BOUND: Final = 2.0
 
 _LEFT_BEHIND: Final[set[asyncio.Future[Any]]] = set()
 """The tasks a clean-up gave up waiting for, held until they end."""
+
+_ROLL_POLL: Final = 0.02
+"""How often a rollover looks whether the stream it leaves is idle, and whether the new one is registered."""
+
+CERTIFICATE_EXPIRED: Final = "certificate expired"
+"""The hub's reason when it ends a certificate session at the certificate's end: an ordinary reconnect."""
 
 _Call = grpc.aio.StreamStreamCall[hub_pb2.ClientMessage, hub_pb2.ServerMessage]
 
@@ -141,7 +151,18 @@ class _Stream:
         """The status that ended the call, as it first landed (see :meth:`HubConnection._keep_status`)."""
         self.why = "hub connection stopped"
         """Why the stream ended (set when it ends): what a request written to it fails with."""
+        self.presented: hub_pb2.Credentials | None = None
+        """The credentials the hub holds for the stream: its ``Register``'s, then each ``ClientMessage.credentials``."""
+        self.certificate: tuple[int, _tls.Pair] | None = None
+        """The client certificate the stream presents, and its generation."""
+        self.rolled = False
+        """Half-closed by a certificate rollover: the next stream opens at once."""
+        self.cut = asyncio.Event()
+        """Set to end the stream from this side (its heartbeats return ``cut_reason``)."""
+        self.cut_reason = ""
         self._room: list[asyncio.Future[None]] = []
+        self._last_beat_ms = 0
+        self._probes: list[tuple[int, asyncio.Future[None]]] = []
 
     def put(self, m: hub_pb2.ClientMessage) -> bool:
         """Queues m for the writer; False when the stream takes nothing more."""
@@ -213,8 +234,9 @@ class _Stream:
                 w.set_result(None)
                 return
 
-    def write_register(self, *, empty: bool) -> None:
-        """The stream's ``Register`` (with no types when empty), then a heartbeat."""
+    def write_register(self, *, empty: bool) -> asyncio.Future[None]:
+        """The stream's ``Register`` (with no types when empty), then a heartbeat; the future is done at the echo of
+        that heartbeat (the hub read the ``Register`` before it), or when the stream ends."""
         register = self.register
         if empty:
             register = hub_pb2.Register()
@@ -223,13 +245,26 @@ class _Stream:
                 register.ClearField(name)
         if self.put(hub_pb2.ClientMessage(register=register)):
             self._registers += 1
-        self.heartbeat()
+        return self._probe(self.heartbeat())
 
-    def heartbeat(self) -> None:
-        """A heartbeat; from the ack on, one the stream took counts as unanswered until an echo."""
-        beat = hub_pb2.ClientMessage(heartbeat=hub_pb2.Heartbeat(sent_at_ms=time.time_ns() // 1_000_000))
-        if self.put(beat) and self.ack is not None:
+    def heartbeat(self) -> int | None:
+        """A heartbeat; from the ack on, one the stream took counts as unanswered until an echo. Its ``sent_at_ms``
+        (each one later than the one before), None when the stream took nothing."""
+        ms = max(time.time_ns() // 1_000_000, self._last_beat_ms + 1)
+        if not self.put(hub_pb2.ClientMessage(heartbeat=hub_pb2.Heartbeat(sent_at_ms=ms))):
+            return None
+        self._last_beat_ms = ms
+        if self.ack is not None:
             self.unanswered += 1
+        return ms
+
+    def _probe(self, ms: int | None) -> asyncio.Future[None]:
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        if ms is None or self.ended.is_set():
+            waiter.set_result(None)
+        else:
+            self._probes.append((ms, waiter))
+        return waiter
 
     def half_close(self) -> None:
         """The writer half-closes the stream after the frames queued before; nothing more is queued."""
@@ -261,16 +296,28 @@ class _Stream:
             self.acked.set()
         return first
 
-    def on_echo(self, now: float) -> None:
-        """A heartbeat from the hub proves it alive; before the ack it confirms nothing."""
+    def on_echo(self, now: float, sent_at_ms: int = 0) -> None:
+        """A heartbeat from the hub proves it alive; before the ack it confirms nothing. It answers every heartbeat sent
+        up to its ``sent_at_ms`` (the hub reads a stream in order)."""
         if self.ack is not None:
             self.last_echo = now
             self.unanswered = 0
+        keep = []
+        for ms, waiter in self._probes:
+            if ms > sent_at_ms:
+                keep.append((ms, waiter))
+            elif not waiter.done():
+                waiter.set_result(None)
+        self._probes = keep
 
     def finish(self) -> None:
         self.writable = False
         self.ended.set()
         self._release(lambda n: True)
+        probes, self._probes = self._probes, []
+        for _, waiter in probes:
+            if not waiter.done():
+                waiter.set_result(None)
         # The requests still waiting for an answer: written ones have an unknown outcome, buffered ones never left.
         requests, self.requests = self.requests, {}
         for r in requests.values():
@@ -302,6 +349,9 @@ class HubConnection:
         on_request: Callable[[_Stream, hub_pb2.Request], None] | None = None,
         on_cancel: Callable[[_Stream, hub_pb2.Cancel], None] | None = None,
         on_answer: Callable[[_Stream, hub_pb2.ServerMessage], None] | None = None,
+        credentials: HubCredentials | None = None,
+        tls: _tls.TLSConfig | None = None,
+        certificates: _tls.Certificates | None = None,
     ) -> None:
         self.address = address
         self._register = register
@@ -319,9 +369,17 @@ class HubConnection:
             ("grpc.keepalive_permit_without_calls", 1),
             ("grpc.http2.max_pings_without_data", 0),
         ]
+        self._credentials = credentials
+        self._tls = tls
+        self._certificates = certificates
+        if credentials is not None:
+            credentials.listen(self._credentials_changed)
+        self.rolling = False
+        """Being rolled over to a renewed client certificate: requests go to another hub while one is live."""
         self._stream: _Stream | None = None
         self._last_hub_id: str | None = None  # from every RegisterAck, kept after its stream ended
         self._reached_ack = False  # the last attempt's stream got its RegisterAck
+        self._last_stream: _Stream | None = None  # the last attempt's stream, None when it opened none
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._wake = asyncio.Event()
@@ -341,6 +399,14 @@ class HubConnection:
         if s is None or s.ack is None or not s.writable:
             return None
         return s
+
+    @property
+    def presented(self) -> tuple[int, _tls.Pair] | None:
+        """The client certificate the registered stream presents, and its generation; None without one."""
+        s = self._stream
+        if s is None or s.ack is None or not s.writable:
+            return None
+        return s.certificate
 
     def stop_requests(self, why: str) -> None:
         """Ends the requests waiting on the current stream (see :meth:`_Stream.stop_requests`)."""
@@ -382,6 +448,80 @@ class HubConnection:
         s = self._stream
         if s is not None:
             s.write_register(empty=empty)
+
+    # Credentials.
+
+    def _credentials_changed(self) -> None:
+        s = self._stream
+        if s is not None and s.ack is not None and self._credentials is not None:
+            self._follow(s, self._credentials.latest())
+
+    def _follow(self, s: _Stream, wanted: hub_pb2.Credentials | None) -> None:
+        """Sends the registered stream s the credentials wanted, once, unless the hub holds them already."""
+        if wanted is None or wanted == s.presented or not s.writable:
+            return
+        if s.put(hub_pb2.ClientMessage(credentials=wanted)):
+            s.presented = wanted
+            log.debug("Credentials refreshed on the hub stream of %s to %s", self._register.service_name, self.address)
+
+    async def roll_over(self, idle: Callable[[_Stream], bool]) -> bool:
+        """Moves the registered stream onto the client certificate the files hold now: a ``Register`` with no types
+        and its heartbeat (the hub routes elsewhere), at most ``roll_idle_limit`` for the stream to be idle (the hub
+        echoed that heartbeat, so no request it forwarded before is still on its way, and idle(stream) holds), the
+        half-close, at most ``close_wait`` for the hub's end, then the next stream opens at once. True once a new
+        stream is registered (or there was nothing to roll, or the connection stops), False when none is within
+        ``roll_reconnect_limit``."""
+        s = self._stream
+        if s is None or s.ack is None or not s.writable or self._stopping:
+            return True
+        t = self._timings
+        log.info(
+            "Rolling the hub stream of %s (%s) to %s over to the renewed client certificate",
+            self._register.service_name,
+            self._register.instance_id,
+            self.address,
+        )
+        self.rolling = True
+        self._on_change()
+        try:
+            echoed = s.write_register(empty=True)
+            try:
+                async with asyncio.timeout(t.roll_idle_limit):
+                    await echoed
+                    while not idle(s) and not s.ended.is_set():  # noqa: ASYNC110 (no event tells when it is idle)
+                        await asyncio.sleep(_ROLL_POLL)
+            except TimeoutError:
+                log.warning(
+                    "Requests still in flight on the hub stream to %s after %.1f s: rolling it over anyway",
+                    self.address,
+                    t.roll_idle_limit,
+                )
+            if self._stopping:
+                return True
+            if not s.ended.is_set():
+                s.rolled = True
+                s.half_close()
+                try:
+                    async with asyncio.timeout(t.close_wait):
+                        await s.ended.wait()
+                except TimeoutError:
+                    s.cut_reason = "the hub did not end the stream after the half-close of a rollover"
+                    s.cut.set()
+                    async with asyncio.timeout(CLEAN_UP_BOUND):
+                        await s.ended.wait()
+            try:
+                async with asyncio.timeout(t.roll_reconnect_limit):
+                    while not self._stopping:
+                        n = self._stream
+                        if n is not None and n is not s and n.ack is not None:
+                            return True
+                        await asyncio.sleep(_ROLL_POLL)
+                    return True
+            except TimeoutError:
+                return False
+        finally:
+            self.rolling = False
+            self._on_change()
 
     # Shutdown, in the order App.shutdown calls them.
 
@@ -425,20 +565,59 @@ class HubConnection:
         backoff = lo
         failures = 0
         refusal_logged: tuple[str, str] | None = None
+        token_logged: str | None = None
         while not self._stopping:
             self._reached_ack = False
+            self._last_stream = None
+            no_token: str | None = None
             try:
                 end = await self._attempt()
+            except NoToken as e:
+                end, no_token = _End(grpc.StatusCode.UNAUTHENTICATED, str(e)), str(e)
             except Exception as e:  # a bug, or a transport failure outside a status: a failed attempt
                 end = _End(grpc.StatusCode.UNKNOWN, repr(e))
                 log.debug("Hub stream to %s failed", self.address, exc_info=True)
             acked = self._reached_ack  # set by the attempt's clean-up, whichever way it ended
+            stream = self._last_stream
             if self._stopping:
                 break
             if acked:  # a stream the hub acknowledged proves the hub back: start again from the floor
-                backoff, failures, refusal_logged = lo, 0, None
+                backoff, failures, refusal_logged, token_logged = lo, 0, None, None
+            if stream is not None and stream.rolled:
+                log.info(
+                    "Hub stream to %s rolled over: reconnecting at once with the renewed certificate", self.address
+                )
+                continue
             failures += 1
-            if end.code in REFUSALS:
+            presented = None if stream is None else stream.presented
+            if end.code == grpc.StatusCode.UNAUTHENTICATED and presented is not None and self._credentials is not None:
+                self._credentials.refused(presented)  # the next stream does not present it again
+            if no_token is not None:
+                # No stream was opened: no access token could be had. Not the hub's refusal: the ordinary backoff.
+                message = (
+                    f"no access token for {self._register.service_name} ({self._register.instance_id}): {no_token}"
+                )
+                self._on_rejection(
+                    Rejection(self._last_hub_id or self.address, "UNAUTHENTICATED", message, time.time())
+                )
+                wait = jitter(backoff, hi, random.random())
+                backoff = next_wait(backoff, lo, hi)
+                level = logging.DEBUG if message == token_logged else logging.ERROR
+                token_logged = message
+                log.log(level, "%s; not connecting to %s, retrying in %.2f s", message, self.address, wait)
+            elif self._expired_certificate(end, acked):
+                # The hub ends a certificate session at the certificate's end: the files are read again at the
+                # next connect, so a renewed pair is presented. Any other UNAUTHENTICATED close is a refusal.
+                wait = jitter(lo, hi, random.random())
+                log.info(
+                    "Hub %s ended the session of %s (%s) at its client certificate's end; reconnecting in %.2f s with "
+                    "the pair the files hold now",
+                    self.address,
+                    self._register.service_name,
+                    self._register.instance_id,
+                    wait,
+                )
+            elif end.code in REFUSALS:
                 hub = self._last_hub_id or self.address
                 self._on_rejection(Rejection(hub, end.code.name, end.message, time.time()))
                 wait = jitter(hi, hi, random.random())
@@ -475,10 +654,42 @@ class HubConnection:
             except TimeoutError:
                 pass
 
+    def _expired_certificate(self, end: _End, acked: bool) -> bool:
+        """The hub ended an acknowledged certificate session at the certificate's end: an ordinary reconnect."""
+        return (
+            acked
+            and self._certificates is not None
+            and end.code == grpc.StatusCode.UNAUTHENTICATED
+            and CERTIFICATE_EXPIRED in end.message
+        )
+
     async def _attempt(self) -> _End:
-        """One stream, from its opening to its end; why it ended. Its clean-up records whether it reached its ack."""
-        stream = _Stream(self._register, self._timings.heartbeat_before_ack, self._timings.permit_batch)
-        channel = grpc.aio.insecure_channel(self.address, options=self._options)
+        """One stream, from its opening to its end; why it ended. Its clean-up records whether it reached its ack.
+        :class:`NoToken` when no stream is opened for want of an access token."""
+        credentials = None if self._credentials is None else await self._credentials.for_register()
+        certificate = None if self._certificates is None else await self._certificates.at_connect()
+        if certificate is not None and certificate[1].not_after <= time.time():
+            pair = certificate[1]
+            # The hub refuses a certificate that has ended: said here, through the refusal path, without a handshake.
+            return _End(
+                grpc.StatusCode.UNAUTHENTICATED,
+                f"client certificate {pair.fingerprint} of {pair.service} expired at "
+                f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(pair.not_after))}: renew the files",
+            )
+        if self._tls is None:
+            channel = grpc.aio.insecure_channel(self.address, options=self._options)
+        else:
+            channel = await _tls.channel(
+                self.address, self._tls, None if certificate is None else certificate[1], self._options
+            )
+        register = hub_pb2.Register()
+        register.CopyFrom(self._register)
+        if credentials is not None:
+            register.credentials.CopyFrom(credentials)
+        stream = _Stream(register, self._timings.heartbeat_before_ack, self._timings.permit_batch)
+        stream.presented = credentials
+        stream.certificate = certificate
+        self._last_stream = stream
         tasks: list[asyncio.Task[Any]] = []
         try:
             call: _Call = hub_pb2_grpc.HubStub(channel).Connect()  # type: ignore[no-untyped-call]
@@ -555,8 +766,10 @@ class HubConnection:
                                 round(stream.interval * 1000),
                             )
                             self._on_change()
+                            if self._credentials is not None:  # one renewed between the Register and the ack
+                                self._follow(stream, self._credentials.latest())
                     case "heartbeat":
-                        stream.on_echo(loop.time())
+                        stream.on_echo(loop.time(), m.heartbeat.sent_at_ms)
                     case "request" if self._on_request is not None:  # also before the ack
                         self._hand_over(self._on_request, stream, m.request)
                     case "cancel" if self._on_cancel is not None:
@@ -622,7 +835,13 @@ class HubConnection:
                 next_beat = now + t.heartbeat_before_ack
         while True:
             interval = stream.interval
-            await asyncio.sleep(interval)
+            try:
+                async with asyncio.timeout(interval):
+                    await stream.cut.wait()
+            except TimeoutError:
+                pass
+            else:
+                return _End(grpc.StatusCode.CANCELLED, stream.cut_reason)
             # On the tick, before its heartbeat: silent when more than n intervals passed since the last echo (the
             # ack counts as the first) and at least n heartbeats written since it are unanswered.
             since = loop.time() - stream.last_echo
@@ -633,6 +852,8 @@ class HubConnection:
                     f"({stream.unanswered} heartbeats unanswered)",
                 )
             stream.heartbeat()
+            if self._credentials is not None and stream.writable:  # a rotated token file, without a reconnect
+                self._follow(stream, await self._credentials.on_tick())
 
 
 def _completed[T](awaitable: Coroutine[Any, Any, T]) -> T:

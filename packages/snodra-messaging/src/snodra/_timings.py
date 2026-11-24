@@ -51,6 +51,24 @@ class Timings:
     """The longest a JWKS fetch takes."""
     jwt_leeway: float
     """The clock skew a token's ``exp`` and ``nbf`` are allowed."""
+    token_fetch_timeout: float
+    """The longest a fetch of the instance's access token takes."""
+    default_token_lifetime: float
+    """The lifetime of an access token that names no expiry."""
+    min_refresh_margin: float
+    """An access token is renewed when a fifth of its lifetime is left, at least this long before its expiry (and at
+    most half of its lifetime before it)."""
+    token_retry: tuple[float, float]
+    """A failed renewal of the access token is retried after the first, doubling up to the second."""
+    cert_check_interval: float
+    """How often the client certificate files are read."""
+    roll_delay_max: float
+    """The longest random delay before a renewed client certificate is rolled over to (also at most a tenth of what
+    the presented certificate has left)."""
+    roll_idle_limit: float
+    """A hub being rolled over: the longest wait for the requests of its stream to finish before the half-close."""
+    roll_reconnect_limit: float
+    """A hub being rolled over: the longest wait for its new stream's ``RegisterAck`` before the roll stops."""
 
 
 DEFAULT_TIMINGS: Final = Timings(
@@ -74,5 +92,13 @@ DEFAULT_TIMINGS: Final = Timings(
     jwks_min_refresh=60.0,
     jwks_fetch_timeout=5.0,
     jwt_leeway=60.0,
+    token_fetch_timeout=10.0,
+    default_token_lifetime=60.0,
+    min_refresh_margin=5.0,
+    token_retry=(1.0, 30.0),
+    cert_check_interval=3.0,
+    roll_delay_max=30.0,
+    roll_idle_limit=10.0,
+    roll_reconnect_limit=30.0,
 )
 """The shipped timings."""

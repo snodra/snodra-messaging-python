@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from snodra import ConfigurationError, RetryPolicy, Settings
+from snodra import ClientCertificate, ClientCredentials, ConfigurationError, RetryPolicy, Settings, TLSConfig, Token
 
 DEFAULT_CAPACITY = 64
 """The handlers the instance runs at once when ``CONFORMANCE_CAPACITY`` is not set."""
@@ -33,7 +33,27 @@ def settings_from_env(environ: Mapping[str, str]) -> Settings:
         values["jwks_url"] = jwks_url
     if (issuer := get("CONFORMANCE_ISSUER")) is not None:
         values["issuer"] = issuer
+    _credentials(get, values)
     return Settings(**values)
+
+
+def _credentials(get: Callable[[str], str | None], values: dict[str, Any]) -> None:
+    """The service's credential towards the hubs: a static token, a JWT of the runner's token endpoint, TLS with the
+    runner's CA and a client certificate, as the runner sets them."""
+    if (token := get("CONFORMANCE_HUB_TOKEN")) is not None:
+        values["credentials"] = Token(token)
+    if (url := get("CONFORMANCE_OAUTH2_TOKEN_URL")) is not None:
+        values["credentials"] = ClientCredentials(
+            url,
+            get("CONFORMANCE_OAUTH2_CLIENT_ID") or values["service"],
+            client_secret=get("CONFORMANCE_OAUTH2_CLIENT_SECRET"),
+        )
+    ca, name = get("CONFORMANCE_TLS_CA"), get("CONFORMANCE_TLS_SERVER_NAME")
+    if ca is not None or name is not None:
+        values["tls"] = TLSConfig(ca, name)
+    cert, key = get("CONFORMANCE_TLS_CLIENT_CERT"), get("CONFORMANCE_TLS_CLIENT_KEY")
+    if cert is not None or key is not None:
+        values["client_certificate"] = ClientCertificate(cert or "", key or "")
 
 
 def _retry(get: Callable[[str], str | None]) -> RetryPolicy | None:

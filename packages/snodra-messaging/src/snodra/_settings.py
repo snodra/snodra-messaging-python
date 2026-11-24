@@ -6,14 +6,16 @@ import math
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Final
 from urllib.parse import urlsplit
 
+from snodra._credentials import ClientCredentials, Credential, Token, TokenFile, is_token_source
 from snodra._errors import ConfigurationError
 from snodra._ids import new_id
 from snodra._retry import RetryPolicy
+from snodra._tls import ClientCertificate, TLSConfig
 
 _UINT32_MAX: Final = 2**32 - 1
 _INT32: Final = range(-(2**31), 2**31)
@@ -70,6 +72,17 @@ class Settings:
     always_route_through_hub: bool = False
     """Every command and query goes through a hub, also one of a type this instance handles
     (``SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB``); by default those are answered in-process."""
+    credentials: Credential | None = None
+    """The instance's credential towards the hubs, for a hub whose access control asks for one: a :class:`Token`
+    (``SNODRA_SERVER_TOKEN``), a :class:`TokenFile` (``SNODRA_SERVER_TOKEN_FILE``, which wins over the token), a JWT
+    from :class:`ClientCredentials` (``SNODRA_SERVER_OAUTH2_*``) or from a :class:`TokenSource`. It excludes
+    ``client_certificate``. Without TLS it travels unencrypted: a warning says so when the app is built."""
+    tls: TLSConfig | None = None
+    """TLS to every hub (``SNODRA_SERVER_TLS``, ``SNODRA_SERVER_TLS_CA``, ``SNODRA_SERVER_TLS_SERVER_NAME``); a client
+    certificate implies it (with the system's roots unless set)."""
+    client_certificate: ClientCertificate | None = None
+    """The client certificate presented to every hub (``SNODRA_SERVER_TLS_CLIENT_CERT``,
+    ``SNODRA_SERVER_TLS_CLIENT_KEY``): the service's credential, excluding ``credentials``."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.service, str) or not self.service.strip():
@@ -116,6 +129,7 @@ class Settings:
                 )
         object.__setattr__(self, "priorities", MappingProxyType(dict(self.priorities)))
         self._check_identity()
+        self._check_credentials()
         for name, variable in (
             ("forward_jwt", "SNODRA_FORWARD_JWT"),
             ("always_route_through_hub", "SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB"),
@@ -147,6 +161,56 @@ class Settings:
                 f"roles_claim (SNODRA_SECURITY_ROLES_CLAIM) must be a claim path or scope, got {self.roles_claim!r}"
             )
         object.__setattr__(self, "roles_claim", self.roles_claim.strip() or "roles")
+
+    def _check_credentials(self) -> None:
+        credential = self.credentials
+        kinds = "Token, TokenFile, ClientCredentials or a TokenSource (an object with async def token())"
+        match credential:
+            case None:
+                pass
+            case Token(value=value):
+                if not isinstance(value, str) or not value.strip():
+                    raise ConfigurationError("credentials Token (SNODRA_SERVER_TOKEN) is blank")
+                object.__setattr__(self, "credentials", Token(value.strip()))
+            case TokenFile(path=path):
+                if not isinstance(path, str) or not path.strip():
+                    raise ConfigurationError("credentials TokenFile (SNODRA_SERVER_TOKEN_FILE) names no file")
+                object.__setattr__(self, "credentials", TokenFile(path.strip()))
+            case ClientCredentials():
+                object.__setattr__(self, "credentials", _checked_grant(credential))
+            case _ if not is_token_source(credential):
+                raise ConfigurationError(f"credentials must be {kinds}, got a {type(credential).__name__}")
+        tls = self.tls
+        if tls is not None:
+            if not isinstance(tls, TLSConfig) or not all(_optional_text(v) for v in (tls.ca_file, tls.server_name)):
+                raise ConfigurationError(
+                    "tls (SNODRA_SERVER_TLS, SNODRA_SERVER_TLS_CA, SNODRA_SERVER_TLS_SERVER_NAME) must be a TLSConfig "
+                    f"of texts or None, got a {type(tls).__name__}"
+                )
+            object.__setattr__(self, "tls", TLSConfig(_blank_none(tls.ca_file), _blank_none(tls.server_name)))
+        pair = self.client_certificate
+        if pair is not None:
+            if not isinstance(pair, ClientCertificate):
+                raise ConfigurationError(
+                    f"client_certificate must be a ClientCertificate or None, got a {type(pair).__name__}"
+                )
+            for name, variable in (
+                ("cert_file", "SNODRA_SERVER_TLS_CLIENT_CERT"),
+                ("key_file", "SNODRA_SERVER_TLS_CLIENT_KEY"),
+            ):
+                if _blank_none(getattr(pair, name)) is None:
+                    raise ConfigurationError(f"client_certificate.{name} ({variable}) names no file")
+            object.__setattr__(
+                self, "client_certificate", ClientCertificate(pair.cert_file.strip(), pair.key_file.strip())
+            )
+            if credential is not None:
+                raise ConfigurationError(
+                    "credentials (SNODRA_SERVER_TOKEN, SNODRA_SERVER_TOKEN_FILE, SNODRA_SERVER_OAUTH2_*) and "
+                    "client_certificate (SNODRA_SERVER_TLS_CLIENT_CERT, SNODRA_SERVER_TLS_CLIENT_KEY) exclude each "
+                    "other: the hub reads the service from the certificate; configure one of them"
+                )
+            if self.tls is None:
+                object.__setattr__(self, "tls", TLSConfig())
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> Settings:
@@ -197,9 +261,14 @@ class Settings:
             values["forward_jwt"] = _env_bool("SNODRA_FORWARD_JWT", v)
         if (v := get("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB")) is not None:
             values["always_route_through_hub"] = _env_bool("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB", v)
+        grant = _env_credentials(get, values)
+        _env_tls(get, values)
         values |= overrides
         if "service" not in values:
             raise ConfigurationError("the service name (service, SNODRA_SERVICE_NAME) is required")
+        if grant is not None and "credentials" not in overrides:
+            uri, client_id, fields = grant
+            values["credentials"] = ClientCredentials(uri, client_id or values["service"], **fields)
         return cls(**values)
 
 
@@ -258,6 +327,100 @@ def _check_backoff(backoff: object) -> None:
             "the reconnect backoff maximum (reconnect_backoff, SNODRA_RECONNECT_BACKOFF_MAX_MS) must be finite and not "
             f"below the minimum {lo!r}, got {hi!r}"
         )
+
+
+def _optional_text(value: object) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _blank_none(value: str | None) -> str | None:
+    return None if value is None or not value.strip() else value.strip()
+
+
+def _checked_grant(grant: ClientCredentials) -> ClientCredentials:
+    """grant with its texts trimmed; :class:`ConfigurationError` for one that cannot fetch a token."""
+    for name in ("token_url", "client_id", "client_secret", "client_secret_file", "scope", "ca_file"):
+        value = getattr(grant, name)
+        if not _optional_text(value) or (name in ("token_url", "client_id") and value is None):
+            raise ConfigurationError(f"ClientCredentials.{name} must be a text, got a {type(value).__name__}")
+    url = grant.token_url.strip()
+    parts = urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        raise ConfigurationError(
+            "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must be an http:// or https:// URL, "
+            f"got {url!r}"
+        )
+    if not grant.client_id.strip():
+        raise ConfigurationError("ClientCredentials.client_id (SNODRA_SERVER_OAUTH2_CLIENT_ID) must not be blank")
+    secret, secret_file = _blank_none(grant.client_secret), _blank_none(grant.client_secret_file)
+    if secret is None and secret_file is None:
+        raise ConfigurationError(
+            "ClientCredentials needs a client secret: client_secret (SNODRA_SERVER_OAUTH2_CLIENT_SECRET) or "
+            "client_secret_file (SNODRA_SERVER_OAUTH2_CLIENT_SECRET_FILE)"
+        )
+    return replace(
+        grant,
+        token_url=url,
+        client_id=grant.client_id.strip(),
+        client_secret=secret,
+        client_secret_file=secret_file,
+        scope=_blank_none(grant.scope),
+        ca_file=_blank_none(grant.ca_file),
+    )
+
+
+def _env_credentials(
+    get: Callable[[str], str | None], values: dict[str, Any]
+) -> tuple[str, str | None, dict[str, str | None]] | None:
+    """Sets the token of ``SNODRA_SERVER_TOKEN`` / ``_TOKEN_FILE`` in values; returns the grant of
+    ``SNODRA_SERVER_OAUTH2_*`` (its URI, client id and other fields), built once the service is known."""
+    token, token_file = get("SNODRA_SERVER_TOKEN"), get("SNODRA_SERVER_TOKEN_FILE")
+    oauth = {name: get(f"SNODRA_SERVER_OAUTH2_{name}") for name in _OAUTH2}
+    uri = oauth.pop("TOKEN_URI")
+    if uri is None:
+        if any(v is not None for v in oauth.values()):
+            raise ConfigurationError("the SNODRA_SERVER_OAUTH2_* variables need SNODRA_SERVER_OAUTH2_TOKEN_URI")
+        if token_file is not None:
+            values["credentials"] = TokenFile(token_file)
+        elif token is not None:
+            values["credentials"] = Token(token)
+        return None
+    if token is not None or token_file is not None:
+        raise ConfigurationError(
+            "SNODRA_SERVER_TOKEN / SNODRA_SERVER_TOKEN_FILE and SNODRA_SERVER_OAUTH2_TOKEN_URI exclude each other: "
+            "configure one credential"
+        )
+    fields = {
+        "client_secret": oauth["CLIENT_SECRET"],
+        "client_secret_file": oauth["CLIENT_SECRET_FILE"],
+        "scope": oauth["SCOPE"],
+        "ca_file": oauth["CA"],
+    }
+    return uri, oauth["CLIENT_ID"], fields
+
+
+def _env_tls(get: Callable[[str], str | None], values: dict[str, Any]) -> None:
+    flag = get("SNODRA_SERVER_TLS")
+    on = None if flag is None else _env_bool("SNODRA_SERVER_TLS", flag)
+    ca, name = get("SNODRA_SERVER_TLS_CA"), get("SNODRA_SERVER_TLS_SERVER_NAME")
+    cert, key = get("SNODRA_SERVER_TLS_CLIENT_CERT"), get("SNODRA_SERVER_TLS_CLIENT_KEY")
+    if cert is not None or key is not None:
+        if on is False:
+            raise ConfigurationError(
+                "SNODRA_SERVER_TLS_CLIENT_CERT and SNODRA_SERVER_TLS_CLIENT_KEY need TLS, but SNODRA_SERVER_TLS=false"
+            )
+        if cert is None or key is None:
+            missing = "SNODRA_SERVER_TLS_CLIENT_CERT" if cert is None else "SNODRA_SERVER_TLS_CLIENT_KEY"
+            raise ConfigurationError(f"a client certificate needs both files: {missing} is not set")
+        values["client_certificate"] = ClientCertificate(cert, key)
+        values["tls"] = TLSConfig(ca, name)
+    elif on:
+        values["tls"] = TLSConfig(ca, name)
+    elif ca is not None or name is not None:
+        raise ConfigurationError("SNODRA_SERVER_TLS_CA and SNODRA_SERVER_TLS_SERVER_NAME need SNODRA_SERVER_TLS=true")
+
+
+_OAUTH2: Final = ("TOKEN_URI", "CLIENT_ID", "CLIENT_SECRET", "CLIENT_SECRET_FILE", "SCOPE", "CA")
 
 
 def _is_number(value: object) -> bool:

@@ -15,3 +15,15 @@ def test_default_timings() -> None:
     assert (t.guard_margin, t.fallback_max_timeout, t.default_deadline, t.retry_min_remaining) == (1.0, 60.0, 5.0, 0.25)
     assert (t.outbound_limit, t.max_unwritten_moves) == (256, 8)
     assert (t.jwks_min_refresh, t.jwks_fetch_timeout, t.jwt_leeway) == (60.0, 5.0, 60.0)
+    assert (t.token_fetch_timeout, t.default_token_lifetime, t.min_refresh_margin, t.token_retry) == (
+        10.0,
+        60.0,
+        5.0,
+        (1.0, 30.0),
+    )
+    assert (t.cert_check_interval, t.roll_delay_max, t.roll_idle_limit, t.roll_reconnect_limit) == (
+        3.0,
+        30.0,
+        10.0,
+        30.0,
+    )

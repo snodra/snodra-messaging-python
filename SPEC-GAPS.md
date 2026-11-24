@@ -63,6 +63,27 @@ library does there. Where an entry is settled, its behaviour is this library's r
   `'<type>' not sent: the app is shutting down`.
 - **Question:** settled: the duration is written in milliseconds.
 
+### SG-4: the client certificate rollover
+
+- **Specification:** `protocol.md` (Credentials) says a library must reload the certificate files and reconnect with
+  the renewed pair before the presented certificate's `notAfter`, and `writing-a-library.md` (Credentials) that the
+  official libraries "watch the files, wait a random delay so replicas do not all leave at once, and roll their hubs
+  over one at a time". It names no period, no bound of the delay and no limit of a hub's roll.
+- **This library:** `snodra/_tls.py` (`Certificates.watch`, `roll_delay_bound`) and `snodra/_connection.py`
+  (`HubConnection.roll_over`). The files are read at every connect and every 3 s; a pair that differs from the one
+  presented and is valid (the same checks as at start, past its `notBefore`, before its `notAfter`) is adopted. Once
+  per pair, before its first roll, the instance waits a delay uniform in `[0, min(30 s, a tenth of what the presented
+  certificate has left)]` and reads the files again. Then the hubs whose registered stream presents an older pair are
+  rolled in the order of the configured addresses, one at a time: a `Register` with no types and its `Heartbeat`, at
+  most 10 s for the stream to be idle (the hub echoed that heartbeat, no handler of a request it forwarded is running
+  and no request sent on it waits for its answer), the half-close (at most 2 s for the hub's end), and a new stream
+  at once with the new pair. The next hub is rolled only once that stream is acknowledged, within 30 s; otherwise the
+  rollover to that pair stops (one error) until the files change again. A hub being rolled takes no new request while
+  another hub is live. A pair that cannot be used is kept out (logged at debug when first seen, at error when seen
+  again) and the pair presented stays.
+- **Question:** open: should the specification name the period, the delay's bound and the limits, or leave them to
+  each library?
+
 ### SG-7: JSON details of the default payload codec
 
 - **Specification:** `messages.md` (Payloads) fixes camelCase names, UTC ISO 8601 timestamps, string ids, unknown fields

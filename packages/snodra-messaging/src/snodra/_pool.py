@@ -1,4 +1,5 @@
-"""The hubs of an instance: one connection per hub address, every one registering the identical ``Register``."""
+"""The hubs of an instance: one connection per hub address, every one registering the identical ``Register``, and the
+rollover of a renewed client certificate across them."""
 
 from __future__ import annotations
 
@@ -6,12 +7,14 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Collection
 
-from snodra._connection import HubConnection, Rejection, _Stream, settle
+from snodra._connection import _TYPE_LISTS, HubConnection, Rejection, _Stream, settle
+from snodra._credentials import HubCredentials
 from snodra._dispatch import Dispatcher
 from snodra._hubpb import hub_pb2
 from snodra._meta import client_version
 from snodra._settings import Settings, hub_targets
 from snodra._timings import Timings
+from snodra._tls import Certificates
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +40,13 @@ class Pool:
         timings: Timings,
         dispatcher: Dispatcher | None = None,
         on_answer: Callable[[_Stream, hub_pb2.ServerMessage], None] | None = None,
+        credentials: HubCredentials | None = None,
+        certificates: Certificates | None = None,
     ) -> None:
         self._timings = timings
+        self._dispatcher = dispatcher
+        self._certificates = certificates
+        self._watch: asyncio.Task[None] | None = None
         register = build_register(settings)
         self._register = register
         self.connections = [
@@ -52,6 +60,9 @@ class Pool:
                 on_request=None if dispatcher is None else dispatcher.on_request,
                 on_cancel=None if dispatcher is None else dispatcher.on_cancel,
                 on_answer=on_answer,
+                credentials=credentials,
+                tls=settings.tls,
+                certificates=certificates,
             )
             for target in hub_targets(settings.hubs)
         ]
@@ -72,11 +83,33 @@ class Pool:
     def start(self) -> None:
         for c in self.connections:
             c.start()
+        if self._certificates is not None:
+            self._watch = asyncio.create_task(
+                self._certificates.watch(lambda: self.connections, self._roll, self._timings),
+                name="snodra:certificates",
+            )
+
+    async def _roll(self, connection: HubConnection) -> bool:
+        """Rolls connection over to the renewed client certificate: its stream is idle once no request it carried is
+        still served here or waits for its answer."""
+        dispatcher = self._dispatcher
+        return await connection.roll_over(
+            lambda s: not s.requests and (dispatcher is None or not dispatcher.serving(s))
+        )
+
+    async def _stop_watch(self) -> None:
+        """No certificate rollover from now on (one under way stops where it is)."""
+        task, self._watch = self._watch, None
+        if task is not None and not task.done():
+            task.cancel()
+            await settle([task])
 
     def pick(self, routing_key: str = "", exclude: Collection[HubConnection] = ()) -> HubConnection | None:
         """The hub a request goes to now, among the live ones not in ``exclude`` (stopping connections are never
-        live): ``live[turn % len(live)]``, the turn shared by every call. None when there is none."""
+        live), a hub being rolled over only when no other is live: ``live[turn % len(live)]``, the turn shared by
+        every call. None when there is none."""
         live = [c for c in self.connections if c not in exclude and c.live_stream() is not None]
+        live = [c for c in live if not c.rolling] or live
         if not live:
             return None
         chosen = live[self._turn % len(live)]
@@ -112,6 +145,7 @@ class Pool:
         meanwhile is opened again with the empty ``Register``, so no new work arrives on it; nothing reconnects after
         the half-close."""
         t = self._timings
+        await self._stop_watch()  # a rollover never fights the shutdown
         self._withdraw_types()  # every later stream registers with no types
         acks = [f for c in self.connections if (f := c.deregister()) is not None]
         if acks:
@@ -139,6 +173,7 @@ class Pool:
         """Ends every connection and its tasks, all at once; waits for them even when cancelled meanwhile (then
         re-raised), and raises the error that crashed a connection, if one did."""
         self._stop_sending()
+        await self._stop_watch()
         tasks = [t for c in self.connections if (t := c.cancel()) is not None]
         await settle(tasks, log_errors=False)  # a crash is logged by its connection and raised below
         for c in self.connections:
@@ -152,7 +187,7 @@ class Pool:
 
     def _withdraw_types(self) -> None:
         """The ``Register`` every stream opens with lists no types from now on."""
-        for name in ("command_types", "query_types", "shared_query_types", "subscription_query_types"):
+        for name in _TYPE_LISTS:
             self._register.ClearField(name)
 
     def _signal_change(self) -> None:

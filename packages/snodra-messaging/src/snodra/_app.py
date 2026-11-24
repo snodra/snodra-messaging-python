@@ -8,6 +8,7 @@ import signal
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal, TypeVar, overload
 
+from snodra import _credentials, _tls
 from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
 from snodra._dispatch import Dispatcher
@@ -19,7 +20,7 @@ from snodra._pool import Pool
 from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
 from snodra._send import Sender
-from snodra._settings import Settings
+from snodra._settings import Settings, hub_targets
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
@@ -36,11 +37,28 @@ class App:
     (https://snodra.damoreira.com/docs/library-authors/protocol/, "Shutting down"). ``run`` does both around the
     process's life, and ``async with app:`` around a block. ``codec`` reads and writes the payloads
     (:class:`JsonCodec` by default).
+
+    Building it checks the credential files of the settings (a token file, a client secret file, the CA files, the
+    client certificate pair): one that cannot be used is a :class:`ConfigurationError`.
     """
 
     def __init__(self, settings: Settings, *, codec: Codec | None = None, _timings: Timings | None = None) -> None:
         self._settings = settings
         self._timings = DEFAULT_TIMINGS if _timings is None else _timings
+        if settings.tls is not None:
+            _tls.check_ca(settings.tls)
+        self._credentials = _credentials.build(settings.credentials, service=settings.service, timings=self._timings)
+        certificates = None
+        if settings.client_certificate is not None:
+            certificates = _tls.Certificates(settings.client_certificate, settings.service)
+        if self._credentials is not None and settings.tls is None:
+            log.warning(
+                "The hub %s of %s goes to %s without TLS: it travels unencrypted "
+                "(configure tls, SNODRA_SERVER_TLS=true)",
+                self._credentials.kind,
+                settings.service,
+                ", ".join(hub_targets(settings.hubs)),
+            )
         self._codec: Codec = JsonCodec() if codec is None else codec
         self._registry = Registry()
         verifier = None
@@ -58,7 +76,14 @@ class App:
             self._registry, self._codec, settings.max_concurrent, self._timings, identity=self._identity
         )
         self._sender = Sender(self._codec, settings, self._timings)
-        self._pool = Pool(settings, self._timings, self._dispatcher, on_answer=self._sender.on_answer)
+        self._pool = Pool(
+            settings,
+            self._timings,
+            self._dispatcher,
+            on_answer=self._sender.on_answer,
+            credentials=self._credentials,
+            certificates=certificates,
+        )
         self._sender.pool = self._pool
         self._sender.local = LocalCalls(self._registry, self._dispatcher, self._codec, settings)
         self._sender.local.pool = self._pool
@@ -306,6 +331,8 @@ class App:
             finally:
                 try:
                     await self._identity.close()  # a JWKS fetch still running ends here
+                    if self._credentials is not None:
+                        await self._credentials.close()  # and a token fetch or renewal
                 finally:
                     self._down.set()
 
