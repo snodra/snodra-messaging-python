@@ -133,3 +133,16 @@ library does there. Where an entry is settled, its behaviour is this library's r
   written); a hub's `NO_HANDLER` for it is the answer, as for a gather whose type has no live target anywhere. A retry
   policy may still send a new gather, which picks a hub anew.
 - **Question:** open: should a gather walk the other live hubs after `NO_HANDLER`, as a unary request does?
+
+### SG-11: the least wait between two token renewals
+
+- **Specification:** silent: the renewal margin is specified (`max(lifetime / 5, 5 s)`, at most half the lifetime),
+  the pacing of renewals is not, so a token shorter-lived than its own margin leaves the question open.
+- **Other Snodra libraries:** they differ. At least one waits at least 1 s between two renewals (its retry floor,
+  documented as the least wait between renewals); another relies on the hub's refresh throttle; the reference
+  implementation has no floor, so it renews a sub-second token in a loop.
+- **This library:** at most one renewal per second whatever the lifetime: `snodra/_credentials.py`
+  (`MIN_RENEWAL_INTERVAL`, applied in `TokenProvider._publish`). A token shorter-lived than that is handed out until
+  the next renewal; one a hub refuses with `UNAUTHENTICATED` is fetched again at once, not held back.
+- **Question:** open to the owner: should the floor stay (it keeps a sub-second token from fetching in a hot loop), or
+  should such a token be renewed at its margin, as the reference implementation does?

@@ -455,6 +455,7 @@ class TokenProvider:
         renewed = previous is None or previous.value != token.value
         if renewed:
             self._generation += 1
+        # TODO(spec-gap): SG-11
         issued = _Issued(
             token.value,
             self._generation,

@@ -200,7 +200,9 @@ async def test_no_request_is_lost_while_a_hub_rolls(tls_hub: FakeHub, ca: Ca, tm
 
     await app.start()
     old = await _registered(tls_hub, 100)
-    request = hub_pb2.Request(id="c-1", kind=hub_pb2.COMMAND, type="orders.PlaceOrder", payload=b'{"orderId":"o-1"}')
+    request = hub_pb2.Request(
+        id="c-1", kind=hub_pb2.COMMAND, type="orders.PlaceOrder", payload=b'{"orderId":"o-1","lines":[]}'
+    )
     await old.send(forward(request))
     await asyncio.wait_for(started.wait(), 1.0)
     _write_pair(tmp_path, ca.issue_client("orders-service"))
