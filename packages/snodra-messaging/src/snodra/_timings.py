@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Final
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class Timings:
     """The client-side timings of https://snodra.damoreira.com/library-authors/protocol/ ("Timing summary")."""
 

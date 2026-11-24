@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from typing import Any
 
 from snodra._connection import HubConnection, Rejection
 from snodra._pool import Pool
@@ -63,18 +64,21 @@ class App:
         elsewhere or the cancellation of the task, then shuts down (``shutdown(15.0)``)."""
         await self.start()
         loop = asyncio.get_running_loop()
-        installed: list[signal.Signals] = []
+        previous: dict[signal.Signals, Any] = {}
         for sig in (signal.SIGTERM, signal.SIGINT):
+            before = signal.getsignal(sig)
             try:
                 loop.add_signal_handler(sig, self._stop.set)
             except (NotImplementedError, RuntimeError, ValueError):  # Windows, or not the main thread
                 continue
-            installed.append(sig)
+            previous[sig] = before
         try:
             await self._stop.wait()
         finally:
-            for sig in installed:
+            for sig, before in previous.items():
                 loop.remove_signal_handler(sig)
+                if before is not None:  # the handler found, not the default
+                    signal.signal(sig, before)
             await self.shutdown(15.0)
             await self._down.wait()  # a shutdown that another task started
 
@@ -94,8 +98,10 @@ class App:
                 except TimeoutError:
                     log.warning("Leaving the hubs took longer than %.2f s: the streams are cut", timeout)
         finally:
-            await self._pool.close()
-            self._down.set()
+            try:
+                await self._pool.close()
+            finally:
+                self._down.set()
 
     async def __aenter__(self) -> App:
         await self.start()

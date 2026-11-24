@@ -1,13 +1,15 @@
 """The App's lifecycle: start, ready, run, shutdown."""
 
 import asyncio
+import logging
+import signal
 import time
 
 import grpc
 import pytest
 from fakehub import FakeHub, FakeStream, ack
-from helpers import assert_no_library_tasks, new_app, start_app, within
-from snodra import App, Settings
+from helpers import assert_no_library_tasks, eventually, new_app, start_app, within
+from snodra import App, Settings, _connection
 from snodra._hubpb import hub_pb2
 
 
@@ -165,3 +167,127 @@ async def test_a_stream_closed_during_shutdown_is_not_reopened(hub: FakeHub) -> 
     await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
     await asyncio.wait_for(leaving, 1.0)
     await hub.no_stream_within(0.15)
+
+
+class _SlowChannel:
+    """A channel whose close takes 0.5 s (longer than the scaled close wait): a cancellation lands in the middle of a
+    stream's clean-up."""
+
+    def __init__(self, channel: grpc.aio.Channel) -> None:
+        self._channel = channel
+        self.closing = asyncio.Event()
+        self.closed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._channel, name)
+
+    async def close(self, grace: float | None = None) -> None:
+        self.closing.set()
+        await asyncio.sleep(0.5)
+        await self._channel.close(grace)
+        self.closed = True
+
+
+@pytest.fixture
+def channels(monkeypatch: pytest.MonkeyPatch) -> list[_SlowChannel]:
+    made: list[_SlowChannel] = []
+    real = grpc.aio.insecure_channel
+
+    def insecure_channel(target: str, options: object = None) -> _SlowChannel:
+        c = _SlowChannel(real(target, options=options))  # type: ignore[arg-type]
+        made.append(c)
+        return c
+
+    monkeypatch.setattr(grpc.aio, "insecure_channel", insecure_channel)
+    return made
+
+
+async def test_shutdown_during_a_streams_clean_up_finishes_it(hub: FakeHub, channels: list[_SlowChannel]) -> None:
+    # The stream ends and its clean-up is closing the channel when shutdown cancels the connection.
+    app = await start_app(hub)
+    s = await _acknowledged(app, hub)
+    await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    await asyncio.wait_for(channels[0].closing.wait(), 1.0)
+    await asyncio.wait_for(app.shutdown(), 2.0)
+    assert all(c.closed for c in channels)
+    assert app.hub_ids() == []
+    assert_no_library_tasks()
+
+
+async def test_a_second_cancellation_during_shutdown_leaves_nothing_running(
+    hub: FakeHub, channels: list[_SlowChannel]
+) -> None:
+    app = new_app(hub)
+    running = asyncio.create_task(app.run())
+    s = await _acknowledged(app, hub)
+    running.cancel()  # run() shuts down: the empty Register, then the half-close
+    assert _empty(await s.recv_register())
+    await s.ack(ack("hub-1"))
+    await s.half_closed(within=1.0)
+    await asyncio.wait_for(channels[0].closing.wait(), 1.0)
+    running.cancel()  # a second cancellation, while the stream's channel is closing
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, 2.0)
+    assert all(c.closed for c in channels)
+    assert app.hub_ids() == []
+    assert_no_library_tasks()
+
+
+async def test_run_returns_when_a_shutdown_elsewhere_is_cancelled(hub: FakeHub, channels: list[_SlowChannel]) -> None:
+    app = new_app(hub)
+    running = asyncio.create_task(app.run())
+    s = await _acknowledged(app, hub)
+    closing = asyncio.create_task(app.shutdown())
+    await s.recv_register()
+    await s.ack(ack("hub-1"))
+    await s.half_closed(within=1.0)
+    await asyncio.wait_for(channels[0].closing.wait(), 1.0)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    await asyncio.wait_for(running, 1.0)  # run() is released all the same
+    assert all(c.closed for c in channels)
+    assert app.hub_ids() == []
+    assert_no_library_tasks()
+
+
+async def test_a_crashed_connection_is_logged_and_surfaced(
+    hub: FakeHub, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(base: float, hi: float, unit: float) -> float:
+        raise RuntimeError("broken backoff")
+
+    monkeypatch.setattr(_connection, "jitter", broken)
+    app = await start_app(hub)
+    s = await hub.next_stream()
+    await s.recv_register()
+    await s.close(grpc.StatusCode.UNAVAILABLE, "restart")  # the loop crashes computing its wait
+    await eventually(
+        lambda: any(
+            r.levelno == logging.ERROR and "broken backoff" in r.getMessage() + str(r.exc_info) for r in caplog.records
+        )
+    )
+    with pytest.raises(RuntimeError, match="broken backoff"):
+        await app.shutdown()
+    assert_no_library_tasks()
+
+
+async def test_run_restores_the_signal_handlers_it_found(hub: FakeHub) -> None:
+    def mine(signum: int, frame: object) -> None:
+        pass
+
+    before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        for sig in before:
+            signal.signal(sig, mine)
+        app = new_app(hub)
+        running = asyncio.create_task(app.run())
+        await _acknowledged(app, hub)
+        assert signal.getsignal(signal.SIGTERM) is not mine  # run() listens meanwhile
+        await app.shutdown()
+        await asyncio.wait_for(running, 1.0)
+        assert signal.getsignal(signal.SIGTERM) is mine
+        assert signal.getsignal(signal.SIGINT) is mine
+    finally:
+        for sig, handler in before.items():
+            signal.signal(sig, handler)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from snodra._connection import HubConnection, Rejection
+from snodra._connection import HubConnection, Rejection, settle
 from snodra._hubpb import hub_pb2
 from snodra._meta import client_version
 from snodra._settings import Settings, hub_targets
@@ -84,11 +84,13 @@ class Pool:
             log.debug("Not every hub finished its stream within %.2f s of the half-close", t.close_wait)
 
     async def close(self) -> None:
-        """Ends every connection and its tasks."""
+        """Ends every connection and its tasks, all at once; waits for them even when cancelled meanwhile (then
+        re-raised), and raises the error that crashed a connection, if one did."""
+        tasks = [t for c in self.connections if (t := c.cancel()) is not None]
+        await settle(tasks)
         for c in self.connections:
-            c.stop_reconnecting()
-        for c in self.connections:
-            await c.close()
+            if (e := c.crash) is not None:
+                raise e
 
     def _changed(self) -> None:
         if self.hub_ids():

@@ -14,6 +14,7 @@ import pytest
 from fakehub import FakeHub, FakeStream, ack
 from helpers import SCALED, eventually, start_app, within
 from snodra import Rejection
+from snodra._connection import _Stream
 from snodra._hubpb import hub_pb2
 from snodra._meta import client_version
 
@@ -165,6 +166,40 @@ async def test_a_heartbeat_follows_every_later_register_and_counts(hub: FakeHub)
     assert _after(s, acked) == 3
 
 
+async def test_unanswered_heartbeats_alone_do_not_drop_the_stream(hub: FakeHub) -> None:
+    # Two later Registers right after the ack: three heartbeats are unanswered at the second tick (400 ms), but only two
+    # intervals have passed; the drop waits for the third tick (600 ms), more than three intervals after the ack.
+    app = await start_app(hub, _timings=QUIET_BEFORE_ACK)
+    s = await _opened(hub)
+    s.echo_heartbeats(False)
+    acked = time.monotonic()
+    await s.ack(ack("hub-1", interval_ms=200))
+    await app.ready(1.0)
+    conn = app._connections()[0]
+    conn.reregister(empty=False)
+    conn.reregister(empty=False)
+    ended = await _end(s)
+    within(ended - acked, 0.6, 0.7)
+    assert _after(s, acked) == 4  # two after the Registers, two ticks
+
+
+async def test_the_ack_restarts_the_silence_clock(hub: FakeHub) -> None:
+    # The ack comes 0.25 s after the stream opened and is the first sign of life: the silence is measured from it,
+    # never from the opening. Two later Registers make the count no obstacle, so the time alone decides.
+    app = await start_app(hub, _timings=replace(QUIET_BEFORE_ACK, handshake_timeout=2.0))
+    s = await _opened(hub)
+    s.echo_heartbeats(False)
+    await s.nothing(0.25)
+    acked = time.monotonic()
+    await s.ack(ack("hub-1", interval_ms=100))
+    await app.ready(1.0)
+    conn = app._connections()[0]
+    conn.reregister(empty=False)
+    conn.reregister(empty=False)
+    ended = await _end(s)
+    within(ended - acked, 0.3, 0.4 + 0.05)
+
+
 async def test_no_silence_check_before_the_ack(hub: FakeHub) -> None:
     # Heartbeats every 50 ms before the ack, none echoed: a silence check would drop the stream at about 0.2 s.
     await start_app(hub, _timings=replace(SCALED, heartbeat_before_ack=0.05))
@@ -248,12 +283,38 @@ async def test_a_refused_register_waits_the_cap_and_is_exposed(hub: FakeHub) -> 
     within(time.monotonic() - closed, 0.8 * 0.2, 0.2 + SETUP)
     revoked = app.rejection
     assert revoked is not None
-    assert (revoked.hub, revoked.code, revoked.message) == (hub.address, "PERMISSION_DENIED", "access revoked")
+    # Once acknowledged, a refusal names the hub by its id, as the Kotlin library does.
+    assert (revoked.hub, revoked.code, revoked.message) == ("hub-1", "PERMISSION_DENIED", "access revoked")
 
     # A later accepted Register leaves the latest refusal as it was.
     await s.ack(ack("hub-1"))
     await app.ready(1.0)
     assert app.rejection == revoked
+
+
+async def test_a_refusal_names_the_hub_by_its_last_acknowledged_id(hub: FakeHub) -> None:
+    # The id from the connection's last RegisterAck, kept after that stream ended; the address before any ack, and
+    # when that id is empty.
+    app = await start_app(hub)
+    s = await _opened(hub)
+    await s.close(grpc.StatusCode.ALREADY_EXISTS, REFUSAL)
+    await eventually(lambda: app.rejection is not None)
+    assert app.rejection is not None
+    assert app.rejection.hub == hub.address  # never acknowledged yet: the address dialled
+    s = await _opened(hub)
+    await s.ack(ack("hub-7"))
+    await app.ready(1.0)
+    await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    s = await _opened(hub)  # a new stream, refused before its ack
+    await s.close(grpc.StatusCode.ALREADY_EXISTS, REFUSAL)
+    await eventually(lambda: app.rejection is not None and app.rejection.hub == "hub-7")
+    s = await _opened(hub)
+    await s.ack(ack(""))  # an empty hub id: the address
+    await app.ready(1.0)
+    await s.close(grpc.StatusCode.PERMISSION_DENIED, "access revoked")
+    await eventually(lambda: app.rejection is not None and app.rejection.message == "access revoked")
+    assert app.rejection is not None
+    assert app.rejection.hub == hub.address
 
 
 async def test_a_refusal_is_logged_once_per_distinct_message(hub: FakeHub, caplog: pytest.LogCaptureFixture) -> None:
@@ -282,6 +343,26 @@ async def test_the_ack_interval_drives_the_heartbeats_of_its_stream_only(hub: Fa
     await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
     s = await _opened(hub)
     assert _kind(await s.recv(within=0.5)) == "heartbeat"
+
+
+async def test_an_attempt_that_crashed_after_its_ack_resets_the_backoff(
+    hub: FakeHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def crash(self: object, now: float) -> None:
+        raise RuntimeError("a bug in the read loop")
+
+    monkeypatch.setattr(_Stream, "on_echo", crash)  # the echo that follows the ack ends the attempt with a bug
+    app = await start_app(hub)
+    for _ in range(2):  # two closures before any ack: the next wait would be 0.2 s
+        s = await _opened(hub)
+        await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    s = await _opened(hub)
+    await s.ack(ack("hub-1"))  # its held echo follows it
+    acked = time.monotonic()
+    s2 = await hub.next_stream()
+    assert s2.index == 3
+    within(time.monotonic() - acked, 0.0, 1.2 * 0.05 + 0.03)
+    assert app.rejection is None
 
 
 async def test_hub_ids_names_every_acknowledged_hub_sorted(hub: FakeHub, hub2: FakeHub) -> None:

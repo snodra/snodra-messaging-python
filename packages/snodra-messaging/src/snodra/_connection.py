@@ -13,7 +13,7 @@ import asyncio
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -39,6 +39,9 @@ REFUSALS: Final = frozenset(
 
 _TYPE_LISTS: Final = ("command_types", "query_types", "shared_query_types", "subscription_query_types")
 
+CLEAN_UP_BOUND: Final = 2.0
+"""After a cancellation, how long a clean-up still waits for the tasks it ends before it gives up on them."""
+
 _Call = grpc.aio.StreamStreamCall[hub_pb2.ClientMessage, hub_pb2.ServerMessage]
 
 
@@ -47,7 +50,8 @@ class Rejection:
     """A hub's refusal of this instance's registration."""
 
     hub: str
-    """The hub's address (``host:port``)."""
+    """The hub: its id (``RegisterAck.hub_id`` of the last stream this connection got acknowledged, the address when
+    that id is empty) once a stream to it was acknowledged, else the address dialled."""
     code: str
     """The gRPC status, for example ``"ALREADY_EXISTS"``."""
     message: str
@@ -194,6 +198,8 @@ class HubConnection:
             ("grpc.http2.max_pings_without_data", 0),
         ]
         self._stream: _Stream | None = None
+        self._last_hub_id: str | None = None  # from every RegisterAck, kept after its stream ended
+        self._reached_ack = False  # the last attempt's stream got its RegisterAck
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._wake = asyncio.Event()
@@ -206,8 +212,25 @@ class HubConnection:
             return None
         return s.ack.hub_id or self.address
 
+    @property
+    def crash(self) -> BaseException | None:
+        """The unexpected error that ended the connection's task, if one did."""
+        task = self._task
+        if task is None or not task.done() or task.cancelled():
+            return None
+        return task.exception()
+
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"snodra:connection:{self.address}")
+        self._task.add_done_callback(self._ended)
+
+    def _ended(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and (e := task.exception()) is not None:
+            log.error(
+                "The connection to hub %s stopped on an unexpected error and no longer reconnects",
+                self.address,
+                exc_info=e,
+            )
 
     def reregister(self, *, empty: bool) -> None:
         """A later ``Register`` on the current stream (with no types when empty), then a heartbeat."""
@@ -243,13 +266,21 @@ class HubConnection:
         if s is not None:
             await s.ended.wait()
 
-    async def close(self) -> None:
-        """Stops the connection: its current stream is cut, its tasks are ended."""
+    def cancel(self) -> asyncio.Task[None] | None:
+        """Stops the connection: no new stream, the current one cut. Returns its task, to await (see :func:`settle`)."""
         self.stop_reconnecting()
-        task, self._task = self._task, None
+        if self._task is not None:
+            self._task.cancel()
+        return self._task
+
+    async def close(self) -> None:
+        """Stops the connection and waits for its task (and its stream's clean-up) to end, even when cancelled
+        meanwhile (then re-raised); raises the error that crashed the task, if one did."""
+        task = self.cancel()
         if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle([task])
+        if (e := self.crash) is not None:
+            raise e
 
     # The connection's task.
 
@@ -259,19 +290,21 @@ class HubConnection:
         failures = 0
         refusal_logged: tuple[str, str] | None = None
         while not self._stopping:
-            acked = False
+            self._reached_ack = False
             try:
-                end, acked = await self._attempt()
+                end = await self._attempt()
             except Exception as e:  # a bug, or a transport failure outside a status: a failed attempt
                 end = _End(grpc.StatusCode.UNKNOWN, repr(e))
                 log.debug("Hub stream to %s failed", self.address, exc_info=True)
+            acked = self._reached_ack  # set by the attempt's clean-up, whichever way it ended
             if self._stopping:
                 break
             if acked:  # a stream the hub acknowledged proves the hub back: start again from the floor
                 backoff, failures, refusal_logged = lo, 0, None
             failures += 1
             if end.code in REFUSALS:
-                self._on_rejection(Rejection(self.address, end.code.name, end.message, time.time()))
+                hub = self._last_hub_id or self.address
+                self._on_rejection(Rejection(hub, end.code.name, end.message, time.time()))
                 wait = jitter(hi, hi, random.random())
                 # The same refusal repeats at every attempt: one ERROR line, then DEBUG.
                 key = (end.code.name, end.message)
@@ -306,8 +339,8 @@ class HubConnection:
             except TimeoutError:
                 pass
 
-    async def _attempt(self) -> tuple[_End, bool]:
-        """One stream, from its opening to its end; why it ended, and whether it reached its ack."""
+    async def _attempt(self) -> _End:
+        """One stream, from its opening to its end; why it ended. Its clean-up records whether it reached its ack."""
         stream = _Stream(self._register, self._timings.heartbeat_before_ack)
         channel = grpc.aio.insecure_channel(self.address, options=self._options)
         tasks: list[asyncio.Task[Any]] = []
@@ -320,19 +353,28 @@ class HubConnection:
             beats = asyncio.create_task(self._beat(stream), name=f"snodra:heartbeat:{self.address}")
             tasks = [writer, reader, beats]
             done, _ = await asyncio.wait((reader, beats), return_when=asyncio.FIRST_COMPLETED)
-            end = (reader if reader in done else beats).result()
-            return end, stream.ack is not None
+            return (reader if reader in done else beats).result()
         finally:
+            # What needs no wait first, so that a cancellation cannot skip it; then the tasks and the channel, awaited
+            # to their end even when a cancellation lands meanwhile (it is raised after).
             stream.writable = False
-            for t in tasks:
-                t.cancel()  # the reader's cancellation cancels the call when it still runs
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await channel.close()
+            self._reached_ack = stream.ack is not None
             if self._stream is stream:
                 self._stream = None
             stream.finish()
             if stream.ack is not None:
                 self._on_change()
+            for t in tasks:
+                t.cancel()  # the reader's cancellation cancels the call when it still runs
+            closing = asyncio.create_task(self._clean_up(tasks, channel), name=f"snodra:clean-up:{self.address}")
+            await settle([closing])
+
+    @staticmethod
+    async def _clean_up(tasks: list[asyncio.Task[Any]], channel: grpc.aio.Channel) -> None:
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await channel.close()
 
     async def _write(self, call: _Call, stream: _Stream) -> None:
         """The stream's one writer: frames in queue order, then the half-close."""
@@ -357,6 +399,7 @@ class HubConnection:
                 assert isinstance(m, hub_pb2.ServerMessage)
                 match m.WhichOneof("message"):
                     case "register_ack":
+                        self._last_hub_id = m.register_ack.hub_id or self.address
                         if stream.on_ack(m.register_ack, loop.time()):
                             log.info(
                                 "Connected to hub %s at %s as %s (%s): heartbeat every %d ms",
@@ -410,3 +453,25 @@ class HubConnection:
                     f"({stream.unanswered} heartbeats unanswered)",
                 )
             stream.heartbeat()
+
+
+async def settle(tasks: Collection[asyncio.Future[Any]], bound: float = CLEAN_UP_BOUND) -> None:
+    """Waits until every task is done, without raising their errors. A cancellation of the caller meanwhile does not
+    stop the wait: it goes on for at most ``bound`` seconds more, then the cancellation is raised."""
+    pending = {t for t in tasks if not t.done()}
+    loop = asyncio.get_running_loop()
+    cancelled: asyncio.CancelledError | None = None
+    deadline: float | None = None
+    while pending:
+        timeout = None if deadline is None else deadline - loop.time()
+        if timeout is not None and timeout <= 0:
+            log.warning("%d task(s) still running %.1f s after a cancellation: left behind", len(pending), bound)
+            break
+        try:
+            _, pending = await asyncio.wait(pending, timeout=timeout)
+        except asyncio.CancelledError as e:
+            cancelled = cancelled or e
+            if deadline is None:
+                deadline = loop.time() + bound
+    if cancelled is not None:
+        raise cancelled
