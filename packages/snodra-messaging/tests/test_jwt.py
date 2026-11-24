@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 import pytest
-from helpers import ISSUER, Jwks, b64url, eventually, jwk, sign
+from helpers import ISSUER, Jwks, b64url, eventually, jwk, sign, within
 from snodra import Unauthenticated, _jwt
 from snodra._identity import bearer_token, check_shape
 from snodra._jwt import JwksVerifier
@@ -143,6 +143,48 @@ async def test_a_failed_first_load_is_tried_again_at_most_once_per_minimum_refre
     assert time.monotonic() - failed >= 0.3
     assert jwks.fetches == 2
     await v.close()
+
+
+async def _refused_until(v: JwksVerifier, jwks: Jwks, fetches: int, within: float = 3.0) -> float:
+    """Verifies tokens (each refused) until the JWKS was fetched ``fetches`` times; when that happened."""
+    deadline = time.monotonic() + within
+    while jwks.fetches < fetches:
+        with pytest.raises(Unauthenticated, match=r"^signing keys unavailable$"):
+            await v.verify(jwks.mint())
+        assert time.monotonic() < deadline, f"fetched {jwks.fetches} times, never {fetches}"
+        await asyncio.sleep(0.01)
+    return time.monotonic()
+
+
+async def test_a_failed_first_load_is_retried_after_a_doubling_wait(jwks: Jwks) -> None:
+    jwks.down = True
+    v = JwksVerifier(jwks.url, ISSUER, min_refresh=60.0, fetch_timeout=5.0, first_retry=0.1)
+    first = await _refused_until(v, jwks, 1)
+    second = await _refused_until(v, jwks, 2)  # not a minute later: 0.1 s after the failure
+    third = await _refused_until(v, jwks, 3)
+    within(second - first, 0.09, 0.5)
+    within(third - second, 0.19, 0.6)  # doubled
+    jwks.down = False
+    while True:  # doubled again, then loaded
+        try:
+            claims = await v.verify(jwks.mint())
+            break
+        except Unauthenticated:
+            assert time.monotonic() - third < 1.5, "the keys were never fetched again"
+            await asyncio.sleep(0.01)
+    assert claims["sub"] == "u-1"
+    assert time.monotonic() - third >= 0.39
+    assert jwks.fetches == 4
+    # Once the keys are loaded, the minimum refresh is the minute again: an unknown kid fetches nothing more.
+    with pytest.raises(Unauthenticated, match=r"^unknown signing key$"):
+        await v.verify(jwks.mint(kid="k-2"))
+    assert jwks.fetches == 4
+    await v.close()
+
+
+def test_the_first_retry_is_at_most_the_minimum_refresh(jwks: Jwks) -> None:
+    v = JwksVerifier(jwks.url, ISSUER, min_refresh=0.3, fetch_timeout=5.0)
+    assert v.first_retry == 0.3  # 1 s by default, never above the minimum refresh
 
 
 async def test_an_unknown_kid_right_after_the_first_load_fetches_once(jwks: Jwks) -> None:

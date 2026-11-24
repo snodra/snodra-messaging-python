@@ -9,7 +9,7 @@ import grpc
 import pytest
 from fakehub import FakeHub, FakeStream, ack
 from helpers import assert_no_library_tasks, eventually, new_app, start_app, within
-from snodra import App, Settings, _connection
+from snodra import AccessToken, App, Settings, _connection
 from snodra._hubpb import hub_pb2
 
 
@@ -342,3 +342,25 @@ async def test_run_restores_the_signal_handlers_it_found(hub: FakeHub) -> None:
     finally:
         for sig, handler in before.items():
             signal.signal(sig, handler)
+
+
+async def test_shutdown_ends_the_token_tasks_when_the_jwks_close_fails(
+    hub: FakeHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Source:
+        async def token(self) -> AccessToken:
+            return AccessToken("own-1", time.time() + 60)
+
+    app = await start_app(hub, credentials=Source())
+    s = await hub.next_stream()
+    await s.recv_register()
+    await s.ack(ack("hub-1"))
+    await eventually(lambda: any(t.get_name() == "snodra:token-renewal" for t in asyncio.all_tasks()))
+
+    async def failing() -> None:
+        raise RuntimeError("closing the JWKS failed")
+
+    monkeypatch.setattr(app._identity, "close", failing)
+    with pytest.raises(RuntimeError, match="closing the JWKS failed"):
+        await app.shutdown(timeout=2.0)
+    assert_no_library_tasks()  # the token renewal ended all the same

@@ -384,10 +384,12 @@ class App:
             finally:
                 try:
                     await self._identity.close()  # a JWKS fetch still running ends here
-                    if self._credentials is not None:
-                        await self._credentials.close()  # and a token fetch or renewal
                 finally:
-                    self._down.set()
+                    try:
+                        if self._credentials is not None:
+                            await self._credentials.close()  # and a token fetch or renewal
+                    finally:
+                        self._down.set()
 
     async def __aenter__(self) -> App:
         await self.start()

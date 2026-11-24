@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -16,6 +17,8 @@ from snodra._errors import ConfigurationError
 from snodra._ids import new_id
 from snodra._retry import RetryPolicy
 from snodra._tls import ClientCertificate, TLSConfig
+
+log = logging.getLogger(__name__)
 
 _UINT32_MAX: Final = 2**32 - 1
 _INT32: Final = range(-(2**31), 2**31)
@@ -79,7 +82,7 @@ class Settings:
     ``client_certificate``. Without TLS it travels unencrypted: a warning says so when the app is built."""
     tls: TLSConfig | None = None
     """TLS to every hub (``SNODRA_SERVER_TLS``, ``SNODRA_SERVER_TLS_CA``, ``SNODRA_SERVER_TLS_SERVER_NAME``); a client
-    certificate implies it (with the system's roots unless set)."""
+    certificate implies it (with grpcio's bundled roots unless set)."""
     client_certificate: ClientCertificate | None = None
     """The client certificate presented to every hub (``SNODRA_SERVER_TLS_CLIENT_CERT``,
     ``SNODRA_SERVER_TLS_CLIENT_KEY``): the service's credential, excluding ``credentials``."""
@@ -146,6 +149,11 @@ class Settings:
             parts = urlsplit(url)
             if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
                 raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be an http:// or https:// URL, got {url!r}")
+            if parts.username is not None or parts.password is not None:
+                raise ConfigurationError(
+                    "jwks_url (SNODRA_JWKS_URL) must carry no userinfo: the credentials of the issuer's endpoint are "
+                    "not read from a URL"
+                )
             object.__setattr__(self, "jwks_url", url)
             if not isinstance(issuer, str) or not issuer.strip():
                 raise ConfigurationError(
@@ -349,6 +357,16 @@ def _checked_grant(grant: ClientCredentials) -> ClientCredentials:
         raise ConfigurationError(
             "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must be an http:// or https:// URL, "
             f"got {url!r}"
+        )
+    if parts.username is not None or parts.password is not None:
+        raise ConfigurationError(
+            "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must carry no userinfo: the client is "
+            "authenticated by client_id and its secret, not by a URL"
+        )
+    if parts.scheme.lower() == "http":
+        log.warning(
+            "The token endpoint of ClientCredentials (SNODRA_SERVER_OAUTH2_TOKEN_URI) is plain http://: the client "
+            "secret and the access token travel unencrypted; use https://"
         )
     if not grant.client_id.strip():
         raise ConfigurationError("ClientCredentials.client_id (SNODRA_SERVER_OAUTH2_CLIENT_ID) must not be blank")

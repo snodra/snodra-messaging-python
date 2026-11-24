@@ -4,6 +4,7 @@ presented, a renewed pair rolled over to one hub at a time, and the hub's close 
 See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Credentials").
 """
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -14,9 +15,10 @@ import grpc
 import pytest
 from certs import Ca, KeyPair, ServerTls, make_ca
 from cryptography import x509
-from fakehub import FakeHub, FakeStream, ack
-from helpers import SCALED, PlaceOrder, eventually, new_app, start_app
+from fakehub import FakeHub, FakeStream, ack, forward
+from helpers import SCALED, Placed, PlaceOrder, eventually, new_app, next_reply, start_app
 from snodra import ClientCertificate, ConfigurationError, TLSConfig
+from snodra._hubpb import hub_pb2
 from snodra._tls import roll_delay_bound
 
 HUB_NAME = "hub.test"
@@ -178,6 +180,37 @@ async def test_a_renewed_certificate_is_presented_before_not_after(
     await eventually(lambda: app.hub_ids() == ["hub-1", "hub-2"])
     await new1.nothing(0.3, "register")  # nothing more to roll
     assert app.rejection is None
+
+
+async def test_no_request_is_lost_while_a_hub_rolls(tls_hub: FakeHub, ca: Ca, tmp_path: Path) -> None:
+    release = asyncio.Event()
+    started = asyncio.Event()
+    app = new_app(
+        tls_hub,
+        tls=TLSConfig(_ca_file(tmp_path, ca), HUB_NAME),
+        client_certificate=_write_pair(tmp_path, ca.issue_client("orders-service")),
+        _timings=replace(SCALED, cert_check_interval=0.05, roll_delay_max=0.0),
+    )
+
+    @app.command_handler
+    async def place_order(cmd: PlaceOrder) -> Placed:
+        started.set()
+        await release.wait()
+        return Placed(cmd.order_id, 1)
+
+    await app.start()
+    old = await _registered(tls_hub, 100)
+    request = hub_pb2.Request(id="c-1", kind=hub_pb2.COMMAND, type="orders.PlaceOrder", payload=b'{"orderId":"o-1"}')
+    await old.send(forward(request))
+    await asyncio.wait_for(started.wait(), 1.0)
+    _write_pair(tmp_path, ca.issue_client("orders-service"))
+    assert list((await old.recv_register(within=1.0)).command_types) == []  # the roll began
+    await old.nothing(0.3, "reply")  # the request is still served: the stream is not half-closed under it
+    release.set()
+    assert (await next_reply(old)).request_id == "c-1"  # answered on the stream it came on
+    await old.half_closed(within=1.0)  # then the roll goes on
+    new = await tls_hub.next_stream(within=1.0)
+    await new.recv_register()
 
 
 async def test_certificate_expired_is_an_ordinary_reconnect(tls_hub: FakeHub, ca: Ca, tmp_path: Path) -> None:

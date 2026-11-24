@@ -46,6 +46,10 @@ _CLIP: Final = 200
 _SLICE: Final = 5.0
 """The renewal looks at the clocks at least this often (a suspended machine stops the monotonic one)."""
 
+MIN_RENEWAL_INTERVAL: Final = 1.0
+"""The shortest time between two fetches of the renewal: a shorter-lived token is renewed at that pace, not in a
+loop (a stream's own fetch after a refusal is not held back)."""
+
 
 @dataclass(frozen=True)
 class Token:
@@ -193,7 +197,11 @@ class StaticToken(HubCredentials):
 class TokenFileCredentials(HubCredentials):
     """The token in a file: read now (:class:`ConfigurationError` when it cannot be read or is empty), then before every
     connect and on every tick, keeping the last token read when the file cannot be read or is empty (a warning per
-    distinct problem)."""
+    distinct problem).
+
+    A tick never waits on the file: it starts one read (task ``snodra:token-file``) when none is under way, and a
+    changed token is followed (``ClientMessage.credentials``) as soon as the read came back, however slow the mount.
+    """
 
     kind = "token (file)"
 
@@ -211,12 +219,44 @@ class TokenFileCredentials(HubCredentials):
             )
         self._last = token
         self._problem: str | None = None
+        self._current = hub_pb2.Credentials(token=token)
+        self._listeners: list[Callable[[], None]] = []
+        self._task: asyncio.Task[None] | None = None
 
     async def for_register(self) -> hub_pb2.Credentials:
-        return hub_pb2.Credentials(token=await asyncio.to_thread(self._read))
+        self._adopt(await asyncio.to_thread(self._read))
+        return self._current
 
     async def on_tick(self) -> hub_pb2.Credentials | None:
-        return await self.for_register()
+        if self._task is None or self._task.done():  # one read at a time, however many ticks pass meanwhile
+            self._task = asyncio.create_task(self._reread(), name="snodra:token-file")
+        return None  # a changed token goes out when its read comes back (latest/listen)
+
+    def latest(self) -> hub_pb2.Credentials | None:
+        return self._current
+
+    def listen(self, changed: Callable[[], None]) -> None:
+        self._listeners.append(changed)
+
+    async def close(self) -> None:
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait({task})
+
+    async def _reread(self) -> None:
+        self._adopt(await asyncio.to_thread(self._read))
+
+    def _adopt(self, token: str) -> None:
+        """token, once it is not the one the streams hold, is followed from here on."""
+        if token == self._current.token:
+            return
+        self._current = hub_pb2.Credentials(token=token)
+        for changed in list(self._listeners):
+            try:
+                changed()
+            except Exception:
+                log.exception("Following a changed hub token failed")
 
     def _read(self) -> str:
         try:
@@ -317,9 +357,9 @@ class TokenProvider:
     one: callers that arrive while a fetch runs wait for that one (a waiter that is cancelled leaves it to the others),
     and its failure is theirs too. A fetch (task ``snodra:token``) asks the source, at most ``token_fetch_timeout``.
     After the first fetch, ``snodra:token-renewal`` renews the token when it stops being fresh and publishes each new
-    one (:attr:`published`, the listeners called); a renewal that fails keeps the current token and is tried again
-    after the first ``token_retry``, doubling (jittered) up to the second, one warning per distinct error. A token a
-    hub refused (:meth:`invalidate`) is never handed out again."""
+    one (:attr:`published`, the listeners called), at most once a second whatever the lifetime; a renewal that fails
+    keeps the current token and is tried again after the first ``token_retry``, doubling (jittered) up to the second,
+    one warning per distinct error. A token a hub refused (:meth:`invalidate`) is never handed out again."""
 
     def __init__(self, source: TokenSource, timings: Timings) -> None:
         self._source = source
@@ -415,7 +455,12 @@ class TokenProvider:
         renewed = previous is None or previous.value != token.value
         if renewed:
             self._generation += 1
-        issued = _Issued(token.value, self._generation, lifetime, refresh_at(lifetime, self._min_margin))
+        issued = _Issued(
+            token.value,
+            self._generation,
+            lifetime,
+            max(refresh_at(lifetime, self._min_margin), MIN_RENEWAL_INTERVAL),
+        )
         self._current = self._published = issued
         log.debug("Access token for the hubs fetched (generation %d), valid for %.0f s", issued.generation, lifetime)
         if renewed:

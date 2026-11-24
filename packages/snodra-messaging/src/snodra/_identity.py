@@ -56,8 +56,17 @@ class Guard:
         self._describe = describe
 
     def allows(self, caller: Caller) -> bool:
-        """True only when the rule returns ``True`` itself (a truthy value of another type refuses)."""
-        return self._rule(caller) is True
+        """True only when the rule returns ``True`` itself (a truthy value of another type refuses). A rule that hands
+        back an awaitable is the programming error ``caller_matches`` refuses: a ``TypeError``, the caller refused."""
+        allowed = self._rule(caller)
+        if inspect.isawaitable(allowed):
+            if inspect.iscoroutine(allowed):
+                allowed.close()  # never awaited: no "coroutine was never awaited" warning to anyone
+            raise TypeError(
+                f"the caller rule returned an awaitable ({type(allowed).__name__}): call it as a plain "
+                "function, an async one is not awaited here"
+            )
+        return allowed is True
 
     def __repr__(self) -> str:
         return self._describe
@@ -77,11 +86,11 @@ def role(name: str) -> Guard:
 
 def caller_matches(rule: Callable[[Caller], bool]) -> Guard:
     """A caller rule returns ``True`` for; a rule that raises refuses the caller. The rule is a plain function: an
-    ``async`` one is a ``TypeError``."""
+    ``async`` one (a ``functools.partial`` of one included) is a ``TypeError``."""
     if not callable(rule):
         raise TypeError(f"caller_matches needs a function of the caller, got {rule!r}")
     call = rule if inspect.isroutine(rule) else type(rule).__call__  # a function, or an object's __call__
-    if inspect.iscoroutinefunction(call):
+    if inspect.iscoroutinefunction(call) or inspect.iscoroutinefunction(rule):
         raise TypeError(f"caller_matches needs a plain function of the caller, not an async one: {rule!r}")
     name = getattr(rule, "__qualname__", None)
     return Guard(rule, f"caller_matches({name.replace('<locals>.', '') if isinstance(name, str) else repr(rule)})")

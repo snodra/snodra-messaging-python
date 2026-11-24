@@ -65,8 +65,9 @@ class JwksVerifier:
 
     The keys are fetched at the first token and cached. A fetch starts at most once per ``min_refresh``: a token whose
     ``kid`` the cache does not know fetches them again once that long passed since the last fetch (the first one
-    included), and after a first fetch that failed every token is refused until it passed. A fetch runs off the event
-    loop (see :mod:`snodra._http`: no redirect followed, ``fetch_timeout`` seconds for the whole download and its
+    included). After a first fetch that failed, tokens are refused, and the keys are fetched again after a short wait
+    (``first_retry``, doubling, never above ``min_refresh``) instead of a whole refresh interval. A fetch runs off the
+    event loop (see :mod:`snodra._http`: no redirect followed, ``fetch_timeout`` seconds for the whole download and its
     parsing, at most 1 MiB, the proxy environment variables honoured) in one task, ``snodra:jwks``, that every token
     needing the keys meanwhile waits for: a waiter that is cancelled leaves it to the others. A token is refused with
     :class:`Unauthenticated` and a short reason, safe to send back to the caller.
@@ -81,6 +82,7 @@ class JwksVerifier:
         fetch_timeout: float,
         leeway: float = 60.0,
         max_bytes: int = MAX_JWKS_BYTES,
+        first_retry: float = 1.0,
     ) -> None:
         self._url = url
         self._issuer = issuer
@@ -88,10 +90,16 @@ class JwksVerifier:
         self._fetch_timeout = fetch_timeout
         self._leeway = leeway
         self._max_bytes = max_bytes
+        self.first_retry = min(first_retry, min_refresh)
+        """The wait after a first load that failed, before trying again (doubling, capped at ``min_refresh``)."""
+        self._failures = 0
+        """How many first loads failed in a row: the retry wait doubles with each."""
         self._keys: dict[str, rsa.RSAPublicKey | None] | None = None
         """The published keys by id (None: published but unusable); None until a fetch succeeded."""
         self._last_fetch: float | None = None
         """When the latest fetch started (loop time)."""
+        self._last_failure: float | None = None
+        """When a first load last failed (loop time): the short retry wait counts from there."""
         self._fetch: asyncio.Task[dict[str, rsa.RSAPublicKey | None]] | None = None
         self._closed = False
 
@@ -161,17 +169,19 @@ class JwksVerifier:
         return key
 
     async def _load(self, *, forced: bool) -> None:
-        """Waits for a fetch of the keys: the one in progress, else a new one when ``min_refresh`` passed since the
-        last. Within it a forced fetch (an unknown ``kid``, the keys known) does nothing, and a first load (no keys
-        yet: the last fetch failed) is refused."""
+        """Waits for a fetch of the keys: the one in progress, else a new one when its wait passed since the last (an
+        unknown ``kid`` with the keys known: ``min_refresh`` since the last fetch started; a first load that failed:
+        a short wait since the failure, doubling). Within it a forced fetch (an unknown ``kid``, the keys known) does
+        nothing."""
         if self._closed:
             raise Unauthenticated(UNAVAILABLE)
         task = self._fetch
         if task is None:
             now = asyncio.get_running_loop().time()
-            if self._last_fetch is not None and now - self._last_fetch < self._min_refresh:
-                if forced:
+            if forced:
+                if self._last_fetch is not None and now - self._last_fetch < self._min_refresh:
                     return
+            elif self._last_failure is not None and now - self._last_failure < self._retry_wait():
                 raise Unauthenticated(UNAVAILABLE)
             self._last_fetch = now
             task = asyncio.create_task(self._fetch_keys(), name="snodra:jwks")
@@ -187,14 +197,22 @@ class JwksVerifier:
         except Exception:
             raise Unauthenticated(UNAVAILABLE) from None
 
+    def _retry_wait(self) -> float:
+        """How long after the failure of a first load the next attempt may start: ``first_retry`` doubling with each
+        failure in a row, never above ``min_refresh``."""
+        return min(self.first_retry * 2.0 ** max(0, self._failures - 1), self._min_refresh)
+
     def _fetched(self, task: asyncio.Task[dict[str, rsa.RSAPublicKey | None]]) -> None:
         if self._fetch is task:
             self._fetch = None
         if task.cancelled():
             return
         if (e := task.exception()) is not None:
+            self._failures += 1
+            self._last_failure = asyncio.get_running_loop().time()
             log.warning("The JWKS at %s could not be fetched: tokens are refused (%s)", self._url, e)
             return
+        self._failures = 0
         self._keys = task.result()
 
     async def _fetch_keys(self) -> dict[str, rsa.RSAPublicKey | None]:

@@ -493,17 +493,27 @@ class HubConnection:
         self._on_change()
         try:
             echoed = s.write_register(empty=True)
+            echo_came = False
             try:
                 async with asyncio.timeout(t.roll_idle_limit):
                     await echoed
+                    echo_came = True
                     while not idle(s) and not s.ended.is_set():  # noqa: ASYNC110 (no event tells when it is idle)
                         await asyncio.sleep(_ROLL_POLL)
             except TimeoutError:
-                log.warning(
-                    "Requests still in flight on the hub stream to %s after %.1f s: rolling it over anyway",
-                    self.address,
-                    t.roll_idle_limit,
-                )
+                if echo_came:
+                    log.warning(
+                        "Requests still in flight on the hub stream to %s after %.1f s: rolling it over anyway",
+                        self.address,
+                        t.roll_idle_limit,
+                    )
+                else:
+                    log.warning(
+                        "The hub stream to %s sent no echo of its heartbeat within %.1f s (the hub may be gone): "
+                        "rolling it over anyway",
+                        self.address,
+                        t.roll_idle_limit,
+                    )
             if self._stopping:
                 return True
             if not s.ended.is_set():
@@ -515,8 +525,12 @@ class HubConnection:
                 except TimeoutError:
                     s.cut_reason = "the hub did not end the stream after the half-close of a rollover"
                     s.cut.set()
-                    async with asyncio.timeout(CLEAN_UP_BOUND):
-                        await s.ended.wait()
+                    try:
+                        async with asyncio.timeout(CLEAN_UP_BOUND):
+                            await s.ended.wait()
+                    except TimeoutError:
+                        # The stream is cut already: the roll goes on to the wait for its replacement.
+                        log.debug("The rolled hub stream to %s did not end after its cut", self.address)
             try:
                 async with asyncio.timeout(t.roll_reconnect_limit):
                     while not self._stopping:

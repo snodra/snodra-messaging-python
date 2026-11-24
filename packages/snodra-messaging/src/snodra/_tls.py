@@ -45,8 +45,8 @@ _KEY: Final = "client_certificate.key_file (SNODRA_SERVER_TLS_CLIENT_KEY)"
 class TLSConfig:
     """TLS to every hub (``SNODRA_SERVER_TLS``): a hub with TLS on accepts nothing else. ``ca_file``
     (``SNODRA_SERVER_TLS_CA``) is a PEM file of the CA certificates that sign the hubs' certificates, read again at
-    every connect (None: the system's roots); ``server_name`` (``SNODRA_SERVER_TLS_SERVER_NAME``) is the name the hubs'
-    certificates must carry (None: the host of each hub address)."""
+    every connect (None: grpcio's bundled roots); ``server_name`` (``SNODRA_SERVER_TLS_SERVER_NAME``) is the name the
+    hubs' certificates must carry (None: the host of each hub address)."""
 
     ca_file: str | None = None
     server_name: str | None = None

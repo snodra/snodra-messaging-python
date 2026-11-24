@@ -2,8 +2,10 @@
 redirect, bounded by one deadline for the whole exchange and by a number of bytes.
 
 ``urllib`` bounds each socket operation only, so a server that sends a byte now and then could keep a thread for
-minutes. Here the deadline is the event loop's: when it passes (or the caller is cancelled) the exchange's socket is
-shut down, and the thread's read ends at once. The proxy environment variables (``https_proxy``, ``http_proxy``,
+minutes. Here the deadline belongs to the exchange, and both the event loop and the thread enforce it: the thread
+reads in short slices (the socket's timeout is shortened for it) and, once the deadline passed, shuts the socket down
+and stops reading by itself, whether or not the loop is still there to cut it; the loop, when its ``asyncio.timeout``
+passes first, cuts the same socket at once. The proxy environment variables (``https_proxy``, ``http_proxy``,
 ``no_proxy``) apply, as for any ``urllib`` request.
 """
 
@@ -16,10 +18,17 @@ import http.client
 import socket
 import ssl
 import threading
+import time
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
+
+_SLICE: Final = 0.1
+"""How long a socket read of the exchange's thread may block before it looks at its deadline again."""
+
+_CHUNK: Final = 1 << 16
+"""How much of the body the exchange's thread reads at a time."""
 
 
 @dataclass(frozen=True)
@@ -62,12 +71,14 @@ async def exchange[T](
 
 
 class _Cut:
-    """The socket of one exchange, shut down from the event loop when its deadline passes."""
+    """The socket of one exchange, shut down by the event loop when its deadline passes, and the deadline the thread
+    reads against."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._socket: socket.socket | None = None
         self._cut = False
+        self.deadline = float("inf")
 
     def attach(self, sock: socket.socket) -> None:
         with self._lock:
@@ -79,6 +90,19 @@ class _Cut:
     def release(self) -> None:
         with self._lock:
             self._socket = None
+
+    def retime(self, seconds: float) -> None:
+        """The attached socket's read timeout (how long one read blocks before the thread looks at the deadline)."""
+        with self._lock:
+            sock = self._socket
+        if sock is not None:
+            with contextlib.suppress(OSError):  # already closed
+                sock.settimeout(max(0.001, seconds))
+
+    @property
+    def cut_off(self) -> bool:
+        """The deadline passed: the socket was shut down, or is to be."""
+        return self._cut
 
     def cut(self) -> None:
         with self._lock:
@@ -100,6 +124,7 @@ def _exchange[T](
     cut: _Cut,
     read: Callable[[Response], T],
 ) -> T:
+    cut.deadline = time.monotonic() + timeout
     context = ssl.create_default_context()
     if ca_file is not None:
         context.load_verify_locations(cafile=ca_file)
@@ -112,34 +137,70 @@ def _exchange[T](
         if response is None:
             raise ValueError(f"no handler for the URL {url}")
         with response:
-            body: bytes = response.read(max_bytes + 1)
             status: int = response.status
+            body = _read_body(response, max_bytes, cut)
     finally:
         cut.release()
-    if len(body) > max_bytes:
-        raise TooLarge(f"the answer is larger than {max_bytes} bytes")
     return read(Response(status, body))
 
 
-def _attached(create: Callable[..., socket.socket], cut: _Cut) -> Callable[..., socket.socket]:
-    def create_connection(*args: Any, **kwargs: Any) -> socket.socket:
-        sock = create(*args, **kwargs)
-        cut.attach(sock)  # the plain socket: shutting it down ends a TLS handshake or read on it too
-        return sock
+def _read_body(response: http.client.HTTPResponse, max_bytes: int, cut: _Cut) -> bytes:
+    """At most ``max_bytes`` + 1 bytes of the answer's body, read in slices so that the thread stops at the deadline
+    by itself (:class:`TimeoutError`, the socket shut down); :class:`TooLarge` once the bound is passed."""
+    body = bytearray()
+    while len(body) <= max_bytes:
+        left = cut.deadline - time.monotonic()
+        if left <= 0 or cut.cut_off:
+            cut.cut()
+            raise TimeoutError("the exchange's deadline passed")
+        cut.retime(min(_SLICE, left))
+        try:
+            chunk = response.read1(min(_CHUNK, max_bytes + 1 - len(body)))
+        except TimeoutError:  # this slice elapsed (or the loop cut the socket): look at the clocks again
+            if cut.cut_off:
+                raise TimeoutError("the exchange's deadline passed") from None
+            continue
+        if not chunk:
+            return bytes(body)
+        body += chunk
+    raise TooLarge(f"the answer is larger than {max_bytes} bytes")
 
-    return create_connection
 
+class _Attach:
+    """Takes the socket a connection opened, in the documented ``connect()``, for the deadline's cut, and keeps its
+    reads short so the thread checks that deadline often.
 
-class _HTTPConnection(http.client.HTTPConnection):
+    ``http.client`` keeps its socket factory as an instance attribute (``_create_connection``); here it stays the
+    documented default, on the class, so an instance carries none and nothing of it is replaced: the socket is taken
+    as ``connect()`` made it, a proxy tunnel included."""
+
     def __init__(self, *args: Any, cut: _Cut, **kwargs: Any) -> None:
+        self._cut = cut
         super().__init__(*args, **kwargs)
-        self._create_connection = _attached(socket.create_connection, cut)
+
+    sock: socket.socket | None
+
+    @property
+    def _create_connection(self) -> Callable[..., socket.socket]:
+        return socket.create_connection
+
+    @_create_connection.setter
+    def _create_connection(self, factory: Callable[..., socket.socket]) -> None:
+        pass  # ``http.client`` setting its documented default: the class's own, unchanged
+
+    def connect(self) -> None:
+        super().connect()  # type: ignore[misc]  # the http.client connection this is mixed into
+        sock = self.sock
+        if sock is not None:
+            self._cut.attach(sock)  # a TLS socket too: shutting it down ends a read or a handshake on it
 
 
-class _HTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, *args: Any, cut: _Cut, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._create_connection = _attached(socket.create_connection, cut)
+class _HTTPConnection(_Attach, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPSConnection(_Attach, http.client.HTTPSConnection):
+    pass
 
 
 class _HTTPHandler(urllib.request.HTTPHandler):
