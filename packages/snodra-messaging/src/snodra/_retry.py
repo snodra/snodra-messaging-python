@@ -1,6 +1,6 @@
 """The retry policy of a call, and which failures it retries.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Never sent or outcome unknown").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Never sent or outcome unknown").
 """
 
 from __future__ import annotations

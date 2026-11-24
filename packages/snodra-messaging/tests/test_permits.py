@@ -1,6 +1,6 @@
 """Flow control: the permits a handled request gives back, when and on which stream.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Flow control").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Flow control").
 """
 
 import asyncio

@@ -28,9 +28,10 @@ class App:
     """One service instance: its handlers and its hub connections.
 
     Handlers are registered before ``start`` (``command_handler``, ``query_handler``); ``start`` opens a connection
-    per hub; ``shutdown`` leaves the hubs in order (https://snodra.damoreira.com/library-authors/protocol/, "Shutting
-    down"). ``run`` does both around the process's life, and ``async with app:`` around a block. ``codec`` reads and
-    writes the payloads (:class:`JsonCodec` by default).
+    per hub; ``shutdown`` leaves the hubs in order
+    (https://snodra.damoreira.com/docs/library-authors/protocol/, "Shutting down"). ``run`` does both around the
+    process's life, and ``async with app:`` around a block. ``codec`` reads and writes the payloads
+    (:class:`JsonCodec` by default).
     """
 
     def __init__(self, settings: Settings, *, codec: Codec | None = None, _timings: Timings | None = None) -> None:

@@ -1,6 +1,6 @@
 """Reconnect waits: doubling from a floor to a maximum, each jittered.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Reconnect and backoff").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Reconnect and backoff").
 """
 
 from __future__ import annotations

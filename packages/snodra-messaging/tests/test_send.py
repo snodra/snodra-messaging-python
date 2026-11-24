@@ -1,7 +1,7 @@
 """Sending a command or a query: the request, its answer, timeouts, never sent and outcome unknown, the hubs tried
 in turn after ``NO_HANDLER``, retries and the caller's cancellation.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Requests", "Several hubs").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Requests", "Several hubs").
 """
 
 import asyncio

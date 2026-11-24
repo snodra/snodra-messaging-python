@@ -1,6 +1,6 @@
 """The payload codec: JSON documents, one object per message.
 
-See https://snodra.damoreira.com/library-authors/messages/ (Payloads).
+See https://snodra.damoreira.com/docs/library-authors/messages/ (Payloads).
 """
 
 import base64

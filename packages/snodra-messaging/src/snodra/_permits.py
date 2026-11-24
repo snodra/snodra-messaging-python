@@ -1,6 +1,6 @@
 """The permit accounting of one hub stream: when the permits of finished requests go back to the hub.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Flow control").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Flow control").
 """
 
 from __future__ import annotations

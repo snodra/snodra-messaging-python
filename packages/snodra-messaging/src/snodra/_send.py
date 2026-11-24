@@ -1,7 +1,7 @@
 """Sending a command or a point query through the hubs: the request, its timing, the hubs tried in turn, retries, and
 the calls waiting for their answer.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Requests", "Several hubs").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Requests", "Several hubs").
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def request_timing(
     """``Request.timeout_ms`` and the local guard (seconds) of a request of ``type_`` to the hub that sent ``ack``,
     when the call chose ``chosen`` (None: no timeout). It sends the chosen timeout (at least 1 ms) or 0, so that the
     hub applies its per-type override or its default; the guard is the hub's bound for the request plus ``margin``:
-    ``min(chosen, override or max)``, or the override or max when 0 is sent (https://snodra.damoreira.com/library-authors/protocol/,
+    ``min(chosen, override or max)``, or the override or max when 0 is sent (https://snodra.damoreira.com/docs/library-authors/protocol/,
     "Timeouts")."""
     timeout_ms = 0 if chosen is None else min(max(1, round(chosen * 1000)), _UINT32_MAX)
     ack = hub_pb2.RegisterAck() if ack is None else ack

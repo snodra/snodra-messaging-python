@@ -1,6 +1,6 @@
 """The connection to one hub: its ``Hub.Connect`` streams, one after another.
 
-A connection runs the state machine of https://snodra.damoreira.com/library-authors/writing-a-library/ ("A
+A connection runs the state machine of https://snodra.damoreira.com/docs/library-authors/writing-a-library/ ("A
 connection to one hub") as one task, ``snodra:connection:<address>``. Each attempt opens a channel and a stream, writes
 the ``Register`` and a ``Heartbeat``, and runs three tasks of its own until the stream ends: the writer (the one task
 that writes to the stream), the reader, and the heartbeats (which also close a stream that gets no ``RegisterAck``
@@ -36,7 +36,7 @@ REFUSALS: Final = frozenset(
     }
 )
 """The statuses with which a hub refuses a registration: retried at the backoff cap and exposed as a
-:class:`Rejection` (https://snodra.damoreira.com/library-authors/protocol/, "Refusals")."""
+:class:`Rejection` (https://snodra.damoreira.com/docs/library-authors/protocol/, "Refusals")."""
 
 _TYPE_LISTS: Final = ("command_types", "query_types", "shared_query_types", "subscription_query_types")
 

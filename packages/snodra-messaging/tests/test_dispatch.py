@@ -1,6 +1,6 @@
 """A forwarded unary request, end to end: lookup, decoding, the handler, the one ``Reply`` and the error mapping.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Handling a request").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Handling a request").
 """
 
 import asyncio

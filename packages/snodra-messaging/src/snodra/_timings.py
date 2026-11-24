@@ -8,7 +8,7 @@ from typing import Final
 
 @dataclass(frozen=True)
 class Timings:
-    """The client-side timings of https://snodra.damoreira.com/library-authors/protocol/ ("Timing summary")."""
+    """The client-side timings of https://snodra.damoreira.com/docs/library-authors/protocol/ ("Timing summary")."""
 
     heartbeat_before_ack: float
     """The heartbeat period of a stream before its ``RegisterAck`` (after it: ``RegisterAck.heartbeat_interval_ms``)."""

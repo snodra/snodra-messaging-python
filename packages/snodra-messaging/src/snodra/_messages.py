@@ -1,6 +1,6 @@
 """Message types: the wire name lives on the class.
 
-See https://snodra.damoreira.com/library-authors/messages/ (Type names).
+See https://snodra.damoreira.com/docs/library-authors/messages/ (Type names).
 """
 
 from collections.abc import Callable

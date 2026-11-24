@@ -1,6 +1,6 @@
 """Error codes, the exceptions the library raises, and the mapping to and from the wire.
 
-See https://snodra.damoreira.com/library-authors/messages/ (Handler errors).
+See https://snodra.damoreira.com/docs/library-authors/messages/ (Handler errors).
 """
 
 import enum

@@ -1,6 +1,6 @@
 """A request the hub forwarded, end to end: its task, its handler, its one answer and its permit.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Handling a request", "Flow control", "Cancel").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Handling a request", "Flow control", "Cancel").
 """
 
 from __future__ import annotations

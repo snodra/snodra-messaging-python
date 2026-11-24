@@ -1,6 +1,6 @@
 # Specification gaps
 
-Places where the [library specification](https://snodra.damoreira.com/library-authors/) is silent, and what this
+Places where the [library specification](https://snodra.damoreira.com/docs/library-authors/) is silent, and what this
 library does there. Where an entry is settled, its behaviour is this library's rule. The code carries a
 `# TODO(spec-gap): SG-<n>` comment at the spot.
 
@@ -34,7 +34,7 @@ library does there. Where an entry is settled, its behaviour is this library's r
 ### SG-2: the forms of a hub address
 
 - **Specification:** `protocol.md` and `writing-a-library.md` name the hubs a library connects to, `host:port` targets
-  and one DNS name whose addresses are the hubs ([Several hubs](https://snodra.damoreira.com/library-authors/protocol/)),
+  and one DNS name whose addresses are the hubs ([Several hubs](https://snodra.damoreira.com/docs/library-authors/protocol/)),
   but no syntax for the configured addresses.
 - **This library:** `snodra/_settings.py` (`hub_targets`, run when `Settings` is built) takes `host:port` or
   `static://host:port`, several of them (repeats dropped, order kept; `SNODRA_SERVER_ADDRESS` is a comma list whose

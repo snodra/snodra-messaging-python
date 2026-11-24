@@ -4,7 +4,7 @@ Keys are RSA 2048; a certificate is valid for one hour from a minute ago unless 
 takes 10 to 60 ms, too long to do on a test's event loop: a background thread keeps a few fresh keys ready
 (generating one releases the GIL), so the functions here stay synchronous and quick. No key is used twice.
 A service certificate names its service the way the hub reads it: one URI SAN
-``snodra://service/<name>`` (https://snodra.damoreira.com/library-authors/protocol/).
+``snodra://service/<name>`` (https://snodra.damoreira.com/docs/library-authors/protocol/).
 """
 
 from __future__ import annotations

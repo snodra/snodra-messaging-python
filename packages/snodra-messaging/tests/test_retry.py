@@ -1,6 +1,6 @@
 """The retry policy: which failures are retried, and the waits between attempts.
 
-See https://snodra.damoreira.com/library-authors/protocol/ ("Never sent or outcome unknown").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Never sent or outcome unknown").
 """
 
 import math

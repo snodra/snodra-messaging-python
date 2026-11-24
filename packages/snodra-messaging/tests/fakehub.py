@@ -7,7 +7,7 @@ helpers) and writes what a hub would (:meth:`FakeStream.send`, :meth:`FakeStream
 wait here is bounded and the bound only stops a hang; a step that does not happen fails with ``AssertionError``.
 
 Where the library relies on it the hub behaves as snodra-server (see "How the runner's hub differs from
-snodra-server" in https://snodra.damoreira.com/library-authors/conformance/), with snodra-server's codes and texts:
+snodra-server" in https://snodra.damoreira.com/docs/library-authors/conformance/), with snodra-server's codes and texts:
 
 - The first frame: one that is not a ``Register``, or a half-close before any frame, closes the stream
   ``FAILED_PRECONDITION``; an empty service name or instance id, an instance id starting with ``snodra-server/``,
