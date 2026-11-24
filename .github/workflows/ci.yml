@@ -73,13 +73,21 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    env:
+      # The distributions this repository publishes, one per line; the examples are never built here.
+      PUBLISHED: |
+        snodra-messaging
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       - run: uv sync --frozen --all-packages
-      - run: uv build --all-packages --out-dir dist
+      - run: |
+          rm -rf dist
+          for package in $PUBLISHED; do
+            uv build --package "$package" --out-dir dist
+          done
       - run: uv run --frozen twine check --strict dist/*
       - run: uv venv -p 3.12 "$RUNNER_TEMP/v"
       - run: uv pip install --python "$RUNNER_TEMP/v" dist/*.whl
