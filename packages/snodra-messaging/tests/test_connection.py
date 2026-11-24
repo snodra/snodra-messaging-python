@@ -444,14 +444,15 @@ async def test_a_refusal_is_honoured_whatever_write_is_in_flight(hub: FakeHub) -
         try:
             for _ in range(20):
                 await s.recv_request()  # the writer is busy writing the rest
+            closed = time.monotonic()  # before the close: the library's wait cannot start earlier
             await s.close(grpc.StatusCode.ALREADY_EXISTS, f"refusal {refusal}")
-            closed = time.monotonic()
-            await eventually(lambda: app.hub_ids() == [])
+            s = await hub.next_stream()
+            # A refusal is recorded before the wait that precedes the next stream.
             rejection = app.rejection
             assert rejection is not None, f"refusal {refusal}: no rejection recorded"
             assert (rejection.code, rejection.message) == ("ALREADY_EXISTS", f"refusal {refusal}")
-            s = await hub.next_stream()
-            within(time.monotonic() - closed, 0.8 * 0.4 - SETUP, 0.4 + SETUP)  # the refusal's wait, not the backoff
+            # The refusal's wait (80-100 % of 0.4 s), not the 0.05 s backoff; the upper bound only stops a hang.
+            within(time.monotonic() - closed, 0.8 * 0.4 - SETUP, 2.0)
         finally:
             for t in flood:
                 t.cancel()

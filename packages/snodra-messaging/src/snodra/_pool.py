@@ -107,11 +107,12 @@ class Pool:
 
     async def leave(self, drain: Callable[[], Awaitable[None]] | None = None) -> None:
         """Leaves every hub in order: the empty ``Register`` (its acks awaited for ``deregister_wait`` at most), the
-        drain of the handlers in flight (which may still send requests), then the end of sending and the half-close
-        (the hub's end awaited for ``close_wait`` at most). Nothing reconnects after it."""
+        drain of the handlers in flight, then the end of sending and the half-close (the hub's end awaited for
+        ``close_wait`` at most). Until the half-close the handlers in flight may still send, and a stream lost
+        meanwhile is opened again with the empty ``Register``, so no new work arrives on it; nothing reconnects after
+        the half-close."""
         t = self._timings
-        for c in self.connections:
-            c.stop_reconnecting()
+        self._withdraw_types()  # every later stream registers with no types
         acks = [f for c in self.connections if (f := c.deregister()) is not None]
         if acks:
             try:
@@ -125,6 +126,7 @@ class Pool:
         # The handlers drained may still have sent requests until here; from now on nothing is sent.
         self._stop_sending()
         for c in self.connections:
+            c.stop_reconnecting()
             c.half_close()
         try:
             async with asyncio.timeout(t.close_wait):
@@ -147,6 +149,11 @@ class Pool:
         if self.hub_ids():
             self._acknowledged.set()
         self._signal_change()
+
+    def _withdraw_types(self) -> None:
+        """The ``Register`` every stream opens with lists no types from now on."""
+        for name in ("command_types", "query_types", "shared_query_types", "subscription_query_types"):
+            self._register.ClearField(name)
 
     def _signal_change(self) -> None:
         self._change.set()

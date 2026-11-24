@@ -122,11 +122,10 @@ class App:
         type, and returns the answer decoded as ``result`` (None without a ``result``: the answer is not read).
 
         ``routing_key``: commands of a type with the same key go to the same instance. ``timeout`` (seconds) is sent
-        as ``Request.timeout_ms`` (else ``Settings.default_timeout``; without one, or with ``timeout=0``, the hub
-        applies its own), and bounds how long the call waits for a hub: without one, ``Settings.default_timeout``,
-        else 5 s. ``priority``: ``Request.priority`` (else
-        ``Settings.priorities``, else 0). ``retry``: a :class:`RetryPolicy` (else ``Settings.default_retry``;
-        ``False``: none).
+        as ``Request.timeout_ms`` (else ``Settings.default_timeout``; without one, or with a ``timeout`` of 0 or less,
+        the hub applies its own), and bounds how long the call waits for a hub: without one,
+        ``Settings.default_timeout``, else 5 s. ``priority``: ``Request.priority`` (else ``Settings.priorities``, else
+        0). ``retry``: a :class:`RetryPolicy` (else ``Settings.default_retry``; ``False``: none).
 
         Raises :class:`NeverSent` when no hub took the request (the handler never ran: sending it again is safe),
         :class:`OutcomeUnknown` when the hub stream broke after the request was written (the handler may have run),
@@ -225,9 +224,10 @@ class App:
         every live stream (its ack awaited for at most 1 s), then the handlers in flight drained (awaited for at most
         5 s, then cancelled and never awaited again), then each stream half-closed and its end awaited (at most 2 s).
         A handler still running when ``timeout`` is reached is cancelled and left behind: one warning names it. A
-        second call returns at once. The handlers being drained can still send commands and queries; once the drain
-        is over nothing is sent: a call fails as :class:`NeverSent`, and one still waiting for its answer as
-        :class:`OutcomeUnknown` ("hub connection stopped").
+        second call returns at once. The handlers being drained can still send commands and queries, and a stream
+        lost meanwhile is opened again with no types (no new work arrives on it); once the drain is over nothing is
+        sent: a call fails as :class:`NeverSent`, and one still waiting for its answer as :class:`OutcomeUnknown`
+        ("hub connection stopped").
 
         The unexpected error that crashed a connection (a library bug, logged at error level when it happened) is
         raised here once everything is stopped, unless another exception or a cancellation is already propagating

@@ -725,6 +725,44 @@ async def test_a_handler_being_drained_can_still_send(hub: FakeHub) -> None:
     assert not _pending(app)
 
 
+async def test_a_stream_dropped_during_the_drain_comes_back_empty_and_carries_the_handlers_sends(hub: FakeHub) -> None:
+    app = new_app(hub)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    answered: list[Placed] = []
+
+    @app.command_handler
+    async def place_order(cmd: PlaceOrder) -> Placed:
+        started.set()
+        await release.wait()
+        order = await app.query(GetOrder(cmd.order_id), Placed, timeout=2.0)
+        answered.append(order)
+        return Placed(cmd.order_id, order.total + 1)
+
+    await app.start()
+    s = await acknowledged(hub)
+    request = hub_pb2.Request(
+        id="r-1", kind=hub_pb2.COMMAND, type="orders.PlaceOrder", payload=b'{"orderId":"o-1","lines":[]}'
+    )
+    await s.send(forward(request))
+    await asyncio.wait_for(started.wait(), 1.0)
+    shutdown = asyncio.create_task(app.shutdown())
+    assert not (await s.recv_register()).command_types  # the empty Register first
+    await s.close(grpc.StatusCode.UNAVAILABLE, "hub restart")  # lost while the handler is being drained
+    s2 = await hub.next_stream()  # the connection comes back
+    register = await s2.recv_register()
+    assert (list(register.command_types), list(register.query_types)) == ([], [])  # no new work
+    await s2.ack(ack("hub-1"))
+    release.set()
+    nested = await s2.recv_request()  # the draining handler's send goes through the new stream
+    assert nested.type == "orders.GetOrder"
+    await s2.send(_reply(nested.id, b'{"orderId":"o-1","total":41}'))
+    await shutdown
+    assert answered == [Placed("o-1", 41)]
+    assert not await _requests_until_end(s2)  # half-closed after the drain
+    assert not _pending(app)
+
+
 async def test_a_send_after_the_drain_is_never_sent(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
     app = await start_app(hub)
     s = await acknowledged(hub)
