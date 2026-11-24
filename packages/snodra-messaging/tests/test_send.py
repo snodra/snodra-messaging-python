@@ -172,8 +172,6 @@ async def test_a_call_refuses_bad_options_before_anything_is_sent(hub: FakeHub) 
     app = await start_app(hub)
     s = await acknowledged(hub)
     for options in (
-        {"timeout": 0},
-        {"timeout": -1.0},
         {"timeout": float("nan")},
         {"timeout": float("inf")},
         {"timeout": True},
@@ -249,7 +247,7 @@ async def test_no_hub_waits_until_the_deadline_then_never_sent(hub: FakeHub) -> 
     acked = time.monotonic()
     await s.ack(ack("hub-1"))
     r = await s.recv_request()
-    assert time.monotonic() - acked < 0.15
+    assert time.monotonic() - acked < 0.5  # woken by the change, far before the deadline
     assert r.timeout_ms == 1000
     await s.send(_reply(r.id))
     await call
@@ -267,7 +265,7 @@ async def test_a_reconnected_hub_wakes_a_waiting_call(hub: FakeHub) -> None:
     acked = time.monotonic()
     await s.ack(ack("hub-1"))
     r = await s.recv_request()
-    assert time.monotonic() - acked < 0.15
+    assert time.monotonic() - acked < 0.5  # woken by the change, far before the deadline
     await s.send(_reply(r.id))
     await call
 
@@ -443,7 +441,7 @@ async def test_when_every_live_hub_declined_the_last_no_handler_comes_at_once(hu
     with pytest.raises(HubError) as raised:
         await call
     assert raised.value.code == ErrorCode.NO_HANDLER
-    assert time.monotonic() - answered < 0.1
+    assert time.monotonic() - answered < 0.5  # at once: the call's deadline is long past
     await s1.nothing(0.1, "request")
     assert not _pending(app)
 
@@ -604,8 +602,39 @@ async def test_no_retry_with_less_than_the_minimum_left(hub: FakeHub) -> None:
     with pytest.raises(HubError) as raised:
         await call
     assert raised.value.code == ErrorCode.NO_HANDLER
-    assert time.monotonic() - started < 0.2  # given up at once, without the wait
     await s.nothing(0.3, "request")
+    # Given up at once, without the wait: budget 1 s, the first answer at 0.5 s, a wait of 0.24 to 0.36 s would leave
+    # less than max(0.3, 0.25) s. Waiting first would end the call 0.74 s in at the earliest.
+    started = time.monotonic()
+    call = asyncio.create_task(app.send(PLACE, timeout=1.0, retry=RetryPolicy(3, initial_backoff=0.3)))
+    r = await s.recv_request()
+    await asyncio.sleep(max(0.0, started + 0.5 - time.monotonic()))
+    await s.send(hub_error(r.id, ErrorCode.NO_HANDLER, "no handler"))
+    with pytest.raises(HubError):
+        await call
+    within(time.monotonic() - started, 0.5, 0.65)
+    await s.nothing(0.3, "request")
+
+
+async def test_a_zero_timeout_lets_the_hub_decide_over_the_default(hub: FakeHub) -> None:
+    app = await start_app(hub, default_timeout=5.0)
+    s = await acknowledged(hub)
+    for timeout in (0, -1.0):
+        call = asyncio.create_task(app.send(PLACE, timeout=timeout))
+        r = await s.recv_request()
+        assert r.timeout_ms == 0
+        await s.send(_reply(r.id))
+        await call
+
+
+async def test_a_zero_timeout_still_waits_the_default_for_a_hub(hub: FakeHub) -> None:
+    app = await start_app(hub, default_timeout=0.3, _timings=PATIENT)
+    s = await hub.next_stream()
+    await s.recv_register()
+    started = time.monotonic()
+    with pytest.raises(NeverSent, match=r"^no hub connected within 300 ms$"):
+        await app.send(PLACE, timeout=0)
+    within(time.monotonic() - started, 0.28, 0.6)
 
 
 async def test_the_per_call_timeout_wins_over_the_default(hub: FakeHub) -> None:

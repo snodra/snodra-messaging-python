@@ -94,3 +94,13 @@ behaviour is the specification. The code carries a `# TODO(spec-gap): SG-<n>` co
   bytes. One trailing underscore of a field name is dropped (`type_` is `type`). Python integers have no range, so a value beyond signed
   64 bits is written as it is.
 - **Question:** open: should the numeric, textual and boolean coercions the Kotlin reader accepts (see above) be read too?
+
+### SG-8: a bound on a stream's outbound requests
+
+- **Specification:** silent. `protocol.md` ("Never sent or outcome unknown") speaks of the library's own outbound
+  buffer, but sets no size for it.
+- **This library:** `snodra/_send.py` (`Sender._hop`) holds at most 256 requests in a stream's outbound buffer
+  (`Timings.outbound_limit`); a call beyond waits for room within its deadline, and is woken when the stream ends or
+  the app stops sending. Heartbeats, replies and permits are never held back.
+- **Question:** open: should the specification bound the buffer, or leave unbounded the memory a stalled stream may
+  hold?

@@ -31,6 +31,9 @@ _UNARY: dict[str, tuple[type[RawJson], bool]] = {
 }
 """The unary targets: the message class and whether it is a query."""
 
+KEPT_OUTCOMES = 1024
+"""Finished asynchronous sends whose outcome is kept for ``conformance.Outcome``; older ones are forgotten."""
+
 
 def classify(exc: BaseException) -> dict[str, Any]:
     """The contract's ``error`` of a failed call, by the library's exception types."""
@@ -66,7 +69,20 @@ class Sends:
             return RawJson(await self._run(m))
         op = uuid.uuid4().hex
         self._ops[op] = asyncio.create_task(self._run(m), name=f"conformance:send:{op}")
+        self._prune()
         return RawJson({"opId": op})
+
+    async def close(self) -> None:
+        """Cancels the asynchronous sends still running and waits for them (at shutdown)."""
+        running = [t for t in self._ops.values() if not t.done()]
+        for t in running:
+            t.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+
+    def _prune(self) -> None:
+        finished = [op for op, t in self._ops.items() if t.done()]  # in start order
+        for op in finished[: max(0, len(finished) - KEPT_OUTCOMES)]:
+            del self._ops[op]
 
     async def outcome(self, m: Outcome) -> RawJson:
         task = self._ops.get(m.op_id)
@@ -74,7 +90,13 @@ class Sends:
             return RawJson({"unknownOp": m.op_id})
         if not task.done():
             await asyncio.wait({task}, timeout=max(0, m.wait_ms) / 1000)
-        return RawJson(task.result() if task.done() else {"pending": True})
+        if not task.done():
+            return RawJson({"pending": True})
+        if task.cancelled():
+            return RawJson(
+                {"result": "error", "error": classify(RuntimeError("the send was cancelled")), "elapsedMs": 0}
+            )
+        return RawJson(task.result())
 
     async def _run(self, m: Send) -> dict[str, Any]:
         started = time.monotonic()

@@ -30,8 +30,9 @@ from conformance_service.messages import (
 from conformance_service.send import Sends
 
 
-def register_handlers(app: App, settings: Settings) -> None:
-    """Registers every type of the contract the service handles so far."""
+def register_handlers(app: App, settings: Settings) -> Sends:
+    """Registers every type of the contract the service handles so far; the asynchronous sends, to close at
+    shutdown."""
     instance = settings.instance
     sends = Sends(app)
 
@@ -99,3 +100,5 @@ def register_handlers(app: App, settings: Settings) -> None:
         target = Missing(m.payload) if m.target == "missing" else Probe(m.payload)
         reply = await app.send(target, RawJson)
         return RelayAnswer(reply.value)
+
+    return sends

@@ -122,8 +122,9 @@ class App:
         type, and returns the answer decoded as ``result`` (None without a ``result``: the answer is not read).
 
         ``routing_key``: commands of a type with the same key go to the same instance. ``timeout`` (seconds) is sent
-        as ``Request.timeout_ms`` (else ``Settings.default_timeout``; without one the hub applies its own), and bounds
-        how long the call waits for a hub: without one, 5 s. ``priority``: ``Request.priority`` (else
+        as ``Request.timeout_ms`` (else ``Settings.default_timeout``; without one, or with ``timeout=0``, the hub
+        applies its own), and bounds how long the call waits for a hub: without one, ``Settings.default_timeout``,
+        else 5 s. ``priority``: ``Request.priority`` (else
         ``Settings.priorities``, else 0). ``retry``: a :class:`RetryPolicy` (else ``Settings.default_retry``;
         ``False``: none).
 

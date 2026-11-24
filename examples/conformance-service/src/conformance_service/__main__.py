@@ -20,7 +20,7 @@ SHUTDOWN_BUDGET = 4.0
 async def main() -> None:
     settings = settings_from_env(os.environ)
     app = App(settings)
-    register_handlers(app, settings)
+    sends = register_handlers(app, settings)
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -29,7 +29,10 @@ async def main() -> None:
     try:
         await stop.wait()
     finally:
-        await app.shutdown(timeout=SHUTDOWN_BUDGET)
+        try:
+            await app.shutdown(timeout=SHUTDOWN_BUDGET)
+        finally:
+            await sends.close()
 
 
 if __name__ == "__main__":

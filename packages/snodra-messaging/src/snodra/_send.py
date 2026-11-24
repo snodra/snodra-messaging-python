@@ -155,13 +155,15 @@ class Sender:
         return self._codec.decode(payload or b"{}", result)
 
     def _chosen(self, timeout: float | None) -> float | None:
+        """The call's timeout: ``timeout``, else ``default_timeout``. 0 (or less) is none, also over the default: the
+        hub decides."""
         if timeout is None:
             return self._settings.default_timeout
         if isinstance(timeout, bool) or not isinstance(timeout, int | float):
             raise TypeError(f"timeout must be a number of seconds or None, got {timeout!r}")
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError(f"timeout must be a positive, finite number of seconds, got {timeout!r}")
-        return float(timeout)
+        if not math.isfinite(timeout):
+            raise ValueError(f"timeout must be a finite number of seconds, got {timeout!r}")
+        return float(timeout) if timeout > 0 else None
 
     def _policy(self, retry: RetryPolicy | Literal[False] | None) -> RetryPolicy | None:
         if retry is None:
@@ -220,7 +222,10 @@ class Sender:
         t = self._timings
         type_ = template.type
         loop = asyncio.get_running_loop()
-        wait = call_deadline(chosen, default=t.default_deadline)
+        # Without a chosen timeout (also a call's explicit 0) the configured default still bounds the wait for a hub.
+        wait = (
+            chosen if chosen is not None else call_deadline(self._settings.default_timeout, default=t.default_deadline)
+        )
         deadline = loop.time() + wait
         request = hub_pb2.Request()
         request.CopyFrom(template)
@@ -276,6 +281,7 @@ class Sender:
             fallback_max=self._timings.fallback_max_timeout,
         )
         request.timeout_ms = timeout_ms
+        # TODO(spec-gap): SG-8
         while stream.buffered >= self._timings.outbound_limit:  # wait for room, within the call's deadline
             room = stream.room()
             try:

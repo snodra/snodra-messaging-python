@@ -3,15 +3,18 @@ does and reports the outcome in the contract's shape."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from conformance_service import send as send_module
 from conformance_service.env import settings_from_env
 from conformance_service.handlers import register_handlers
-from conformance_service.send import classify
+from conformance_service.messages import Outcome, Send
+from conformance_service.send import Sends, classify
 from fakehub import FakeHub, FakeStream, ack, forward, hub_error
 from helpers import SCALED, assert_no_library_tasks
 from snodra import (
@@ -22,6 +25,7 @@ from snodra import (
     LostParts,
     NeverSent,
     OutcomeUnknown,
+    RawJson,
     ReservedHeader,
     RetryPolicy,
 )
@@ -105,6 +109,10 @@ async def _next_request(s: FakeStream) -> hub_pb2.Request:
 
 def _reply(id: str, payload: object) -> hub_pb2.ServerMessage:
     return hub_pb2.ServerMessage(reply=hub_pb2.Reply(request_id=id, payload=json.dumps(payload).encode()))
+
+
+def _value(r: RawJson) -> Any:
+    return r.value
 
 
 def test_classify() -> None:
@@ -296,6 +304,47 @@ async def test_a_send_before_any_ack_is_never_sent(hub: FakeHub) -> None:
         outcome = _payload(reply)
         assert outcome["error"]["kind"] == "never-sent"
         assert 280 <= outcome["elapsedMs"] < 600
+    finally:
+        await app.shutdown(timeout=2.0)
+    assert_no_library_tasks()
+
+
+async def test_old_outcomes_are_forgotten(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(send_module, "KEPT_OUTCOMES", 2)
+    sends = Sends(cast("App", None))
+
+    async def run(m: Send) -> dict[str, Any]:
+        return {"result": "ok", "payload": m.payload, "elapsedMs": 0}
+
+    monkeypatch.setattr(sends, "_run", run)
+    ops: list[str] = []
+    for n in range(4):
+        answer = await sends.send(Send(op="unary", target="probe", payload=n, async_=True))
+        ops.append(_value(answer)["opId"])
+        await asyncio.sleep(0)  # the send runs to its end
+    first = await sends.outcome(Outcome(op_id=ops[0]))
+    assert first.value == {"unknownOp": ops[0]}  # the oldest finished one is forgotten
+    for n in (1, 2, 3):
+        assert _value(await sends.outcome(Outcome(op_id=ops[n])))["payload"] == n
+
+
+async def test_close_cancels_the_sends_still_running(hub: FakeHub) -> None:
+    settings = settings_from_env({"CONFORMANCE_SERVICE_NAME": "conformance-python", "CONFORMANCE_HUBS": hub.address})
+    app = App(settings, _timings=SCALED)
+    sends = register_handlers(app, settings)
+    await app.start()
+    try:
+        s = await hub.next_stream()
+        await s.recv_register()
+        await s.ack(ack("hub-1"))
+        ask = await _ask(s, "conformance.Send", {"op": "unary", "target": "probe", "timeoutMs": 5000, "async": True})
+        _, reply = await _frames(s, ask)
+        op = _payload(reply)["opId"]
+        await _next_request(s)  # the send is in flight, never answered
+        await sends.close()
+        outcome = _value(await sends.outcome(Outcome(op_id=op)))
+        assert (outcome["result"], outcome["error"]["message"]) == ("error", "the send was cancelled")
+        assert not [t for t in asyncio.all_tasks() if t.get_name().startswith("conformance:")]
     finally:
         await app.shutdown(timeout=2.0)
     assert_no_library_tasks()
