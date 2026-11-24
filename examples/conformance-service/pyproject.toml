@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.33,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snodra-conformance-service"
+version = "0.0.0"
+description = "The conformance service of snodra-messaging-python, driven by the Snodra conformance runner; not published."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+classifiers = ["Private :: Do Not Upload"]
+dependencies = ["snodra-messaging"]
+
+[tool.uv.sources]
+snodra-messaging = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/conformance_service"]

@@ -36,6 +36,22 @@ behaviour is the specification. The code carries a `# TODO(spec-gap): SG-<n>` co
 - **Question:** settled: follows the Kotlin library for the texts and the exception mapping; the line-break rule comes
   from the conformance contract.
 
+### SG-2: the forms of a hub address
+
+- **Specification:** `protocol.md` and `writing-a-library.md` name the hubs a library connects to, `host:port` targets
+  and one DNS name whose addresses are the hubs ([Several hubs](https://snodra.damoreira.com/library-authors/protocol/)),
+  but no syntax for the configured addresses.
+- **Kotlin library (the reference):** `host:port` or `static://host:port`, a comma list of them (blank entries and
+  repeats dropped, order kept), or exactly one `dns:///name:port` with a port from 1 to 65535
+  (`snodra-messaging@ecc4207:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/hub/HubTargets.kt:12-50`).
+  Any other prefix is not a form it knows: the entry goes to gRPC as a target, which cannot reach a hub with it.
+- **Other libraries:** the Go and Rust libraries also take `http://host:port` and `https://host:port`, `https://`
+  meaning TLS to that hub with the system's roots when no TLS is configured.
+- **This library:** `snodra/_settings.py` (`hub_targets`, run when `Settings` is built) takes Kotlin's forms and refuses
+  every other `scheme://` entry, `http://` and `https://` included, with a `ConfigurationError` that names
+  `SNODRA_SERVER_ADDRESS` and the accepted forms. TLS is a setting of its own, for every hub.
+- **Question:** settled: follows the Kotlin library; an address Kotlin cannot connect to is refused at startup.
+
 ### SG-7: JSON details of the default payload codec
 
 - **Specification:** `messages.md` (Payloads) fixes camelCase names, UTC ISO 8601 timestamps, string ids, unknown fields

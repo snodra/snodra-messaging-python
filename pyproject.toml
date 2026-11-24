@@ -13,6 +13,7 @@ members = ["packages/*", "examples/*"]
 
 [tool.uv.sources]
 snodra-messaging = { workspace = true }
+snodra-conformance-service = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -25,6 +26,7 @@ dev = [
     "types-protobuf",
     "twine==7.0.0",
     "snodra-messaging",
+    "snodra-conformance-service",
 ]
 gen = ["grpcio-tools==1.85.4"]
 
@@ -42,14 +44,14 @@ select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF", "SIM", "PT"]
 
 [tool.mypy]
 strict = true
-files = ["packages"]
+files = ["packages", "examples"]
 
 [[tool.mypy.overrides]]
 module = "snodra._hubpb.*"
 ignore_errors = true
 
 [tool.pytest.ini_options]
-testpaths = ["packages/snodra-messaging/tests"]
+testpaths = ["packages/snodra-messaging/tests", "examples"]
 pythonpath = ["packages/snodra-messaging/tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

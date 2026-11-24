@@ -1,8 +1,8 @@
 """Identification of this client library."""
 
-from snodra import __version__
+from importlib.metadata import version
 
 
 def client_version() -> str:
     """The `client_version` the library announces to the hub."""
-    return f"snodra-messaging-python/{__version__}"
+    return f"snodra-messaging-python/{version('snodra-messaging')}"

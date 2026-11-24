@@ -1,0 +1,302 @@
+"""One hub stream: the handshake, heartbeats, the silent hub, reconnect, refusals.
+
+Time comes from the fake hub: the heartbeat interval of its ``RegisterAck`` and the scaled timings of
+``helpers.SCALED``. Every bound below is the rule's, with room for the connection set-up of a new stream.
+"""
+
+import itertools
+import logging
+import time
+from dataclasses import replace
+
+import grpc
+import pytest
+from fakehub import FakeHub, FakeStream, ack
+from helpers import SCALED, eventually, start_app, within
+from snodra import Rejection
+from snodra._hubpb import hub_pb2
+from snodra._meta import client_version
+
+SETUP = 0.05
+"""Room for a new stream's connection set-up (a new channel per attempt) on top of a wait."""
+
+QUIET_BEFORE_ACK = replace(SCALED, heartbeat_before_ack=5.0)
+"""No heartbeat tick before the ack: every heartbeat after the first one follows the ack."""
+
+
+def _kind(m: hub_pb2.ClientMessage) -> str:
+    return m.WhichOneof("message") or "empty"
+
+
+async def _opened(hub: FakeHub) -> FakeStream:
+    """The next stream, its Register and Heartbeat read."""
+    s = await hub.next_stream()
+    assert _kind(await s.recv()) == "register"
+    assert _kind(await s.recv()) == "heartbeat"
+    return s
+
+
+async def _end(s: FakeStream, within: float = 5.0) -> float:
+    """Reads the stream to its end; the time (monotonic) the end came."""
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            await s.recv(within=max(0.0, deadline - time.monotonic()))
+        except AssertionError as e:
+            if "stream ended" not in str(e):
+                raise
+            return time.monotonic()
+
+
+def _after(s: FakeStream, t: float) -> int:
+    """The heartbeats that arrived after t."""
+    return sum(1 for h in s.heartbeats if h > t)
+
+
+async def test_every_stream_opens_with_register_then_heartbeat(hub: FakeHub) -> None:
+    await start_app(hub, max_concurrent=8, tags={"zone": "a"})
+    s = await hub.next_stream()
+    first = (await s.recv()).register
+    assert (first.service_name, first.instance_id, first.initial_permits, first.load_factor) == (
+        "orders-service",
+        "i-1",
+        8,
+        100,
+    )
+    assert first.client_version == client_version()
+    assert first.tags["zone"] == "a"
+    assert _kind(await s.recv()) == "heartbeat"
+    await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    s2 = await hub.next_stream()
+    assert (await s2.recv()).register == first  # identical Register
+    assert _kind(await s2.recv()) == "heartbeat"
+
+
+async def test_registered_only_on_the_ack(hub: FakeHub) -> None:
+    app = await start_app(hub)
+    s = await hub.next_stream()
+    s.echo_heartbeats(True)  # echoes before the ack: they confirm nothing
+    await s.recv_register()
+    await s.nothing(0.15)  # the first heartbeat and the one 0.1 s later, both echoed
+    assert len(s.heartbeats) >= 2
+    assert app.hub_ids() == []
+    with pytest.raises(TimeoutError):
+        await app.ready(0.01)
+    await s.ack(ack("hub-1"))
+    await app.ready(1.0)
+    assert app.hub_ids() == ["hub-1"]
+
+
+async def test_an_empty_hub_id_is_the_address(hub: FakeHub) -> None:
+    app = await start_app(hub)
+    s = await _opened(hub)
+    await s.ack(ack(""))
+    await app.ready(1.0)
+    assert app.hub_ids() == [hub.address]
+
+
+async def test_no_ack_within_the_handshake_timeout_reopens(hub: FakeHub) -> None:
+    await start_app(hub)
+    s = await hub.next_stream()
+    opened = time.monotonic()
+    s.echo_heartbeats(True)
+    await s.recv_register()
+    await hub.next_stream(within=2.0)
+    within(time.monotonic() - opened, 0.3, 0.3 + 0.25)
+
+
+async def test_heartbeats_at_the_ack_interval(hub: FakeHub) -> None:
+    await start_app(hub, _timings=QUIET_BEFORE_ACK)
+    s = await _opened(hub)
+    acked = time.monotonic()
+    await s.ack(ack("hub-1", interval_ms=100))
+    while _after(s, acked) < 11:  # about 1 s
+        await s.recv()
+    beats = [h for h in s.heartbeats if h > acked]
+    gaps = [b - a for a, b in itertools.pairwise(beats)]
+    within(sum(gaps) / len(gaps), 0.08, 0.12)
+    assert max(gaps) <= 0.15, gaps
+    within(beats[0] - acked, 0.09, 0.15)  # the first tick, one interval after the ack
+
+
+async def test_a_silent_hub_is_dropped_between_three_and_four_intervals(hub: FakeHub) -> None:
+    await start_app(hub, _timings=QUIET_BEFORE_ACK)
+    s = await _opened(hub)
+    s.echo_heartbeats(False)  # none from now on, the first heartbeat's included: the ack is the last sign of life
+    acked = time.monotonic()
+    await s.ack(ack("hub-1", interval_ms=100))
+    ended = await _end(s)
+    within(ended - acked, 0.3, 0.4 + 0.05)
+    assert _after(s, acked) == 3  # the dropped stream carried exactly three heartbeats after the ack
+    assert (await hub.next_stream()).index == 1  # and a new one comes
+
+
+async def test_an_echo_restarts_the_silence(hub: FakeHub) -> None:
+    await start_app(hub, _timings=QUIET_BEFORE_ACK)
+    s = await _opened(hub)
+    s.echo_heartbeats(False)  # none from now on, the first heartbeat's included: the ack is the last sign of life
+    acked = time.monotonic()
+    await s.ack(ack("hub-1", interval_ms=100))
+    await eventually(lambda: len(s.heartbeats) >= 3)  # the first heartbeat and two ticks, unanswered
+    s.echo_heartbeats(True)
+    await eventually(lambda: len(s.heartbeats) >= 4)  # the third tick, echoed: the hub is alive
+    s.echo_heartbeats(False)
+    last_echo = s.heartbeats[3]
+    ended = await _end(s)
+    within(ended - last_echo, 0.3, 0.4 + 0.05)
+    assert ended - acked > 0.6
+
+
+async def test_a_heartbeat_follows_every_later_register_and_counts(hub: FakeHub) -> None:
+    app = await start_app(hub, _timings=QUIET_BEFORE_ACK)
+    s = await _opened(hub)
+    s.echo_heartbeats(False)  # none from now on, the first heartbeat's included: the ack is the last sign of life
+    acked = time.monotonic()
+    await s.ack(ack("hub-1", interval_ms=200))
+    await app.ready(1.0)
+    app._connections()[0].reregister(empty=False)
+    later = await s.recv()
+    assert _kind(later) == "register"
+    assert later.register.service_name == "orders-service"
+    assert _kind(await s.recv()) == "heartbeat"
+    ended = await _end(s)
+    # the third tick (600 ms) drops the stream, not the fourth (800 ms): the extra heartbeat counted
+    within(ended - acked, 0.6, 0.7)
+    assert _after(s, acked) == 3
+
+
+async def test_no_silence_check_before_the_ack(hub: FakeHub) -> None:
+    # Heartbeats every 50 ms before the ack, none echoed: a silence check would drop the stream at about 0.2 s.
+    await start_app(hub, _timings=replace(SCALED, heartbeat_before_ack=0.05))
+    s = await hub.next_stream()
+    opened = time.monotonic()
+    s.echo_heartbeats(False)
+    ended = await _end(s)
+    within(ended - opened, 0.3 - 0.05, 0.3 + 0.25)  # the handshake timeout ends it
+    assert len(s.heartbeats) >= 5
+
+
+async def test_reconnects_after_the_hub_went_away(hub: FakeHub) -> None:
+    app = await start_app(hub)
+    s = await hub.next_stream()
+    first = await s.recv_register()
+    await s.ack(ack("hub-1"))
+    await app.ready(1.0)
+    await hub.down()
+    await eventually(lambda: app.hub_ids() == [])
+    await hub.up()
+    s2 = await hub.next_stream(within=2.0)
+    assert await s2.recv_register() == first
+    await s2.ack(ack("hub-1"))
+    await app.ready(1.0)
+    assert app.hub_ids() == ["hub-1"]
+
+
+async def test_the_backoff_resets_after_an_ack(hub: FakeHub) -> None:
+    app = await start_app(hub)
+    for _ in range(2):  # two closures before any ack: the next wait is 0.2 s
+        s = await _opened(hub)
+        await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    s = await _opened(hub)
+    await s.ack(ack("hub-1"))
+    await app.ready(1.0)
+    await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    closed = time.monotonic()
+    await hub.next_stream()
+    within(time.monotonic() - closed, 0.8 * 0.05, 1.2 * 0.05 + 0.03)
+
+
+async def test_unavailable_is_an_ordinary_closure(hub: FakeHub) -> None:
+    app = await start_app(hub)
+    s = await _opened(hub)
+    for wait in (0.05, 0.1, 0.2):  # doubling before any ack, up to the maximum
+        await s.close(grpc.StatusCode.UNAVAILABLE, "jwks not loaded yet")
+        closed = time.monotonic()
+        s = await _opened(hub)
+        within(time.monotonic() - closed, 0.8 * wait, min(1.2 * wait, 0.2) + SETUP)
+    assert app.rejection is None
+
+
+REFUSAL = "type orders.PlaceOrder is owned by billing-service"
+
+
+async def test_a_refused_register_waits_the_cap_and_is_exposed(hub: FakeHub) -> None:
+    app = await start_app(hub)
+    s = await _opened(hub)
+    for code in (
+        grpc.StatusCode.ALREADY_EXISTS,
+        grpc.StatusCode.INVALID_ARGUMENT,
+        grpc.StatusCode.UNAUTHENTICATED,
+        grpc.StatusCode.PERMISSION_DENIED,
+    ):
+        before = time.time()
+        await s.close(code, REFUSAL)
+        closed = time.monotonic()
+        s = await _opened(hub)
+        within(time.monotonic() - closed, 0.8 * 0.2, 0.2 + SETUP)
+        rejection = app.rejection
+        assert rejection is not None
+        assert rejection == Rejection(hub=hub.address, code=code.name, message=REFUSAL, at=rejection.at)
+        within(rejection.at, before, time.time())
+
+    # A refusal code on an acknowledged stream is a refusal too.
+    await s.ack(ack("hub-1"))
+    await app.ready(1.0)
+    await s.close(grpc.StatusCode.PERMISSION_DENIED, "access revoked")
+    closed = time.monotonic()
+    s = await _opened(hub)
+    within(time.monotonic() - closed, 0.8 * 0.2, 0.2 + SETUP)
+    revoked = app.rejection
+    assert revoked is not None
+    assert (revoked.hub, revoked.code, revoked.message) == (hub.address, "PERMISSION_DENIED", "access revoked")
+
+    # A later accepted Register leaves the latest refusal as it was.
+    await s.ack(ack("hub-1"))
+    await app.ready(1.0)
+    assert app.rejection == revoked
+
+
+async def test_a_refusal_is_logged_once_per_distinct_message(hub: FakeHub, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger="snodra")
+    await start_app(hub)
+    s = await _opened(hub)
+    for code, message in (
+        (grpc.StatusCode.ALREADY_EXISTS, REFUSAL),
+        (grpc.StatusCode.ALREADY_EXISTS, REFUSAL),
+        (grpc.StatusCode.ALREADY_EXISTS, "type orders.GetOrder is owned by billing-service"),
+    ):
+        await s.close(code, message)
+        s = await _opened(hub)
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR and r.name.startswith("snodra")]
+    assert len(errors) == 2, errors
+    assert REFUSAL in errors[0]
+    assert "orders.GetOrder" in errors[1]
+    assert all("ALREADY_EXISTS" in e for e in errors)
+
+
+async def test_the_ack_interval_drives_the_heartbeats_of_its_stream_only(hub: FakeHub) -> None:
+    # A new stream starts again from the heartbeat before the ack, not from the last ack's interval.
+    await start_app(hub, _timings=replace(SCALED, heartbeat_before_ack=0.05))
+    s = await _opened(hub)
+    await s.ack(ack("hub-1", interval_ms=10_000))
+    await s.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    s = await _opened(hub)
+    assert _kind(await s.recv(within=0.5)) == "heartbeat"
+
+
+async def test_hub_ids_names_every_acknowledged_hub_sorted(hub: FakeHub, hub2: FakeHub) -> None:
+    app = await start_app([hub, hub2])
+    s1, s2 = await _opened(hub), await _opened(hub2)
+    await s1.ack(ack("hub-b"))
+    await s2.ack(ack("hub-a"))
+    await eventually(lambda: len(app.hub_ids()) == 2)
+    assert app.hub_ids() == ["hub-a", "hub-b"]
+    await s1.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    await eventually(lambda: app.hub_ids() == ["hub-a"])
+
+
+async def test_one_connection_per_address(hub: FakeHub) -> None:
+    app = await start_app(hub, hubs=(hub.address, f"static://{hub.address}"))
+    assert len(app._connections()) == 1
+    await _opened(hub)
+    await hub.no_stream_within(0.1)

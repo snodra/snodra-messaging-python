@@ -4,6 +4,14 @@ from collections.abc import AsyncIterator
 
 import pytest
 from fakehub import FakeHub
+from helpers import stop_apps
+
+
+@pytest.fixture(autouse=True)
+async def _stop_apps() -> AsyncIterator[None]:
+    """Shuts down every app a test started (``helpers.start_app``), and checks that no library task is left."""
+    yield
+    await stop_apps()
 
 
 @pytest.fixture

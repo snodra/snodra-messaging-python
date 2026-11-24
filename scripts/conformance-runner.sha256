@@ -1,0 +1,8 @@
+# sha256 of the snodra-conformance release archives this repository pins, one per platform, in the
+# format of `sha256sum`. scripts/conformance.sh checks every download against it: change the runner
+# version there and these lines here together.
+#
+# The runner version this library is checked with (v0.3.0, the contract of snodra-conformance main)
+# is not released yet, so no archive is pinned: until it is, build the runner from
+# https://github.com/snodra/snodra-conformance and run scripts/conformance.sh with
+# SNODRA_CONFORMANCE_BIN=<path to the snodra-conformance binary>.

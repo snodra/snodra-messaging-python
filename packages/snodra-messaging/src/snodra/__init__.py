@@ -2,7 +2,9 @@
 
 from importlib.metadata import version
 
+from snodra._app import App
 from snodra._codec import Codec, JsonCodec, RawJson
+from snodra._connection import Rejection
 from snodra._errors import (
     ConfigurationError,
     DecodeError,
@@ -20,10 +22,12 @@ from snodra._errors import (
     Unauthenticated,
 )
 from snodra._messages import message_type
+from snodra._settings import Settings
 
 __version__: str = version("snodra-messaging")
 
 __all__ = [
+    "App",
     "Codec",
     "ConfigurationError",
     "DecodeError",
@@ -38,7 +42,9 @@ __all__ = [
     "PermissionDenied",
     "RawJson",
     "RegistrationClosed",
+    "Rejection",
     "ReservedHeader",
+    "Settings",
     "SnodraError",
     "Unauthenticated",
     "__version__",
