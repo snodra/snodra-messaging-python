@@ -13,6 +13,7 @@ from conformance_service.messages import (
     Echo,
     EchoAnswer,
     EchoQuery,
+    Emit,
     Fail,
     Guarded,
     GuardedAnswer,
@@ -32,6 +33,9 @@ from conformance_service.messages import (
     StrictAnswer,
     View,
     ViewAnswer,
+    Watch,
+    WatchInitial,
+    WatchUpdate,
 )
 from conformance_service.send import Sends
 
@@ -83,6 +87,24 @@ def register_handlers(app: App, settings: Settings) -> Sends:
                 await asyncio.sleep(m.delay_ms / 1000)
             yield {"n": n}
 
+    @app.subscription_handler(update=WatchUpdate)
+    async def watch_updates(m: Watch) -> WatchInitial:
+        return WatchInitial(m.topic, 0, instance)
+
+    @app.command_handler
+    async def on_emit(m: Emit) -> None:
+        # As an application does: the emitter of its subscription handler, on the event loop.
+        def matches(w: Watch) -> bool:
+            return w.topic == m.topic
+
+        for value in m.values:
+            watch_updates.emit(matches, WatchUpdate(m.topic, value))
+        if m.fail is not None:
+            watch_updates.fail(matches, m.fail)
+        elif m.complete:
+            watch_updates.complete(matches)
+        return None
+
     @app.command_handler
     async def on_fail(m: Fail) -> None:
         raise HandlerError(m.message, details=m.details)
@@ -106,7 +128,7 @@ def register_handlers(app: App, settings: Settings) -> Sends:
             instance_id=instance,
             hub_ids=app.hub_ids(),
             last_rejection=None if rejection is None else f"{rejection.code}: {rejection.message}",
-            subscriptions_served=0,
+            subscriptions_served=app.subscriptions_served,
             retry=settings.default_retry is not None,
         )
 

@@ -29,9 +29,11 @@ from conformance_service.messages import (
     Probe,
     ProbeQuery,
     ProbeStream,
+    ProbeWatch,
     Send,
     SharedQuery,
     Stream,
+    Watch,
 )
 
 _UNARY: dict[str, tuple[type[RawJson], bool]] = {
@@ -49,6 +51,12 @@ _STREAMED: dict[str, type] = {
     "stream": Stream,
 }
 """The streaming targets: the message class of each (its items are read as ``RawJson``)."""
+
+_SUBSCRIBED: dict[str, type] = {
+    "probe-watch": ProbeWatch,
+    "watch": Watch,
+}
+"""The subscription targets: the request class of each (its initial result and updates are read as ``RawJson``)."""
 
 _GATHERED: dict[str, type[RawJson]] = {
     "probe-query": ProbeQuery,
@@ -133,7 +141,7 @@ class Sends:
         elif m.op == "stream":
             out = await self._stream(m)
         elif m.op == "subscribe":
-            out = _unsupported(f"op {m.op} is not supported by this service yet")
+            out = await self._subscribe(m)
         else:
             out = _unsupported(f"op {m.op} is not a contract op")
         out["elapsedMs"] = round((time.monotonic() - started) * 1000)
@@ -181,6 +189,40 @@ class Sends:
                     if m.read is not None and len(items) >= m.read:
                         stopped = True
                         break
+        except Exception as e:
+            return {"result": "error", "items": items, "error": classify(e)}
+        return {"result": "ok", "items": items, "end": "stopped" if stopped else "completed"}
+
+    async def _subscribe(self, m: Send) -> dict[str, Any]:
+        """A subscription query of the target, read as the contract's outcome: the initial result and the updates in
+        order, and whether the subscription completed or the caller stopped after ``read`` items (which cancels it)."""
+        cls = _SUBSCRIBED.get(m.target)
+        if cls is None:
+            return _unsupported(f"target {m.target} is not a subscription target of this service")
+        items: list[Any] = []
+        stopped = False
+        try:
+            options = _options(m)
+            del options["routing_key"]  # a subscription goes to every target: unkeyed
+            async with self._app.subscribe(
+                cls(m.payload),
+                RawJson,
+                RawJson,
+                initial_credit=m.initial_credit,
+                max_results=m.max_results or 0,
+                **options,
+            ) as sub:
+                items.append(sub.initial.value)
+                if m.read is not None and len(items) >= m.read:
+                    stopped = True
+                else:
+                    async for update in sub:
+                        items.append(update.value)
+                        if m.read_delay_ms:
+                            await asyncio.sleep(m.read_delay_ms / 1000)
+                        if m.read is not None and len(items) >= m.read:
+                            stopped = True
+                            break
         except Exception as e:
             return {"result": "error", "items": items, "error": classify(e)}
         return {"result": "ok", "items": items, "end": "stopped" if stopped else "completed"}

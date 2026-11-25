@@ -20,6 +20,7 @@ from snodra._identity import AUTHORIZATION, Caller, IdentityResolver
 from snodra._permits import PermitLedger
 from snodra._registry import Handler, Kind, Registry
 from snodra._stream_handler import StreamCredit, end_of_stream, failure, serve
+from snodra._subscription_handler import ServedSubscription, Subscriptions
 from snodra._timings import Timings
 
 log = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class Dispatcher:
         identity: IdentityResolver | None = None,
         *,
         stream_credit_timeout: float = 600.0,
+        max_subscriptions: int = 1024,
     ) -> None:
         self._registry = registry
         self._codec = codec
@@ -97,16 +99,29 @@ class Dispatcher:
         self._stream_credit_timeout = stream_credit_timeout
         self._running: dict[tuple[object, str], _Running] = {}
         self._tasks: dict[asyncio.Task[None], _Running] = {}
+        self._subscriptions = Subscriptions(max_subscriptions)
+        self._subscription_tasks: set[asyncio.Task[None]] = set()
+        """The admissions of subscription targets still running: no permit, no handler slot."""
         self._timers: set[asyncio.Task[None]] = set()
         self._closed = False
         """Set by :meth:`abandon`: no permit timer is armed any more (the shutdown is under way)."""
+
+    @property
+    def subscriptions(self) -> Subscriptions:
+        """The subscription targets this instance serves, for the emitters of its subscription handlers."""
+        return self._subscriptions
+
+    @property
+    def subscriptions_served(self) -> int:
+        """How many subscription targets this instance serves now."""
+        return len(self._subscriptions)
 
     # Called by the stream's reader: never raises, runs no user code, never waits.
 
     def on_request(self, arrival: Arrival, request: hub_pb2.Request) -> None:
         """A ``ServerMessage.request``, also before the stream's ``RegisterAck``."""
         if request.mode == hub_pb2.SUBSCRIPTION:
-            self._refuse_subscription(arrival, request)  # outside flow control: no permit
+            self._open_subscription(arrival, request)  # outside flow control: no permit
             return
         arrival.permits.arrived()
         key = (arrival, request.id)
@@ -132,14 +147,28 @@ class Dispatcher:
 
     def on_cancel(self, arrival: Arrival, cancel: hub_pb2.Cancel) -> None:
         """The hub gave up on a request this instance serves: its handler is cancelled and nothing is answered; a
-        ``Cancel`` for a request that already ended is ignored."""
+        ``Cancel`` for a request that already ended is ignored. A subscription target it names is removed, nothing is
+        written for it, and its admission stops."""
         run = self._running.pop((arrival, cancel.request_id), None)
         if run is None or run.task is None:
             log.debug("Cancel for request %s ignored: not running here (%s)", cancel.request_id, cancel.reason)
-            return
-        log.debug("The hub cancelled request %s (%s): %s", cancel.request_id, run.label, cancel.reason)
-        run.cancelled = True
-        run.task.cancel()
+        else:
+            log.debug("The hub cancelled request %s (%s): %s", cancel.request_id, run.label, cancel.reason)
+            run.cancelled = True
+            run.task.cancel()
+        if self._subscriptions.cancel(arrival, cancel.request_id):
+            log.debug("The hub cancelled subscription %s (%s)", cancel.request_id, cancel.reason)
+
+    def on_stream_lost(self, arrival: Arrival) -> None:
+        """The stream arrival is gone: its streaming handlers are cancelled (their flows would never move again) and its
+        subscriptions are removed, since the hub forgot them with the session. A unary handler may run on, its reply
+        dropped."""
+        for (stream, _), run in list(self._running.items()):
+            if stream is arrival and run.credit is not None and run.task is not None:
+                run.task.cancel()
+        dropped = self._subscriptions.lost(arrival)
+        if dropped:
+            log.info("%d subscription(s) of a lost hub stream dropped", dropped)
 
     # Shutdown.
 
@@ -149,15 +178,19 @@ class Dispatcher:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         try:
-            while self._tasks and (left := deadline - loop.time()) > 0:
-                await asyncio.wait(set(self._tasks), timeout=left)
+            while left := list(self._tasks) + list(self._subscription_tasks):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.wait(left, timeout=remaining)
         finally:
             self.abandon()
 
     def abandon(self) -> None:
         """Cancels every handler still running, without waiting for it, and the permit timers; one warning names the
         handlers it cancels. From then on no permit timer is armed: a handler it cancels ends after it, and its
-        permit, when still due, is written at once or dropped with its stream."""
+        permit, when still due, is written at once or dropped with its stream. The subscriptions it still serves are
+        dropped without writing anything."""
         self._closed = True
         for timer in list(self._timers):
             timer.cancel()
@@ -166,11 +199,19 @@ class Dispatcher:
             run.abandoned = True
             if run.task is not None:
                 run.task.cancel()
+        for task in list(self._subscription_tasks):
+            task.cancel()
+        self._subscriptions.close_all()
         if left:
             names = ", ".join(f"{r.label} ({r.request.type} {r.request.id})" for r in left)
             log.warning(
                 "%d handler(s) still running at the end of the drain, cancelled and not awaited: %s", len(left), names
             )
+
+    def end_subscriptions(self) -> int:
+        """Ends every served subscription with a clean ``ReplyEnd`` (the shutdown, before the handlers drain): its
+        subscriber hears that this target completed once every other target has ended too. Returns how many."""
+        return self._subscriptions.end_all()
 
     # A request's task.
 
@@ -280,7 +321,16 @@ class Dispatcher:
         anonymous caller before the payload is decoded, then the payload is decoded, then the guard's rule applies.
         The handler runs in the calling task, with ``current_message()`` and ``current_caller()`` set for it only.
         Every outcome is a message; a cancellation of the calling task is raised."""
-        if handler.stream:
+        if handler.subscription:
+            # A subscription handler's type is served in mode SUBSCRIPTION only; its one unary request is the hub's
+            # initial request, whose id ends "#0".
+            if not request.id.endswith("#0"):
+                return _error_reply(
+                    request.id,
+                    ErrorCode.INVALID_REQUEST,
+                    f"{handler.type} is a subscription query: send it with App.subscribe (mode SUBSCRIPTION)",
+                )
+        elif handler.stream:
             # A streaming handler's type is served in mode STREAMING only: a unary request of it (a point query this
             # instance answers itself, or one the hub forwarded) is a contract mismatch.
             return _error_reply(
@@ -395,17 +445,77 @@ class Dispatcher:
         if n > 0:
             arrival.put(hub_pb2.ClientMessage(permits=hub_pb2.Permits(count=n)))
 
-    # The modes that have no handler here yet.
+    # Subscription targets: registered when the request is read, admitted in a task of their own.
 
-    def _refuse_subscription(self, arrival: Arrival, request: hub_pb2.Request) -> None:
-        query = self._registry.find("query", request.type)
-        if query is None:
-            message = f"no subscription handler for {request.type} on this instance"
-        else:
-            message = (
-                f"handler {query.label} for {request.type} is not a subscription query handler (it answers mode UNARY)"
+    def _open_subscription(self, arrival: Arrival, request: hub_pb2.Request) -> None:
+        """A ``SUBSCRIPTION`` request (``<id>#n``): registered here, in the reader, before the admission runs, so that
+        an update emitted after the subscription's initial request was read reaches it. The duplicate id and the
+        instance's limit are decided here; the token check, the handler lookup and the payload follow in a task."""
+        handler = self._registry.find("query", request.type)
+        query_type = type(None) if handler is None else handler.message
+        opened = self._subscriptions.open(arrival, request, query_type)
+        if isinstance(opened, hub_pb2.Error):
+            self._end(arrival, request.id, ErrorCode(opened.code), opened.message)
+            return
+        task = asyncio.create_task(self._admit_subscription(opened, request), name=f"snodra:subscription:{request.id}")
+        opened.task = task
+        self._subscription_tasks.add(task)
+        task.add_done_callback(self._subscription_ended)
+
+    async def _admit_subscription(self, served: ServedSubscription, request: hub_pb2.Request) -> None:
+        """The subscription's admission: the forwarded token, then the handler that owns the type in mode
+        ``SUBSCRIPTION``, then the guards and the payload. A refusal ends it with ``ReplyEnd{error}``; an admitted one
+        goes live and what was held is written."""
+        try:
+            await self._admit_or_refuse(served, request)
+        except asyncio.CancelledError:
+            raise  # a hub's Cancel, a lost stream or the shutdown: nothing is written
+        except Exception as e:  # a bug of the admission is the subscription's failure, never an unanswered target
+            log.warning("Admitting subscription %s (%s) failed", request.id, request.type, exc_info=True)
+            self._subscriptions.refuse(served, error_to_wire(request.id, e, self._codec))
+
+    async def _admit_or_refuse(self, served: ServedSubscription, request: hub_pb2.Request) -> None:
+        id_ = request.id
+        try:
+            caller = await self._identity.resolve(request.headers.get(AUTHORIZATION))
+        except Unauthenticated as e:
+            log.debug("Refused subscription %s: %s", id_, e)
+            self._subscriptions.refuse(served, failure(id_, ErrorCode.UNAUTHENTICATED, str(e)))
+            return
+        except Exception:
+            log.warning("Checking the token of subscription %s (%s) failed", id_, request.type, exc_info=True)
+            self._subscriptions.refuse(served, failure(id_, ErrorCode.UNAUTHENTICATED, "invalid token"))
+            return
+        # A subscription target looks for the query handler, whatever its kind (the hub's id scheme only).
+        handler = self._registry.find("query", request.type)
+        if handler is None:
+            self._subscriptions.refuse(
+                served,
+                failure(id_, ErrorCode.INVALID_REQUEST, f"no subscription handler for {request.type} on this instance"),
             )
-        self._end(arrival, request.id, ErrorCode.INVALID_REQUEST, message)
+            return
+        if not handler.subscription:
+            self._subscriptions.refuse(
+                served,
+                failure(
+                    id_,
+                    ErrorCode.INVALID_REQUEST,
+                    f"handler {handler.label} for {request.type} is not a subscription query handler "
+                    "(it answers mode UNARY)",
+                ),
+            )
+            return
+        message, refused = self._prepare(handler, request, caller)
+        if refused is not None:
+            assert refused.HasField("error")  # _prepare answers a refusal with an Error
+            self._subscriptions.refuse(served, refused.error)
+            return
+        self._subscriptions.activate(served, message)
+
+    def _subscription_ended(self, task: asyncio.Task[None]) -> None:
+        self._subscription_tasks.discard(task)
+        if not task.cancelled() and (e := task.exception()) is not None:
+            log.error("Serving a subscription target failed", exc_info=e)
 
     @staticmethod
     def _end(arrival: Arrival, request_id: str, code: ErrorCode, message: str) -> None:

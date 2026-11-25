@@ -368,6 +368,7 @@ class HubConnection:
         on_cancel: Callable[[_Stream, hub_pb2.Cancel], None] | None = None,
         on_flow: Callable[[_Stream, hub_pb2.Flow], None] | None = None,
         on_answer: Callable[[_Stream, hub_pb2.ServerMessage], None] | None = None,
+        on_lost: Callable[[_Stream], None] | None = None,
         credentials: HubCredentials | None = None,
         tls: _tls.TLSConfig | None = None,
         certificates: _tls.Certificates | None = None,
@@ -382,6 +383,7 @@ class HubConnection:
         self._on_cancel = on_cancel
         self._on_flow = on_flow
         self._on_answer = on_answer
+        self._on_lost = on_lost
         self._gate: asyncio.Event | None = None  # the writer waits on it before writing a frame (a test hook)
         self._options = [
             ("grpc.keepalive_time_ms", round(timings.keepalive_time * 1000)),
@@ -746,6 +748,11 @@ class HubConnection:
             if self._stream is stream:
                 self._stream = None
             stream.finish()
+            if self._on_lost is not None:
+                try:
+                    self._on_lost(stream)  # its streaming handlers and subscriptions ended here: the hub forgot them
+                except Exception:
+                    log.exception("Hub stream to %s: ending what it carried failed", self.address)
             if stream.ack is not None:
                 self._on_change()
             for t in tasks:

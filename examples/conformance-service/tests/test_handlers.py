@@ -71,6 +71,7 @@ async def test_the_register_lists_the_contracts_unary_types(hub: FakeHub, servic
     assert list(r.command_types) == [  # no conformance.Guarded without a JWKS
         "conformance.Done",
         "conformance.Echo",
+        "conformance.Emit",
         "conformance.Fail",
         "conformance.Relay",
         "conformance.Send",
@@ -83,8 +84,104 @@ async def test_the_register_lists_the_contracts_unary_types(hub: FakeHub, servic
         "conformance.SleepQuery",
         "conformance.Stream",
         "conformance.View",
+        "conformance.Watch",
     ]
     assert list(r.shared_query_types) == ["conformance.SharedQuery"]
+    assert list(r.subscription_query_types) == ["conformance.Watch"]
+
+
+async def _frames_until(s: FakeStream, reply_id: str) -> tuple[list[hub_pb2.ReplyPart], list[hub_pb2.ReplyEnd]]:
+    """Every part and end written before the reply to reply_id (Permits and the like are skipped)."""
+    parts: list[hub_pb2.ReplyPart] = []
+    ends: list[hub_pb2.ReplyEnd] = []
+    while True:
+        m = await s.recv()
+        match m.WhichOneof("message"):
+            case "part":
+                parts.append(m.part)
+            case "end":
+                ends.append(m.end)
+            case "reply" if m.reply.request_id == reply_id:
+                return parts, ends
+
+
+async def _send(s: FakeStream, id: str, type: str, payload: object, *, kind: int = hub_pb2.COMMAND) -> str:
+    await s.send(forward(hub_pb2.Request(id=id, kind=kind, type=type, payload=json.dumps(payload).encode())))  # type: ignore[arg-type]
+    return id
+
+
+async def test_watch_emits_updates_then_ends(hub: FakeHub, service: App) -> None:
+    s = await _stream(hub)
+    # A subscription target, and its initial result as the hub's separate unary request ending in #0.
+    await s.send(
+        forward(
+            hub_pb2.Request(
+                id="watch-1#1",
+                kind=hub_pb2.QUERY,
+                type="conformance.Watch",
+                payload=b'{"topic":"a"}',
+                mode=hub_pb2.SUBSCRIPTION,
+                initial_credit=1,
+            )
+        )
+    )
+    await _send(s, "watch-1#0", "conformance.Watch", {"topic": "a"}, kind=hub_pb2.QUERY)
+    initial = await s.recv_reply()
+    assert (initial.request_id, json.loads(initial.payload)) == (
+        "watch-1#0",
+        {"topic": "a", "value": 0, "instanceId": "i-1"},
+    )
+    assert service.subscriptions_served == 1
+
+    emit = await _send(s, "emit-1", "conformance.Emit", {"topic": "a", "values": [1, 2]})
+    parts, ends = await _frames_until(s, emit)
+    assert not ends
+    assert [(p.request_id, p.seq) for p in parts] == [("watch-1#1", 1), ("watch-1#1", 2)]
+    assert [json.loads(p.payload)["value"] for p in parts] == [1, 2]
+
+    emit = await _send(s, "emit-2", "conformance.Emit", {"topic": "a", "complete": True})
+    _, ends = await _frames_until(s, emit)
+    assert [(e.request_id, e.parts, e.HasField("error")) for e in ends] == [("watch-1#1", 2, False)]
+    assert service.subscriptions_served == 0
+
+    # Another subscription fails with the emitter's failure: HANDLER_ERROR with the text.
+    await s.send(
+        forward(
+            hub_pb2.Request(
+                id="watch-2#1",
+                kind=hub_pb2.QUERY,
+                type="conformance.Watch",
+                payload=b'{"topic":"b"}',
+                mode=hub_pb2.SUBSCRIPTION,
+                initial_credit=1,
+            )
+        )
+    )
+    emit = await _send(s, "emit-3", "conformance.Emit", {"topic": "b", "fail": "the feed closed"})
+    _, ends = await _frames_until(s, emit)
+    assert [(e.request_id, e.error.code, e.error.message) for e in ends] == [
+        ("watch-2#1", hub_pb2.HANDLER_ERROR, "the feed closed")
+    ]
+
+
+async def test_view_reports_the_subscriptions_served(hub: FakeHub, service: App) -> None:
+    s = await _stream(hub)
+    for id, topic in (("watch-1#1", "x"), ("watch-2#1", "y")):
+        await s.send(
+            forward(
+                hub_pb2.Request(
+                    id=id,
+                    kind=hub_pb2.QUERY,
+                    type="conformance.Watch",
+                    payload=json.dumps({"topic": topic}).encode(),
+                    mode=hub_pb2.SUBSCRIPTION,
+                    initial_credit=1,
+                )
+            )
+        )
+    view = _answer(await _ask(s, "conformance.View", {}, kind=hub_pb2.QUERY))
+    assert isinstance(view, dict)
+    assert view["subscriptionsServed"] == 2
 
 
 async def test_stream_answers_count_items_one_part_at_a_time(hub: FakeHub, service: App) -> None:

@@ -23,20 +23,25 @@ from snodra._retry import RetryPolicy
 from snodra._send import Sender
 from snodra._settings import Settings, hub_targets
 from snodra._stream_client import Stream, stream
+from snodra._subscribe import Subscription, subscribe
+from snodra._subscription_handler import Updates
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
 
 H = TypeVar("H", bound=Callable[..., Awaitable[Any]])
+IN = TypeVar("IN")
+Q = TypeVar("Q")
 R = TypeVar("R")
 S = TypeVar("S", bound=Callable[..., AsyncIterator[Any]])
+U = TypeVar("U")
 
 
 class App:
     """One service instance: its handlers and its hub connections.
 
-    Handlers are registered before ``start`` (``command_handler``, ``query_handler``); ``start`` opens a connection
-    per hub; ``shutdown`` leaves the hubs in order
+    Handlers are registered before ``start`` (``command_handler``, ``query_handler``, ``stream_handler``,
+    ``subscription_handler``); ``start`` opens a connection per hub; ``shutdown`` leaves the hubs in order
     (https://snodra.damoreira.com/docs/library-authors/protocol/, "Shutting down"). ``run`` does both around the
     process's life, and ``async with app:`` around a block. ``codec`` reads and writes the payloads
     (:class:`JsonCodec` by default).
@@ -82,6 +87,7 @@ class App:
             self._timings,
             identity=self._identity,
             stream_credit_timeout=settings.stream_credit_timeout,
+            max_subscriptions=settings.max_subscriptions,
         )
         self._sender = Sender(self._codec, settings, self._timings)
         self._pool = Pool(
@@ -184,6 +190,32 @@ class App:
                 "configured to verify forwarded tokens: set jwks_url (SNODRA_JWKS_URL) and issuer (SNODRA_ISSUER); "
                 "without them every caller is anonymous"
             )
+
+    def subscription_handler(
+        self, *, update: type[U], shared: bool = False, guard: Guard | None = None
+    ) -> Callable[[Callable[[Q], Awaitable[Any]]], Updates[Q, U]]:
+        """Registers a subscription query handler and returns the :class:`Updates` that pushes its updates.
+
+        The decorated ``async def`` takes the query (a ``@message_type`` class) and returns the subscription's *initial
+        result*; the type is served in mode ``SUBSCRIPTION`` only (``App.subscribe``), and a unary query of it is
+        ``INVALID_REQUEST`` unless its id is the hub's initial request ``<id>#0``. ``update`` is the class of the
+        updates the returned :class:`Updates` emits (``emit(match, update)``, ``complete(match)``,
+        ``fail(match, error)``, all on the app's event loop). ``shared=True`` registers it as a shared subscription type
+        (``Register.shared_query_types`` as well as ``Register.subscription_query_types``); ``guard`` is that of
+        :meth:`command_handler`."""
+        if not isinstance(update, type):
+            raise TypeError(f"update must be the class of the updates, got {update!r}")
+        if not isinstance(shared, bool):
+            raise TypeError(f"shared must be True or False, got {shared!r}")
+        if guard is not None and not isinstance(guard, Guard):
+            raise TypeError(f"guard must be made by authenticated(), role() or caller_matches(), got {guard!r}")
+
+        def register(fn: Callable[[Q], Awaitable[Any]]) -> Updates[Q, U]:
+            self._check_guard(fn, guard)
+            handler = self._registry.add("query", fn, guard, shared=shared, subscription=True)
+            return Updates(self._dispatcher.subscriptions, self._codec, handler.type, handler.message, update)
+
+        return register
 
     @overload
     async def send(
@@ -362,9 +394,60 @@ class App:
             retry=retry,
         )
 
+    def subscribe(
+        self,
+        query: object,
+        initial: type[IN],
+        update: type[U],
+        *,
+        initial_credit: int | None = None,
+        max_results: int = 0,
+        timeout: float | None = None,
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> Subscription[IN, U]:
+        """A subscription query: ``async with app.subscribe(query, Initial, Update) as sub`` waits for the initial
+        result, kept as ``sub.initial``, and ``async for update in sub`` reads the updates the handler instance(s) push.
+        Nothing is sent until the block is entered; leaving it early (a ``break``, an exception, a cancellation) cancels
+        the subscription on the hub. A subscription always goes through a hub, also when this instance handles the type.
+
+        ``initial_credit`` is the window: how many parts (the initial result included) the hub may relay before the
+        caller consumed any (None or 0: 64); the library grants ``max(1, window // 2)`` more each time that many parts
+        were consumed, the initial result counting as one. ``max_results`` ends the subscription after that many updates
+        at the hub (0: until the handlers complete; the initial result does not count). ``timeout`` bounds the initial
+        result only (queue wait plus handler): a quiet subscription is never timed out. ``priority``, ``headers`` and
+        ``retry`` are those of :meth:`send`, and a retry applies only until the initial result, each attempt sending
+        what is left of the caller's budget.
+
+        The updates are the parts decoded as ``update`` (``DecodeError`` for one that does not). A subscription the hub
+        ends with an error fails as :meth:`send` fails with that code; one that lost parts fails as :class:`LostParts`;
+        one whose hub stream broke after its initial result fails as :class:`OutcomeUnknown` (:class:`NeverSent` when no
+        hub took the request); one whose initial result did not come within the hub's bound for the request plus 1 s
+        fails as :class:`HubError` (``TIMEOUT``) and is cancelled. A cancellation of the caller stays
+        ``asyncio.CancelledError``."""
+        return subscribe(
+            self._sender,
+            query,
+            initial,
+            update,
+            initial_credit=initial_credit,
+            max_results=max_results,
+            timeout=timeout,
+            priority=priority,
+            headers=headers,
+            retry=retry,
+        )
+
     def hub_ids(self) -> list[str]:
         """``RegisterAck.hub_id`` of every acknowledged stream (its address when empty), sorted."""
         return self._pool.hub_ids()
+
+    @property
+    def subscriptions_served(self) -> int:
+        """How many subscription targets this instance serves now (every open subscription, pending admissions
+        included)."""
+        return self._dispatcher.subscriptions_served
 
     async def start(self) -> None:
         """Opens a connection per hub and returns at once; the connections register and reconnect on their own."""
@@ -373,8 +456,14 @@ class App:
         if self._started:
             raise RuntimeError("the app is already started")
         self._registry.close()
+        self._dispatcher.subscriptions.bind(asyncio.get_running_loop())
         registry = self._registry
-        self._pool.declare(registry.types("command"), registry.types("query"), registry.shared_types())
+        self._pool.declare(
+            registry.types("command"),
+            registry.types("query"),
+            registry.shared_types(),
+            registry.subscription_types(),
+        )
         self._started = True
         self._pool.start()
 
@@ -439,7 +528,10 @@ class App:
             if self._started:
                 try:
                     async with asyncio.timeout(budget):
-                        await self._pool.leave(drain=lambda: self._dispatcher.drain(self._timings.handler_drain))
+                        await self._pool.leave(
+                            drain=lambda: self._dispatcher.drain(self._timings.handler_drain),
+                            end_subscriptions=self._dispatcher.end_subscriptions,
+                        )
                 except TimeoutError:
                     log.warning("Leaving the hubs took longer than %.2f s: the streams are cut", budget)
         except BaseException:

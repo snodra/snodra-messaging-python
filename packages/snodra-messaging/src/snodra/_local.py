@@ -5,7 +5,8 @@ handler for that is not shared, run here: through the same checks as a forwarded
 the error mapping), with the headers a request through the hub would carry, and the caller the hub path would carry.
 Nothing goes on the wire: no permit, no routing key, no timeout of the library's own, no retry.
 ``Settings.always_route_through_hub`` sends them through a hub instead. A query of a shared type and a scatter-gather
-always go through a hub.
+always go through a hub, and so does a subscription (:meth:`snodra.App.subscribe`). A point query of a type served by a
+streaming or subscription handler is answered here ``INVALID_REQUEST``: those types are served in their own mode only.
 
 See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Requests a service answers itself").
 """

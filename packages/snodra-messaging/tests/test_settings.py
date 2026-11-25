@@ -28,6 +28,9 @@ async def test_settings_refuse_bad_values() -> None:
     _refused("SNODRA_MAX_CONCURRENT_HANDLERS", max_concurrent=0)
     _refused("SNODRA_MAX_CONCURRENT_HANDLERS", max_concurrent=2**32)
     _refused("SNODRA_MAX_CONCURRENT_HANDLERS", max_concurrent=True)
+    _refused("SNODRA_SERVER_MAX_SUBSCRIPTIONS", max_subscriptions=0)
+    _refused("SNODRA_SERVER_MAX_SUBSCRIPTIONS", max_subscriptions=2**32)
+    _refused("SNODRA_SERVER_MAX_SUBSCRIPTIONS", max_subscriptions=True)
     _refused("SNODRA_RECONNECT_BACKOFF_MIN_MS", reconnect_backoff=(0, 5.0))
     _refused("SNODRA_RECONNECT_BACKOFF_MIN_MS", reconnect_backoff=(-1.0, 5.0))
     _refused("SNODRA_RECONNECT_BACKOFF_MAX_MS", reconnect_backoff=(2.0, 1.0))
@@ -211,6 +214,17 @@ def test_the_streaming_settings() -> None:
     _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=0)
     _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=-1.0)
     _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=float("inf"))
+
+
+def test_the_subscription_limit() -> None:
+    assert Settings(service="orders-service").max_subscriptions == 1024  # the hub's default per instance
+    assert (
+        Settings.from_env({"SNODRA_SERVICE_NAME": "s", "SNODRA_SERVER_MAX_SUBSCRIPTIONS": "7"}).max_subscriptions == 7
+    )
+    assert Settings(service="s", max_subscriptions=1).max_subscriptions == 1
+    for bad in ("0", "-1", "many"):
+        with pytest.raises(ConfigurationError, match="SNODRA_SERVER_MAX_SUBSCRIPTIONS"):
+            Settings.from_env({"SNODRA_SERVICE_NAME": "s", "SNODRA_SERVER_MAX_SUBSCRIPTIONS": bad})
     _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=True)
 
 

@@ -25,6 +25,8 @@ def settings_from_env(environ: Mapping[str, str]) -> Settings:
         values["hubs"] = tuple(h.strip() for h in hubs.split(",") if h.strip())
     capacity = get("CONFORMANCE_CAPACITY")
     values["max_concurrent"] = DEFAULT_CAPACITY if capacity is None else int(capacity)
+    if (subscriptions := get("CONFORMANCE_MAX_SUBSCRIPTIONS")) is not None:
+        values["max_subscriptions"] = _positive("CONFORMANCE_MAX_SUBSCRIPTIONS", subscriptions)
     values["default_retry"] = _retry(get)
     if (credit := get("CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS")) is not None:
         values["stream_credit_timeout"] = _positive_ms("CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS", credit) / 1000
@@ -62,6 +64,13 @@ def _positive_ms(name: str, value: str) -> int:
     """A positive whole number of milliseconds, as the runner's timeout variables are."""
     if not (value.isascii() and value.isdigit()) or int(value) < 1:
         raise ConfigurationError(f"{name} must be a positive integer of milliseconds, got {value!r}")
+    return int(value)
+
+
+def _positive(name: str, value: str) -> int:
+    """A positive whole number, as a count of the runner's variables is."""
+    if not (value.isascii() and value.isdigit()) or int(value) < 1:
+        raise ConfigurationError(f"{name} must be a positive integer, got {value!r}")
     return int(value)
 
 

@@ -45,6 +45,9 @@ class Settings:
     ``dns:///name:port``."""
     max_concurrent: int = 256
     """Handlers run at once (``SNODRA_MAX_CONCURRENT_HANDLERS``): ``Register.initial_permits``."""
+    max_subscriptions: int = 1024
+    """Subscription queries this instance serves at once (``SNODRA_SERVER_MAX_SUBSCRIPTIONS``); one beyond is ended
+    ``RESOURCE_EXHAUSTED``. The hub's own default is 1024 per instance."""
     reconnect_backoff: tuple[float, float] = _DEFAULT_BACKOFF
     """The first and the longest reconnect wait (``SNODRA_RECONNECT_BACKOFF_MIN_MS``, ``_MAX_MS``)."""
     load_factor: int = 100
@@ -105,6 +108,11 @@ class Settings:
             raise ConfigurationError(
                 f"max_concurrent (SNODRA_MAX_CONCURRENT_HANDLERS) must be an integer from 1 to {_UINT32_MAX}, "
                 f"got {self.max_concurrent!r}"
+            )
+        if not _is_int(self.max_subscriptions) or not 1 <= self.max_subscriptions <= _UINT32_MAX:
+            raise ConfigurationError(
+                f"max_subscriptions (SNODRA_SERVER_MAX_SUBSCRIPTIONS) must be an integer from 1 to {_UINT32_MAX}, "
+                f"got {self.max_subscriptions!r}"
             )
         _check_backoff(self.reconnect_backoff)
         lo, hi = self.reconnect_backoff
@@ -249,6 +257,8 @@ class Settings:
             values["hubs"] = tuple(e.strip() for e in v.split(",") if e.strip())
         if (v := get("SNODRA_MAX_CONCURRENT_HANDLERS")) is not None:
             values["max_concurrent"] = _env_int("SNODRA_MAX_CONCURRENT_HANDLERS", v)
+        if (v := get("SNODRA_SERVER_MAX_SUBSCRIPTIONS")) is not None:
+            values["max_subscriptions"] = _env_int("SNODRA_SERVER_MAX_SUBSCRIPTIONS", v)
         lo = get("SNODRA_RECONNECT_BACKOFF_MIN_MS")
         hi = get("SNODRA_RECONNECT_BACKOFF_MAX_MS")
         if lo is not None or hi is not None:

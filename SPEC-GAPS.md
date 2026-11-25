@@ -148,3 +148,16 @@ library does there. Where an entry is settled, its behaviour is this library's r
   the next renewal; one a hub refuses with `UNAUTHENTICATED` is fetched again at once, not held back.
 - **Question:** open: should the floor stay (it keeps a sub-second token from fetching in a hot loop), or should such
   a token be renewed at its margin, as the reference implementation does?
+
+### SG-12: a subscription that ends before its initial result
+
+- **Specification:** `protocol.md` ("Subscription") says the hub numbers a subscription's parts itself, `1` for the
+  initial result, and names the sender's endings (a clean end, an end with an error, a lost part); it does not say what
+  a sender does with a clean `ReplyEnd` that arrives before any part.
+- **Other Snodra libraries:** they refuse such an answer as a local protocol error, not with a hub code, since no
+  handler produced a result to report.
+- **This library:** `snodra/_subscribe.py` (`Subscription._attempt`). The wait for the initial result ends with
+  `HubError` `INVALID_REQUEST` `subscription <type> ended before its initial result`: the subscription never opened, so
+  there is no initial result to return; an end carrying an error is that error. A first part whose `seq` is not `1` is
+  a lost part instead (`LostParts`, as for a stream), and the subscription is cancelled.
+- **Question:** open: should such an end read as a loss (`LostParts`) or as this local contract failure?

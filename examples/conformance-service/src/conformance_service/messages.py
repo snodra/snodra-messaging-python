@@ -54,9 +54,50 @@ class Stream:
     delay_ms: int = 0
 
 
+@message_type("conformance.Watch")
+@dataclass
+class Watch:
+    """A subscription query by topic: the initial result {topic, value 0, instanceId}; updates come from Emit."""
+
+    topic: str = ""
+
+
+@message_type("conformance.Emit")
+@dataclass
+class Emit:
+    """Emits each value as an update to every Watch subscription of ``topic``, then completes or fails them."""
+
+    topic: str = ""
+    values: list[Any] = field(default_factory=list)
+    complete: bool = False
+    fail: str | None = None
+
+
+@dataclass
+class WatchInitial:
+    """The initial result of a conformance.Watch subscription."""
+
+    topic: str
+    value: int
+    instance_id: str
+
+
+@dataclass
+class WatchUpdate:
+    """One update a conformance.Emit sends to a conformance.Watch subscription."""
+
+    topic: str
+    value: Any
+
+
 @message_type("conformance.runner.ProbeStream")
 class ProbeStream(RawJson):
     """A streaming query the runner answers part by part; the service passes the payload unchanged."""
+
+
+@message_type("conformance.runner.ProbeWatch")
+class ProbeWatch(RawJson):
+    """A subscription the runner answers part by part; the service passes the payload unchanged."""
 
 
 @message_type("conformance.Fail")

@@ -47,8 +47,8 @@ class _State(enum.Enum):
 
 
 class _StreamEntry(OutboundRequest):
-    """A stream waiting for its frames: its parts, its end (or the hub's error for the request itself) and the loss of
-    the stream it was sent on, in arrival order.
+    """A stream or a subscription waiting for its frames: its parts, its end (or the hub's error for the request
+    itself) and the loss of the stream it was sent on, in arrival order.
 
     Every frame is queued in the order the hub relayed it; the reader decides what a part out of seq or an end that
     counts more parts than it received means when it reaches that frame, so a part that arrived before a loss is still
@@ -65,7 +65,7 @@ class _StreamEntry(OutboundRequest):
 
     def take(self, m: hub_pb2.ServerMessage) -> bool:
         if m.WhichOneof("message") not in ("part", "end", "error"):
-            return False  # a Reply is no answer to a stream
+            return False  # a Reply is no answer to a stream or a subscription
         self.frames.put_nowait(m)
         self.resolve(m)  # the first frame opens the stream; a later one changes nothing
         return True
@@ -238,9 +238,7 @@ class Stream[T]:
 
     def _flow(self, entry: _StreamEntry, credits: int) -> None:
         """Grants credits more parts for the stream, on the stream it was sent on."""
-        stream = entry.stream
-        if stream is not None:
-            stream.put(hub_pb2.ClientMessage(flow=hub_pb2.Flow(request_id=entry.id, credits=credits)))
+        grant_flow(entry, credits)
 
     def _release(self, *, cancel: bool, reason: str = CANCEL_REASON) -> None:
         """Drops what this library holds of the stream, and with cancel writes the ``Cancel`` (when the stream has not
@@ -251,19 +249,32 @@ class Stream[T]:
 
     def _let_go(self, entry: _StreamEntry, *, cancel: bool, reason: str) -> None:
         """Forgets a stream's entry here and, with cancel, tells the hub to stop it on the stream it was sent on."""
-        stream = entry.stream
-        if cancel and stream is not None:
-            stream.put(hub_pb2.ClientMessage(cancel=hub_pb2.Cancel(request_id=entry.id, reason=reason)))
-        if self._sender.pending.get(entry.id) is entry:
-            del self._sender.pending[entry.id]
-        if stream is not None:
-            stream.forget(entry)
+        release_entry(self._sender, entry, cancel=cancel, reason=reason)
 
     async def _close_items(self) -> None:
         """Closes the generator the caller was reading, so that nothing of it stays suspended."""
         items, self._items = self._items, None
         if items is not None:
             await cast("AsyncGenerator[T, None]", items).aclose()
+
+
+def grant_flow(entry: OutboundRequest, credits: int) -> None:
+    """Grants credits more parts for a stream or a subscription, on the stream it was sent on."""
+    stream = entry.stream
+    if stream is not None:
+        stream.put(hub_pb2.ClientMessage(flow=hub_pb2.Flow(request_id=entry.id, credits=credits)))
+
+
+def release_entry(sender: Sender, entry: OutboundRequest, *, cancel: bool, reason: str) -> None:
+    """Forgets a stream's or a subscription's entry here and, with cancel, tells the hub to stop it on the stream it was
+    sent on."""
+    stream = entry.stream
+    if cancel and stream is not None:
+        stream.put(hub_pb2.ClientMessage(cancel=hub_pb2.Cancel(request_id=entry.id, reason=reason)))
+    if sender.pending.get(entry.id) is entry:
+        del sender.pending[entry.id]
+    if stream is not None:
+        stream.forget(entry)
 
 
 def stream[T](

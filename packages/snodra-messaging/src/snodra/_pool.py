@@ -61,6 +61,7 @@ class Pool:
                 on_cancel=None if dispatcher is None else dispatcher.on_cancel,
                 on_flow=None if dispatcher is None else dispatcher.on_flow,
                 on_answer=on_answer,
+                on_lost=None if dispatcher is None else dispatcher.on_stream_lost,
                 credentials=credentials,
                 tls=settings.tls,
                 certificates=certificates,
@@ -75,13 +76,20 @@ class Pool:
         self.leaving = False
         """The app's shutdown drained its handlers: nothing is sent any more."""
 
-    def declare(self, command_types: list[str], query_types: list[str], shared_query_types: list[str]) -> None:
+    def declare(
+        self,
+        command_types: list[str],
+        query_types: list[str],
+        shared_query_types: list[str],
+        subscription_query_types: list[str],
+    ) -> None:
         """The types every ``Register`` of every stream lists; before :meth:`start`."""
         r = self._register
         for field, types in (
             (r.command_types, command_types),
             (r.query_types, query_types),
             (r.shared_query_types, shared_query_types),
+            (r.subscription_query_types, subscription_query_types),
         ):
             del field[:]
             field.extend(types)
@@ -144,8 +152,13 @@ class Pool:
             self._acknowledged.clear()
             await self._acknowledged.wait()
 
-    async def leave(self, drain: Callable[[], Awaitable[None]] | None = None) -> None:
-        """Leaves every hub in order: the empty ``Register`` (its acks awaited for ``deregister_wait`` at most), the
+    async def leave(
+        self,
+        drain: Callable[[], Awaitable[None]] | None = None,
+        end_subscriptions: Callable[[], object] | None = None,
+    ) -> None:
+        """Leaves every hub in order: the empty ``Register`` (its acks awaited for ``deregister_wait`` at most), then
+        ``end_subscriptions`` (the subscriptions this instance served end, so subscribers hear at once), then the
         drain of the handlers in flight, then the end of sending and the half-close (the hub's end awaited for
         ``close_wait`` at most). Until the half-close the handlers in flight may still send, and a stream lost
         meanwhile is opened again with the empty ``Register``, so no new work arrives on it; nothing reconnects after
@@ -161,6 +174,8 @@ class Pool:
                         await f
             except TimeoutError:
                 log.debug("Not every hub acknowledged the empty Register within %.2f s", t.deregister_wait)
+        if end_subscriptions is not None:
+            end_subscriptions()
         if drain is not None:
             await drain()
         # The handlers drained may still have sent requests until here; from now on nothing is sent.

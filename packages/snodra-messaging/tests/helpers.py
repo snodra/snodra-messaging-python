@@ -491,6 +491,44 @@ class ListOrders:
     order_id: str
 
 
+@message_type("orders.WatchOrders")
+@dataclass
+class WatchOrders:
+    """A subscription query: the topic whose updates a subscription watches."""
+
+    topic: str
+
+
+@message_type("orders.WatchArchive")
+@dataclass
+class WatchArchive:
+    """A shared subscription query."""
+
+    topic: str
+
+
+@message_type("orders.Noop")
+@dataclass
+class Noop:
+    """A command without a result, for a request that must run while something else is served."""
+
+
+@dataclass
+class WatchInitial:
+    """The initial result of a subscription to orders.WatchOrders."""
+
+    topic: str
+    value: int
+
+
+@dataclass
+class WatchUpdate:
+    """One update of a subscription to orders.WatchOrders."""
+
+    topic: str
+    value: object
+
+
 @dataclass
 class Stock:
     count: int

@@ -226,7 +226,7 @@ async def test_an_async_send_and_its_outcome(service: _Service) -> None:
 
 async def test_the_other_ops_are_not_supported_yet(service: _Service) -> None:
     _, s = await service()
-    for op, target in (("subscribe", "probe-watch"), ("scatter", "probe")):
+    for op, target in (("scatter", "probe"), ("frobnicate", "probe")):
         ask = await _ask(s, "conformance.Send", {"op": op, "target": target})
         sent, reply = await _frames(s, ask)
         assert not sent
@@ -367,6 +367,86 @@ async def test_a_stream_send_stops_after_read_and_cancels(service: _Service) -> 
     assert (cancel.request_id, cancel.reason) == (probe.id, "collector cancelled")
     outcome = _payload(await _reply_to(s, ask))
     assert (outcome["result"], outcome["items"], outcome["end"]) == ("ok", [{"n": 1}, {"n": 2}], "stopped")
+
+
+async def test_a_subscription_send_reports_the_initial_and_the_updates(service: _Service) -> None:
+    _, s = await service()
+    ask = await _ask(
+        s,
+        "conformance.Send",
+        {
+            "op": "subscribe",
+            "target": "probe-watch",
+            "payload": {"case": "u1"},
+            "initialCredit": 2,
+            "maxResults": 3,
+            "timeoutMs": 1500,
+        },
+    )
+    r = await _next_request(s)
+    assert (r.type, r.mode, r.kind, r.initial_credit, r.max_results, r.timeout_ms) == (
+        "conformance.runner.ProbeWatch",
+        hub_pb2.SUBSCRIPTION,
+        hub_pb2.QUERY,
+        2,
+        3,
+        1500,
+    )
+    assert json.loads(r.payload) == {"case": "u1"}
+    for n in range(1, 5):  # the initial result, then three updates
+        await s.send(_part(r.id, n, "runner", {"n": n}))
+    await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=r.id, parts=4)))
+    _, reply = await _frames(s, ask)
+    outcome = _payload(reply)
+    assert outcome.pop("elapsedMs") >= 0
+    assert outcome == {"result": "ok", "items": [{"n": n} for n in range(1, 5)], "end": "completed"}
+
+
+async def test_a_subscription_send_stops_after_read_and_cancels(service: _Service) -> None:
+    _, s = await service()
+    ask = await _ask(
+        s,
+        "conformance.Send",
+        {"op": "subscribe", "target": "probe-watch", "payload": {"case": "u2"}, "initialCredit": 4, "read": 2},
+    )
+    r = await _next_request(s)
+    for n in (1, 2):
+        await s.send(_part(r.id, n, "runner", {"n": n}))
+    cancel = await _next_cancel(s)
+    assert (cancel.request_id, cancel.reason) == (r.id, "collector cancelled")
+    outcome = _payload(await _reply_to(s, ask))
+    assert (outcome["result"], outcome["items"], outcome["end"]) == (
+        "ok",
+        [{"n": 1}, {"n": 2}],
+        "stopped",
+    )
+
+
+async def test_a_subscription_send_reports_lost_parts(service: _Service) -> None:
+    _, s = await service()
+    for case, seqs, parts in (("u5", [1, 2, 4], 4), ("u6", [1, 2], 4)):
+        ask = await _ask(
+            s,
+            "conformance.Send",
+            {"op": "subscribe", "target": "probe-watch", "payload": {"case": case}, "initialCredit": 10},
+        )
+        r = await _next_request(s)
+        for n in seqs:
+            await s.send(_part(r.id, n, "runner", {"n": n}))
+        await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=r.id, parts=parts)))
+        _, reply = await _frames(s, ask)
+        outcome = _payload(reply)
+        assert (outcome["result"], outcome["error"]["kind"]) == ("error", "lost-parts"), case
+
+
+async def test_a_subscription_send_of_the_services_own_type(service: _Service) -> None:
+    _, s = await service()
+    ask = await _ask(s, "conformance.Send", {"op": "subscribe", "target": "watch", "payload": {"topic": "x"}})
+    r = await _next_request(s)
+    assert (r.type, r.mode) == ("conformance.Watch", hub_pb2.SUBSCRIPTION)  # its own type goes through the hub too
+    await s.send(hub_error(r.id, ErrorCode.NO_HANDLER, "nobody"))
+    _, reply = await _frames(s, ask)
+    assert _payload(reply)["error"]["code"] == "NO_HANDLER"
 
 
 async def test_a_stream_send_reports_lost_parts(service: _Service) -> None:

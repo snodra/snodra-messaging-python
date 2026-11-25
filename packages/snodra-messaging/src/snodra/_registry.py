@@ -41,6 +41,9 @@ class Handler:
     """A query type many services may own (``Register.shared_query_types``); a command is never shared."""
     stream: bool = False
     """A streaming query handler: an async generator function, whose query type is served in mode ``STREAMING``."""
+    subscription: bool = False
+    """A subscription query handler: an async function answering the initial result, whose query type is served in mode
+    ``SUBSCRIPTION``."""
 
 
 def label_of(fn: object) -> str:
@@ -61,12 +64,20 @@ class Registry:
         self._closed = True
 
     def add(
-        self, kind: Kind, fn: object, guard: Guard | None = None, *, shared: bool = False, stream: bool = False
+        self,
+        kind: Kind,
+        fn: object,
+        guard: Guard | None = None,
+        *,
+        shared: bool = False,
+        stream: bool = False,
+        subscription: bool = False,
     ) -> Handler:
         """Registers fn as the kind's handler of the type its first parameter is annotated with, for the callers
         guard lets through; a shared query type when shared, a streaming query handler when stream (an async generator
-        function, whose type is served in mode ``STREAMING``). Raises :class:`RegistrationClosed` once closed and
-        ``TypeError`` for what cannot be served, naming the handler."""
+        function, whose type is served in mode ``STREAMING``), a subscription query handler when subscription (an async
+        function whose result is a subscription's initial result, its type served in mode ``SUBSCRIPTION``). Raises
+        :class:`RegistrationClosed` once closed and ``TypeError`` for what cannot be served, naming the handler."""
         label = label_of(fn)
         if self._closed:
             raise RegistrationClosed(f"handler {label}: handlers are registered before the app starts")
@@ -77,6 +88,10 @@ class Registry:
                 raise TypeError(f"stream handler {label} must be an async generator function taking the message")
         elif not inspect.iscoroutinefunction(fn):
             raise TypeError(f"handler {label} must be an async def taking the message")
+        if subscription and kind != "query":
+            raise TypeError(f"handler {label}: a command type is never a subscription")
+        if subscription and stream:
+            raise TypeError(f"handler {label}: a streaming query handler is never a subscription query handler")
         message = _message_class(fn, label)
         name = type_name(message)
         other: Kind = "query" if kind == "command" else "command"
@@ -89,7 +104,7 @@ class Registry:
             raise TypeError(f"handler {label}: type {name} already has the {kind} handler {taken.label}")
         if shared and kind != "query":
             raise TypeError(f"handler {label}: a command type is never shared")
-        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard, shared, stream)
+        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard, shared, stream, subscription)
         self._handlers[kind][name] = handler
         return handler
 
@@ -104,6 +119,11 @@ class Registry:
     def shared_types(self) -> list[str]:
         """The shared query types, sorted: ``Register.shared_query_types``."""
         return sorted(t for t, h in self._handlers["query"].items() if h.shared)
+
+    def subscription_types(self) -> list[str]:
+        """The query types served by a subscription handler, sorted: ``Register.subscription_query_types`` (each is also
+        one of the register's query types: exclusive or shared)."""
+        return sorted(t for t, h in self._handlers["query"].items() if h.subscription)
 
 
 def _message_class(fn: object, label: str) -> type:

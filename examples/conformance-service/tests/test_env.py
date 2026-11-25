@@ -56,6 +56,15 @@ def test_the_streaming_credit_bound() -> None:
             settings_from_env(base | {"CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS": bad})
 
 
+def test_the_subscription_limit() -> None:
+    base = {"CONFORMANCE_SERVICE_NAME": "conformance-python"}
+    assert settings_from_env(base).max_subscriptions == 1024
+    assert settings_from_env(base | {"CONFORMANCE_MAX_SUBSCRIPTIONS": "2"}).max_subscriptions == 2
+    for bad in ("0", "-1", "soon", "1.5"):
+        with pytest.raises(ConfigurationError, match="CONFORMANCE_MAX_SUBSCRIPTIONS"):
+            settings_from_env(base | {"CONFORMANCE_MAX_SUBSCRIPTIONS": bad})
+
+
 def test_the_service_reads_its_credentials() -> None:
     base = {"CONFORMANCE_SERVICE_NAME": "conformance-python"}
     s = settings_from_env(base)
