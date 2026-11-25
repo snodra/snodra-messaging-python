@@ -497,6 +497,22 @@ async def test_a_token_url_or_jwks_url_with_userinfo_is_refused() -> None:
         with pytest.raises(ConfigurationError, match="user") as e:
             Settings(service="orders-service", jwks_url=url, issuer="https://idp.test")
         assert "pw" not in str(e.value), url
+    # No authority in the text (a scheme-relative authority, a path where one was expected): the parts decide, or the
+    # scheme error refuses the URL without it. Either way the URL is never echoed.
+    for url, message in (
+        ("//id:pw@idp.test/token", "userinfo"),
+        ("https:///id:pw@idp.test/token", r"http:// or https://"),
+    ):
+        with pytest.raises(ConfigurationError, match=message) as e:
+            Settings(service="orders-service", credentials=ClientCredentials(url, "c", "s"))
+        assert "pw" not in str(e.value), url
+    for url, message in (
+        ("//id:pw@idp.test/jwks", "userinfo"),
+        ("https:///id:pw@idp.test/jwks", r"http:// or https://"),
+    ):
+        with pytest.raises(ConfigurationError, match=message) as e:
+            Settings(service="orders-service", jwks_url=url, issuer="https://idp.test")
+        assert "pw" not in str(e.value), url
 
 
 async def test_a_plain_http_token_url_warns(caplog: pytest.LogCaptureFixture) -> None:

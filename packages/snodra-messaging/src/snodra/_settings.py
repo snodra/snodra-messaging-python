@@ -144,17 +144,17 @@ class Settings:
         url, issuer = self.jwks_url, self.issuer
         if url is not None:
             if not isinstance(url, str) or not url.strip():
-                raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be a URL or None, got {url!r}")
+                raise ConfigurationError("jwks_url (SNODRA_JWKS_URL) must be a URL or None")
             url = url.strip()
             parts = urlsplit(url)
-            if _carries_userinfo(url):
+            if _carries_userinfo(url) or parts.username is not None or parts.password is not None:
                 # Before the scheme check: a URL with credentials is never written into an error, whatever its scheme.
                 raise ConfigurationError(
                     "jwks_url (SNODRA_JWKS_URL) must carry no userinfo: the credentials of the issuer's endpoint are "
                     "not read from a URL"
                 )
             if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
-                raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be an http:// or https:// URL, got {url!r}")
+                raise ConfigurationError("jwks_url (SNODRA_JWKS_URL) must be an http:// or https:// URL")
             object.__setattr__(self, "jwks_url", url)
             if not isinstance(issuer, str) or not issuer.strip():
                 raise ConfigurationError(
@@ -345,7 +345,8 @@ def _optional_text(value: object) -> bool:
 def _carries_userinfo(url: str) -> bool:
     """Whether the authority of url carries ``@``, read from the text so that every form is refused whatever
     :func:`~urllib.parse.urlsplit` makes of it: a scheme-less ``user:pw@host/x`` is read as the scheme ``user``, with
-    the credentials in its path."""
+    the credentials in its path. Callers also check the parsed userinfo, for the forms no authority is read from
+    (``//id:pw@host/x``)."""
     rest = url[url.find("://") + 3 :] if "://" in url else url
     ends = [i for i in (rest.find(c) for c in "/?#") if i != -1]
     return "@" in rest[: min(ends, default=len(rest))]
@@ -363,7 +364,7 @@ def _checked_grant(grant: ClientCredentials) -> ClientCredentials:
             raise ConfigurationError(f"ClientCredentials.{name} must be a text, got a {type(value).__name__}")
     url = grant.token_url.strip()
     parts = urlsplit(url)
-    if _carries_userinfo(url):
+    if _carries_userinfo(url) or parts.username is not None or parts.password is not None:
         # Before the scheme check: a URL with credentials is never written into an error, whatever its scheme.
         raise ConfigurationError(
             "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must carry no userinfo: the client is "
@@ -371,8 +372,7 @@ def _checked_grant(grant: ClientCredentials) -> ClientCredentials:
         )
     if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
         raise ConfigurationError(
-            "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must be an http:// or https:// URL, "
-            f"got {url!r}"
+            "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must be an http:// or https:// URL"
         )
     if parts.scheme.lower() == "http":
         log.warning(

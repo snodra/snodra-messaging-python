@@ -7,10 +7,12 @@ import socket
 import ssl
 import threading
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
+from certs import make_ca
 from helpers import Jwks, TokenAnswer, TokenEndpoint, eventually
 from snodra import _http
 
@@ -96,6 +98,51 @@ def test_the_tls_wrap_is_made_without_the_handshake(monkeypatch: pytest.MonkeyPa
         conn.close()
         listener.close()
     assert handshakes == [False]  # not inside the wrap: after the cut holds the TLS socket
+
+
+def test_a_real_tls_connect_leaves_a_socket_the_slice_retimes(tmp_path: Path) -> None:
+    """The TLS socket keeps the connection's timeout and takes every slice's, so a body read over ``https://`` is
+    bounded the same way a plain one is: the cut holds that socket
+    (``test_a_stalled_handshake_is_cut_at_the_deadline``), and ``_read_body`` shortens it before each read."""
+    ca = make_ca("slice.test")
+    pair = ca.issue_server("hub.test")
+    (tmp_path / "cert.pem").write_bytes(pair.cert_pem)
+    (tmp_path / "key.pem").write_bytes(pair.key_pem)
+    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server.load_cert_chain(tmp_path / "cert.pem", tmp_path / "key.pem")
+    listener = socket.create_server(("127.0.0.1", 0))
+    stop = threading.Event()
+
+    def serve() -> None:
+        raw, _ = listener.accept()
+        try:
+            tls = server.wrap_socket(raw, server_side=True)  # the handshake completes, nothing is written
+        except OSError:
+            raw.close()
+            return
+        try:
+            stop.wait(10.0)
+        finally:
+            tls.close()
+
+    threading.Thread(target=serve, name="tests:tls-slice", daemon=True).start()
+    context = ssl.create_default_context()  # this test is about the timeout, not the verification
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    cut = _http._Cut()
+    conn = _http._HTTPSConnection("127.0.0.1", listener.getsockname()[1], cut=cut, context=context, timeout=5.0)
+    try:
+        conn.connect()
+        attached = cut._socket
+        assert attached is not None  # the live TLS socket, handshake done
+        assert attached.fileno() != -1
+        assert attached.gettimeout() == 5.0  # the connection's own timeout, kept across the wrap
+        cut.retime(0.05)  # what _read_body does before every slice
+        assert attached.gettimeout() == 0.05
+    finally:
+        conn.close()
+        listener.close()
+        stop.set()
 
 
 async def test_a_stalled_handshake_is_cut_at_the_deadline() -> None:
