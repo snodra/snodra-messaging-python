@@ -4,6 +4,7 @@ does, and reports the outcome in the contract's shape."""
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Coroutine
@@ -13,6 +14,7 @@ from snodra import (
     App,
     Gathered,
     HubError,
+    JsonCodec,
     LostParts,
     NeverSent,
     OutcomeUnknown,
@@ -67,6 +69,16 @@ _GATHERED: dict[str, type[RawJson]] = {
 
 KEPT_OUTCOMES = 1024
 """Finished asynchronous sends whose outcome is kept for ``conformance.Outcome``; older ones are forgotten."""
+
+_CODEC = JsonCodec()
+
+
+def _request(cls: type, payload: Any) -> Any:
+    """The target's request message: a ``RawJson`` message holds the payload document itself, a dataclass its fields
+    (read with the library's codec, so the contract's names decode and an absent field takes its default)."""
+    if issubclass(cls, RawJson):
+        return cls(payload)
+    return _CODEC.decode(json.dumps(payload).encode("utf-8"), cls)
 
 
 def classify(exc: BaseException) -> dict[str, Any]:
@@ -176,7 +188,7 @@ class Sends:
             options = _options(m)
             del options["routing_key"]  # a stream goes to one target: unkeyed
             async with self._app.stream(
-                cls(m.payload),
+                _request(cls, m.payload),
                 RawJson,
                 initial_credit=m.initial_credit,
                 max_results=m.max_results or 0,
@@ -205,7 +217,7 @@ class Sends:
             options = _options(m)
             del options["routing_key"]  # a subscription goes to every target: unkeyed
             async with self._app.subscribe(
-                cls(m.payload),
+                _request(cls, m.payload),
                 RawJson,
                 RawJson,
                 initial_credit=m.initial_credit,

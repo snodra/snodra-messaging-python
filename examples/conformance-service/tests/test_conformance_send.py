@@ -444,9 +444,27 @@ async def test_a_subscription_send_of_the_services_own_type(service: _Service) -
     ask = await _ask(s, "conformance.Send", {"op": "subscribe", "target": "watch", "payload": {"topic": "x"}})
     r = await _next_request(s)
     assert (r.type, r.mode) == ("conformance.Watch", hub_pb2.SUBSCRIPTION)  # its own type goes through the hub too
+    assert json.loads(r.payload) == {"topic": "x"}
     await s.send(hub_error(r.id, ErrorCode.NO_HANDLER, "nobody"))
     _, reply = await _frames(s, ask)
     assert _payload(reply)["error"]["code"] == "NO_HANDLER"
+
+
+async def test_a_stream_send_of_the_services_own_type(service: _Service) -> None:
+    _, s = await service()
+    ask = await _ask(
+        s,
+        "conformance.Send",
+        {"op": "stream", "target": "stream", "payload": {"count": 2, "delayMs": 5}},
+    )
+    r = await _next_request(s)
+    assert (r.type, r.mode) == ("conformance.Stream", hub_pb2.STREAMING)  # its own type goes through the hub too
+    assert json.loads(r.payload) == {"count": 2, "delayMs": 5}
+    await s.send(_part(r.id, 1, "i-1", {"n": 1}))
+    await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=r.id, parts=1)))
+    _, reply = await _frames(s, ask)
+    outcome = _payload(reply)
+    assert (outcome["result"], outcome["items"], outcome["end"]) == ("ok", [{"n": 1}], "completed")
 
 
 async def test_a_stream_send_reports_lost_parts(service: _Service) -> None:
