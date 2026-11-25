@@ -175,7 +175,13 @@ class Stream[T]:
     async def _read(self) -> AsyncGenerator[T, None]:
         """The items, in the seq the handler gave them, refilling the credit as the caller consumes them: a part out of
         seq or an end that counts more parts than were delivered is reported when the reader reaches that frame, so the
-        parts already delivered stay."""
+        parts already delivered stay.
+
+        An end carrying an error is that error whatever its ``parts`` count, also when the count is above the parts
+        received: the short-end rule is the specification's for a *clean* end ("a clean ``ReplyEnd`` whose
+        ``ReplyEnd.parts`` is more than the parts received"), and a failed stream reports the failure that ended it
+        rather than a loss it may also have suffered (the reference checks the count first; this library answers the
+        error, deliberately)."""
         entry = self._entry
         assert entry is not None  # a stream is open only once its entry is here
         codec = self._sender.codec

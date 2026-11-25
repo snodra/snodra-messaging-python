@@ -13,7 +13,9 @@ import pytest
 from fakehub import FakeHub, FakeStream, ack
 from helpers import ListOrders, Placed, acknowledged, eventually, library_tasks, new_app
 from snodra import App, ErrorCode, HubError, LostParts, OutcomeUnknown, RetryPolicy
+from snodra._connection import Lost
 from snodra._hubpb import hub_pb2
+from snodra._stream_client import _StreamEntry
 
 
 def _part(id: str, seq: int, total: int) -> hub_pb2.ServerMessage:
@@ -213,6 +215,51 @@ async def test_a_gap_or_a_short_end_is_lost_parts(hub: FakeHub) -> None:
         assert failure == f"stream orders.ListOrders lost {lost} part(s)"
         await s.nothing(0.2, "cancel")
         assert not app._sender.pending
+
+
+async def test_an_entry_hands_the_parts_before_a_loss_to_its_reader() -> None:
+    """A stream that received its first part and then lost its hub stream is an unknown outcome, not a timeout.
+
+    ``_StreamEntry`` queues every frame in arrival order, and a loss resolves the entry at once: a later part or a
+    ``stop_requests`` (the app stopping) arrives in the queue *after* the part, so the reader yields it and meets the
+    ``Lost`` next. Enqueueing the loss ahead of what already arrived would make the caller see ``TIMEOUT`` for a
+    handler that may have produced it (the M-1 invariant)."""
+    entry = _StreamEntry(
+        hub_pb2.ClientMessage(
+            request=hub_pb2.Request(
+                id="s-1",
+                kind=hub_pb2.QUERY,
+                type="orders.ListOrders",
+                payload=b'{"orderId":"o-1"}',
+                mode=hub_pb2.STREAMING,
+                initial_credit=1,
+            )
+        )
+    )
+    payload = b'{"orderId":"o-1","total":1}'
+    part = hub_pb2.ServerMessage(part=hub_pb2.ReplyPart(request_id="s-1", seq=1, payload=payload))
+    assert entry.take(part)
+    entry.resolve(Lost(True, "hub connection stopped"))
+    assert entry.frames.get_nowait() is part  # the part arrived first and stays first
+    assert entry.frames.get_nowait() == Lost(True, "hub connection stopped")
+    assert entry.frames.empty()
+
+
+async def test_a_part_out_of_order_is_lost_parts(hub: FakeHub) -> None:
+    app = new_app(hub)
+    await app.start()
+    s = await acknowledged(hub)
+    call = asyncio.create_task(_lost_after(app))
+    r = await s.recv_request()
+    for _ in range(2):
+        await s.send(_part(r.id, 1, 1))
+    received, failure = await call
+    assert received == [Placed("o-1", 1)]
+    assert failure == "stream orders.ListOrders part seq 1 out of order (expected 2)"
+    cancel = await _next_cancel(s)  # exactly one Cancel
+    assert (cancel.request_id, cancel.reason) == (r.id, failure)
+    await s.nothing(0.2, "cancel")
+    assert not app._sender.pending
 
 
 async def test_the_ends_error_reaches_the_caller(hub: FakeHub) -> None:
