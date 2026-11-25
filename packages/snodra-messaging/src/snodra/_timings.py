@@ -43,6 +43,8 @@ class Timings:
     """A retry starts only with at least this much of the budget left after its wait (or the initial backoff)."""
     outbound_limit: int
     """Requests waiting in a stream's outbound buffer at most; a call beyond waits for room."""
+    default_credit: int
+    """The window of a stream or subscription whose sender asked for none (``Request.initial_credit`` 0 reads as 64)."""
     max_unwritten_moves: int
     """How often a request lost in a stream's buffer moves to another stream before it fails as never sent."""
     jwks_min_refresh: float
@@ -88,6 +90,7 @@ DEFAULT_TIMINGS: Final = Timings(
     default_deadline=5.0,
     retry_min_remaining=0.25,
     outbound_limit=256,
+    default_credit=64,
     max_unwritten_moves=8,
     jwks_min_refresh=60.0,
     jwks_fetch_timeout=5.0,

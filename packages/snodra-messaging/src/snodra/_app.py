@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Literal, TypeVar, overload
 
 from snodra import _credentials, _tls
@@ -22,12 +22,14 @@ from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
 from snodra._send import Sender
 from snodra._settings import Settings, hub_targets
+from snodra._stream_client import Stream, stream
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
 
 H = TypeVar("H", bound=Callable[..., Awaitable[Any]])
 R = TypeVar("R")
+S = TypeVar("S", bound=Callable[..., AsyncIterator[Any]])
 
 
 class App:
@@ -74,7 +76,12 @@ class App:
             )
         self._identity = IdentityResolver(verifier, settings.roles_claim)
         self._dispatcher = Dispatcher(
-            self._registry, self._codec, settings.max_concurrent, self._timings, identity=self._identity
+            self._registry,
+            self._codec,
+            settings.max_concurrent,
+            self._timings,
+            identity=self._identity,
+            stream_credit_timeout=settings.stream_credit_timeout,
         )
         self._sender = Sender(self._codec, settings, self._timings)
         self._pool = Pool(
@@ -144,16 +151,39 @@ class App:
             raise TypeError(f"guard must be made by authenticated(), role() or caller_matches(), got {guard!r}")
 
         def register(f: H) -> H:
-            if guard is not None and not self._identity.verifies:
-                raise ConfigurationError(
-                    f"handler {label_of(f)} requires an authenticated caller (guard={guard!r}) but no JWKS is "
-                    "configured to verify forwarded tokens: set jwks_url (SNODRA_JWKS_URL) and issuer (SNODRA_ISSUER); "
-                    "without them every caller is anonymous"
-                )
+            self._check_guard(f, guard)
             self._registry.add(kind, f, guard, shared=shared)
             return f
 
         return register if fn is None else register(fn)
+
+    @overload
+    def stream_handler(self, fn: S, /) -> S: ...
+    @overload
+    def stream_handler(self, fn: None = None, /, *, guard: Guard | None = None) -> Callable[[S], S]: ...
+    def stream_handler(self, fn: S | None = None, /, *, guard: Guard | None = None) -> S | Callable[[S], S]:
+        """Registers a streaming query handler, bare (``@app.stream_handler``) or called
+        (``@app.stream_handler()``): an ``async def`` generator whose first parameter is annotated with a
+        ``@message_type`` class, the query type it serves, and whose items are the stream's parts. A query of its type
+        is answered in mode ``STREAMING`` only (``App.stream``); a unary query of it is ``INVALID_REQUEST``. ``guard``
+        is that of :meth:`command_handler`. Returns the function unchanged."""
+        if guard is not None and not isinstance(guard, Guard):
+            raise TypeError(f"guard must be made by authenticated(), role() or caller_matches(), got {guard!r}")
+
+        def register(f: S) -> S:
+            self._check_guard(f, guard)
+            self._registry.add("query", f, guard, stream=True)
+            return f
+
+        return register if fn is None else register(fn)
+
+    def _check_guard(self, fn: object, guard: Guard | None) -> None:
+        if guard is not None and not self._identity.verifies:
+            raise ConfigurationError(
+                f"handler {label_of(fn)} requires an authenticated caller (guard={guard!r}) but no JWKS is "
+                "configured to verify forwarded tokens: set jwks_url (SNODRA_JWKS_URL) and issuer (SNODRA_ISSUER); "
+                "without them every caller is anonymous"
+            )
 
     @overload
     async def send(
@@ -283,6 +313,48 @@ class App:
             self._sender,
             query,
             result,
+            max_results=max_results,
+            timeout=timeout,
+            priority=priority,
+            headers=headers,
+            retry=retry,
+        )
+
+    def stream(
+        self,
+        query: object,
+        item: type[R],
+        *,
+        initial_credit: int | None = None,
+        max_results: int = 0,
+        timeout: float | None = None,
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> Stream[R]:
+        """A streaming query: ``async with app.stream(query, Item) as items: async for item in items`` reads the items a
+        streaming handler produces, one at a time. Nothing is sent until the block is entered; leaving it early (a
+        ``break``, an exception, a cancellation) cancels the stream on the hub.
+
+        ``initial_credit`` is the window: how many parts the handler may send ahead of the caller (None or 0: 64); the
+        library grants ``max(1, window // 2)`` more each time that many items were consumed. ``max_results`` ends the
+        stream after that many parts at the hub (0: until the handler completes). ``timeout`` is the stream's idle
+        timeout (``Request.timeout_ms``): the longest the hub waits for the next part, not a bound on the whole stream;
+        ``priority``, ``headers`` and ``retry`` are those of :meth:`send`, and a retry applies only before the first
+        part, sending the caller's idle timeout whole on every attempt. A stream always goes through a hub, also when
+        this instance handles the type.
+
+        The items are the handler's parts decoded as ``item`` (``DecodeError`` for one that does not). A stream the hub
+        ends with an error fails as :meth:`send` fails with that code; one that lost parts fails as :class:`LostParts`;
+        one whose hub stream broke after a part as :class:`OutcomeUnknown` (:class:`NeverSent` when no hub took the
+        request); one that waited for a frame longer than the hub's bound for the stream plus 1 s (twice the bound for
+        the first part, which the hub may hold in its queue) as :class:`HubError` (``TIMEOUT``), and the stream is
+        cancelled. A cancellation of the caller stays ``asyncio.CancelledError``."""
+        return stream(
+            self._sender,
+            query,
+            item,
+            initial_credit=initial_credit,
             max_results=max_results,
             timeout=timeout,
             priority=priority,

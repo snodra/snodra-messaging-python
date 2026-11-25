@@ -28,6 +28,7 @@ from snodra._identity import Caller, Guard, authenticated, caller_matches, role
 from snodra._messages import message_type
 from snodra._retry import RetryPolicy
 from snodra._settings import Settings
+from snodra._stream_client import Stream
 from snodra._tls import ClientCertificate, TLSConfig
 
 __version__: str = version("snodra-messaging")
@@ -61,6 +62,7 @@ __all__ = [
     "RetryPolicy",
     "Settings",
     "SnodraError",
+    "Stream",
     "TLSConfig",
     "Token",
     "TokenFile",

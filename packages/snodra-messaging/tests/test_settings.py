@@ -204,6 +204,25 @@ def test_the_sending_settings_from_env() -> None:
     assert s.default_retry == RetryPolicy(max_attempts=4, initial_backoff=0.05, multiplier=1.5, max_backoff=0.8)
 
 
+def test_the_streaming_settings() -> None:
+    s = Settings(service="orders-service")
+    assert s.stream_credit_timeout == 600.0  # the hub's default maximum stream duration
+    assert Settings(service="orders-service", stream_credit_timeout=0.25).stream_credit_timeout == 0.25
+    _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=0)
+    _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=-1.0)
+    _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=float("inf"))
+    _refused("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", stream_credit_timeout=True)
+
+
+def test_the_streaming_settings_from_env() -> None:
+    base = {"SNODRA_SERVICE_NAME": "orders-service"}
+    assert Settings.from_env(base).stream_credit_timeout == 600.0
+    assert Settings.from_env(base | {"SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS": "2000"}).stream_credit_timeout == 2.0
+    for value in ("0", "-1", "soon", "1.5"):
+        with pytest.raises(ConfigurationError, match="SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS"):
+            Settings.from_env(base | {"SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS": value})
+
+
 @pytest.mark.parametrize(
     ("variable", "value"),
     [

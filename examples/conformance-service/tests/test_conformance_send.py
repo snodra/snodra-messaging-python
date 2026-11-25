@@ -226,7 +226,7 @@ async def test_an_async_send_and_its_outcome(service: _Service) -> None:
 
 async def test_the_other_ops_are_not_supported_yet(service: _Service) -> None:
     _, s = await service()
-    for op, target in (("stream", "probe-stream"), ("subscribe", "probe-watch"), ("scatter", "probe")):
+    for op, target in (("subscribe", "probe-watch"), ("scatter", "probe")):
         ask = await _ask(s, "conformance.Send", {"op": op, "target": target})
         sent, reply = await _frames(s, ask)
         assert not sent
@@ -295,6 +295,99 @@ async def test_shared_query_sends(service: _Service) -> None:
             await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=sent.id)))
         _, reply = await _frames(s, ask)
         assert _payload(reply)["result"] == "ok"
+
+
+async def _reply_to(s: FakeStream, answer: str) -> hub_pb2.Reply:
+    """The reply to the request answer, skipping the frames of other requests (a Cancel, a Flow, Permits)."""
+    while True:
+        m = await s.recv()
+        if m.WhichOneof("message") == "reply" and m.reply.request_id == answer:
+            return m.reply
+
+
+async def _next_cancel(s: FakeStream) -> hub_pb2.Cancel:
+    """The next Cancel on a stream, skipping heartbeats, statuses, Permits and Flows."""
+    while True:
+        m = await s.recv()
+        if m.WhichOneof("message") == "cancel":
+            return m.cancel
+
+
+async def test_a_stream_send_reports_its_items(service: _Service) -> None:
+    _, s = await service()
+    ask = await _ask(
+        s,
+        "conformance.Send",
+        {
+            "op": "stream",
+            "target": "probe-stream",
+            "payload": {"case": "s1"},
+            "initialCredit": 4,
+            "maxResults": 2,
+            "timeoutMs": 1500,
+        },
+    )
+    probe = await _next_request(s)
+    assert (
+        probe.type,
+        probe.mode,
+        probe.kind,
+        probe.initial_credit,
+        probe.max_results,
+        probe.timeout_ms,
+    ) == (
+        "conformance.runner.ProbeStream",
+        hub_pb2.STREAMING,
+        hub_pb2.QUERY,
+        4,
+        2,
+        1500,
+    )
+    assert json.loads(probe.payload) == {"case": "s1"}
+    await s.send(_part(probe.id, 1, "runner", {"n": 1}))
+    await s.send(_part(probe.id, 2, "runner", {"n": 2}))
+    await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=probe.id, parts=2)))
+    _, reply = await _frames(s, ask)
+    outcome = _payload(reply)
+    assert outcome.pop("elapsedMs") >= 0
+    assert outcome == {"result": "ok", "items": [{"n": 1}, {"n": 2}], "end": "completed"}
+
+
+async def test_a_stream_send_stops_after_read_and_cancels(service: _Service) -> None:
+    _, s = await service()
+    ask = await _ask(
+        s,
+        "conformance.Send",
+        {"op": "stream", "target": "probe-stream", "payload": {"case": "s2"}, "initialCredit": 4, "read": 2},
+    )
+    probe = await _next_request(s)
+    for n in range(1, 4):
+        await s.send(_part(probe.id, n, "runner", {"n": n}))
+    cancel = await _next_cancel(s)
+    assert (cancel.request_id, cancel.reason) == (probe.id, "collector cancelled")
+    outcome = _payload(await _reply_to(s, ask))
+    assert (outcome["result"], outcome["items"], outcome["end"]) == ("ok", [{"n": 1}, {"n": 2}], "stopped")
+
+
+async def test_a_stream_send_reports_lost_parts(service: _Service) -> None:
+    _, s = await service()
+    for case, seqs, parts, items in (
+        ("gap", [1, 2, 4], 4, [1, 2]),
+        ("short", [1, 2, 3], 5, [1, 2, 3]),
+    ):
+        ask = await _ask(
+            s,
+            "conformance.Send",
+            {"op": "stream", "target": "probe-stream", "payload": {"case": case}, "initialCredit": 10},
+        )
+        probe = await _next_request(s)
+        for n in seqs:
+            await s.send(_part(probe.id, n, "runner", {"n": n}))
+        await s.send(hub_pb2.ServerMessage(end=hub_pb2.ReplyEnd(request_id=probe.id, parts=parts)))
+        _, reply = await _frames(s, ask)
+        outcome = _payload(reply)
+        assert (outcome["result"], outcome["error"]["kind"]) == ("error", "lost-parts"), case
+        assert [item["n"] for item in outcome["items"]] == items, case
 
 
 async def test_relay_sends_on_and_rethrows(service: _Service) -> None:

@@ -135,6 +135,25 @@ class Sender:
         """Reads and writes the payloads."""
         return self._codec
 
+    @property
+    def default_credit(self) -> int:
+        """The window of a stream whose sender asked for none (``Request.initial_credit`` 0 reads as 64 at the hub)."""
+        return self._timings.default_credit
+
+    def guard_for(
+        self, ack: hub_pb2.RegisterAck | None, type_: str, chosen: float | None, *, queue_wait: bool = False
+    ) -> float:
+        """The local guard (seconds) of a request of type_ to the hub that sent ack, when the call chose chosen
+        (None: no timeout): the hub's bound plus the margin, and twice the bound plus the margin with ``queue_wait``
+        (a streaming handler's first part, which the hub forwards after a queue wait)."""
+        _, guard = request_timing(
+            ack, type_, chosen, margin=self._timings.guard_margin, fallback_max=self._timings.fallback_max_timeout
+        )
+        if queue_wait:
+            bound = guard - self._timings.guard_margin
+            guard = 2 * bound + self._timings.guard_margin
+        return guard
+
     def on_answer(self, stream: _Stream, m: hub_pb2.ServerMessage) -> None:
         """A ``Reply``, an ``Error``, a ``ReplyPart`` or a ``ReplyEnd`` from a hub (called by the stream's reader): the
         request of that id sent on that stream takes it; any other is dropped (its caller gave up, it came from
@@ -236,9 +255,17 @@ class Sender:
             raise TypeError(f"retry must be a RetryPolicy, False or None, got {retry!r}")
         return retry
 
-    async def with_retry[T](self, p: Prepared, run: Callable[[hub_pb2.Request, float | None], Awaitable[T]]) -> T:
+    async def with_retry[T](
+        self,
+        p: Prepared,
+        run: Callable[[hub_pb2.Request, float | None], Awaitable[T]],
+        *,
+        whole_timeout: bool = False,
+    ) -> T:
         """What ``run(template, timeout)`` returns; attempts follow the call's policy within one budget, each a fresh
-        id (``run`` routes the template) sending what is left of the budget (at least 1 ms)."""
+        id (``run`` routes the template) sending what is left of the budget (at least 1 ms). With ``whole_timeout``
+        they send the caller's chosen timeout as it is, and the budget only bounds when an attempt may start (a
+        stream's idle timeout, which the hub restarts at every part)."""
         template, chosen, policy = p.template, p.chosen, p.policy
         if policy is None or policy.max_attempts <= 1:
             return await run(template, chosen)
@@ -251,7 +278,7 @@ class Sender:
         while True:
             remaining = max(deadline - loop.time(), 0.001)
             try:
-                return await run(template, remaining)
+                return await run(template, chosen if whole_timeout else remaining)
             except SnodraError as e:
                 if attempt >= policy.max_attempts or not retryable(template.kind, e) or self._leaving():
                     raise
@@ -283,13 +310,15 @@ class Sender:
         *,
         entry: Callable[[hub_pb2.ClientMessage], OutboundRequest] = OutboundRequest,
         walk: bool = True,
+        queue_wait: bool = False,
     ) -> Answered:
         """Sends the request, with one fresh id, to the hubs in turn until one answers it, within one deadline (the
         chosen timeout, else 5 s): a hub that did not take the request is not tried again, nor, with ``walk`` (a unary
         request), one that answers ``NO_HANDLER``; when every live hub declined, the last ``NO_HANDLER`` is the answer
         at once. With no hub to take it, the call waits for the live hubs to change until the deadline; no hop starts
         after it. Every hop sends the chosen timeout whole. ``entry`` makes the request's entry, which takes the hub's
-        frames for its id."""
+        frames for its id; ``queue_wait`` gives its first answer the hub's queue wait too (a streaming handler's first
+        part, which the hub forwards after a queue wait and then times out on its own)."""
         t = self._timings
         type_ = template.type
         loop = asyncio.get_running_loop()
@@ -320,7 +349,7 @@ class Sender:
                 # TODO(spec-gap): SG-3
                 text = "no hub connected within" if not tried else "no hub took the request within"
                 raise NeverSent(f"{text} {round(wait * 1000)} ms")
-            hop = await self._hop(conn, request, chosen, deadline, entry)
+            hop = await self._hop(conn, request, chosen, deadline, entry, queue_wait)
             if isinstance(hop, _NotTaken):
                 tried.add(conn)
             elif isinstance(hop, _LostInBuffer):
@@ -345,19 +374,24 @@ class Sender:
         chosen: float | None,
         deadline: float,
         entry: Callable[[hub_pb2.ClientMessage], OutboundRequest],
+        queue_wait: bool = False,
     ) -> _Hop:
         """The request on one hub's live stream, and what came of it; ``TIMEOUT`` after the local guard (for a gather,
-        the guard of the whole gather), outcome unknown when the stream ended after the write."""
+        the guard of the whole gather; for a stream's first part, its queue wait included), outcome unknown when the
+        stream ended after the write."""
         stream = conn.live_stream()
         if stream is None:
             return _NotTaken()
-        timeout_ms, guard = request_timing(
+        timeout_ms = request_timing(
             stream.ack,
             request.type,
             chosen,
             margin=self._timings.guard_margin,
             fallback_max=self._timings.fallback_max_timeout,
-        )
+        )[0]
+        # The hub may hold the request in its queue for the whole idle timeout before forwarding it, and starts its
+        # own bound again at the forward: for a stream's first part the local guard is two bounds and one margin.
+        guard = self.guard_for(stream.ack, request.type, chosen, queue_wait=queue_wait)
         request.timeout_ms = timeout_ms
         # TODO(spec-gap): SG-8
         while stream.buffered >= self._timings.outbound_limit:  # wait for room, within the call's deadline

@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, cast
 
 from snodra._codec import Codec
 from snodra._context import _CALLER, _CURRENT, MessageInfo
@@ -18,6 +19,7 @@ from snodra._hubpb import hub_pb2
 from snodra._identity import AUTHORIZATION, Caller, IdentityResolver
 from snodra._permits import PermitLedger
 from snodra._registry import Handler, Kind, Registry
+from snodra._stream_handler import StreamCredit, end_of_stream, failure, serve
 from snodra._timings import Timings
 
 log = logging.getLogger(__name__)
@@ -50,6 +52,8 @@ class _Running:
     label: str
     """The handler's name, else the type (for the logs)."""
     task: asyncio.Task[None] | None = None
+    credit: StreamCredit | None = None
+    """The credit of a streaming request (``Request.initial_credit`` and its ``Flow``s); None for any other."""
     cancelled: bool = False
     """By the hub's ``Cancel``: nothing at all is answered."""
     finished: bool = False
@@ -81,6 +85,8 @@ class Dispatcher:
         max_concurrent: int,
         timings: Timings,
         identity: IdentityResolver | None = None,
+        *,
+        stream_credit_timeout: float = 600.0,
     ) -> None:
         self._registry = registry
         self._codec = codec
@@ -88,6 +94,7 @@ class Dispatcher:
         self._max_concurrent = max_concurrent
         self._slots: asyncio.Semaphore | None = None
         self._timings = timings
+        self._stream_credit_timeout = stream_credit_timeout
         self._running: dict[tuple[object, str], _Running] = {}
         self._tasks: dict[asyncio.Task[None], _Running] = {}
         self._timers: set[asyncio.Task[None]] = set()
@@ -102,16 +109,22 @@ class Dispatcher:
             self._refuse_subscription(arrival, request)  # outside flow control: no permit
             return
         arrival.permits.arrived()
-        if request.mode == hub_pb2.STREAMING:
-            self._refuse_stream(arrival, request)
-            self._finish(arrival)
-            return
         key = (arrival, request.id)
         run = _Running(arrival, request, self._label(request))
+        if request.mode == hub_pb2.STREAMING:
+            # Before its task starts: a Flow of the hub may land before the handler's first item.
+            run.credit = StreamCredit(request.initial_credit or self._timings.default_credit)
         run.task = asyncio.create_task(self._serve(run), name=f"snodra:handler:{request.id}")
         self._tasks[run.task] = run
         self._running[key] = run
         run.task.add_done_callback(lambda t: self._ended(key, run, t))
+
+    def on_flow(self, arrival: Arrival, flow: hub_pb2.Flow) -> None:
+        """A ``Flow`` from the hub: credit for a streaming request this instance serves. One for an id that ended here,
+        or never arrived here, is dropped."""
+        run = self._running.get((arrival, flow.request_id))
+        if run is not None and run.credit is not None:
+            run.credit.add(flow.credits)
 
     def serving(self, arrival: Arrival) -> bool:
         """True while a request that arrived on arrival is being served."""
@@ -166,6 +179,9 @@ class Dispatcher:
             if self._slots is None:
                 self._slots = asyncio.Semaphore(self._max_concurrent)
             async with self._slots:  # held until the handler really ended, a cancelled one too
+                if run.request.mode == hub_pb2.STREAMING:
+                    await self._stream(run)
+                    return
                 reply = await self._answer(run.request)
                 if run.cancelled:
                     return  # the hub's Cancel: nothing at all
@@ -177,6 +193,64 @@ class Dispatcher:
                     )
         finally:
             self._finish_run(run)  # before the next request takes the local permit: the order on the wire
+
+    async def _stream(self, run: _Running) -> None:
+        """A streaming request: the token check, then the handler that owns the type in mode ``STREAMING``, then its
+        items as parts and the one ``ReplyEnd``. Every other outcome is a ``ReplyEnd`` with an error, and no part."""
+        request = run.request
+        id_ = request.id
+        try:
+            caller = await self._identity.resolve(request.headers.get(AUTHORIZATION))
+        except Unauthenticated as e:
+            log.debug("Refused %s request %s: %s", request.type, id_, e)
+            self._end_stream(run, failure(id_, ErrorCode.UNAUTHENTICATED, str(e)))
+            return
+        except Exception:  # a bug of the check is the caller's refusal, never an unanswered request
+            log.warning("Checking the token of %s request %s failed", request.type, id_, exc_info=True)
+            self._end_stream(run, failure(id_, ErrorCode.UNAUTHENTICATED, "invalid token"))
+            return
+        # A streaming request always looks for the query handler, whatever its kind.
+        handler = self._registry.find("query", request.type)
+        if handler is None:
+            self._end_stream(run, failure(id_, ErrorCode.NO_HANDLER, f"no handler for type {request.type}"))
+            return
+        if not handler.stream:
+            self._end_stream(
+                run,
+                failure(
+                    id_,
+                    ErrorCode.INVALID_REQUEST,
+                    f"handler {handler.label} for {request.type} is not a streaming query handler "
+                    "(it answers mode UNARY)",
+                ),
+            )
+            return
+        message, refused = self._prepare(handler, request, caller)
+        if refused is not None:
+            self._end_stream(run, refused.error)
+            return
+        credit = run.credit
+        assert credit is not None  # a streaming request opens its credit when it arrives
+        items = cast("AsyncIterator[object]", handler.fn(message))  # a streaming handler is an async generator
+        current = _CURRENT.set(self._info(request))
+        calling = _CALLER.set(caller)
+        try:
+            await serve(
+                items,
+                request,
+                arrival=run.arrival,
+                codec=self._codec,
+                credit=credit,
+                credit_timeout=self._stream_credit_timeout,
+            )
+        finally:
+            _CALLER.reset(calling)
+            _CURRENT.reset(current)
+
+    def _end_stream(self, run: _Running, error: hub_pb2.Error) -> None:
+        """A stream over before its handler produced anything: one ``ReplyEnd`` with error, and no part."""
+        if not run.cancelled:  # the hub's Cancel: nothing at all
+            run.arrival.put(end_of_stream(run.request.id, 0, error))
 
     async def _answer(self, request: hub_pb2.Request) -> hub_pb2.Reply:
         """The one ``Reply`` to a unary request; every outcome is a message."""
@@ -206,19 +280,39 @@ class Dispatcher:
         anonymous caller before the payload is decoded, then the payload is decoded, then the guard's rule applies.
         The handler runs in the calling task, with ``current_message()`` and ``current_caller()`` set for it only.
         Every outcome is a message; a cancellation of the calling task is raised."""
+        if handler.stream:
+            # A streaming handler's type is served in mode STREAMING only: a unary request of it (a point query this
+            # instance answers itself, or one the hub forwarded) is a contract mismatch.
+            return _error_reply(
+                request.id,
+                ErrorCode.INVALID_REQUEST,
+                f"{handler.type} is a streaming query: send it with App.stream (mode STREAMING)",
+            )
+        message, refused = self._prepare(handler, request, caller)
+        if refused is not None:
+            return refused
+        return await self._call(handler, request, message, caller)
+
+    def _prepare(
+        self, handler: Handler, request: hub_pb2.Request, caller: Caller | None
+    ) -> tuple[object | None, hub_pb2.Reply | None]:
+        """The message request carries, once handler's checks pass, and None; or None and the ``Reply`` that refuses
+        it. The caller's token was checked before this; a guarded handler refuses an anonymous caller before the payload
+        is decoded, so that an anonymous caller cannot probe the payload shapes of a guarded handler."""
         id_ = request.id
         guard = handler.guard
         if guard is not None and caller is None:
-            # Before decoding, so that an anonymous caller cannot probe the payload shapes of a guarded handler.
             # TODO(spec-gap): SG-1
-            return _error_reply(id_, ErrorCode.UNAUTHENTICATED, f"handler {handler.label} requires authentication")
+            return None, _error_reply(
+                id_, ErrorCode.UNAUTHENTICATED, f"handler {handler.label} requires authentication"
+            )
         try:
             message: object = self._codec.decode(request.payload, handler.message)
         except DecodeError as e:
-            return _error_reply(id_, ErrorCode.INVALID_REQUEST, str(e))
+            return None, _error_reply(id_, ErrorCode.INVALID_REQUEST, str(e))
         except Exception as e:  # a codec's bug is the handler's failure, never the stream's
             log.warning("Decoding %s request %s failed", request.type, id_, exc_info=True)
-            return hub_pb2.Reply(request_id=id_, error=error_to_wire(id_, e, self._codec))
+            return None, hub_pb2.Reply(request_id=id_, error=error_to_wire(id_, e, self._codec))
         if guard is not None and caller is not None:
             # The rule on the caller (a role, a given caller) applies once the payload decoded.
             try:
@@ -226,21 +320,25 @@ class Dispatcher:
             except Exception as e:
                 log.warning("The guard of %s refused a caller by raising", handler.label, exc_info=True)
                 denied = f"handler {handler.label}: access denied ({type(e).__name__})"
-                return _error_reply(id_, ErrorCode.PERMISSION_DENIED, denied)
+                return None, _error_reply(id_, ErrorCode.PERMISSION_DENIED, denied)
             if not allowed:
-                return _error_reply(id_, ErrorCode.PERMISSION_DENIED, f"handler {handler.label}: access denied")
-        return await self._call(handler, request, message, caller)
+                return None, _error_reply(id_, ErrorCode.PERMISSION_DENIED, f"handler {handler.label}: access denied")
+        return message, None
+
+    @staticmethod
+    def _info(request: hub_pb2.Request) -> MessageInfo:
+        """What a handler of request reads as ``current_message()``."""
+        headers = dict(request.headers)
+        # An empty correlationId is one the request carries: kept as it is.
+        # TODO(spec-gap): SG-9
+        return MessageInfo(request.id, request.type, headers.get(CORRELATION_ID, request.id), MappingProxyType(headers))
 
     async def _call(
         self, handler: Handler, request: hub_pb2.Request, message: object, caller: Caller | None
     ) -> hub_pb2.Reply:
         id_ = request.id
-        headers = dict(request.headers)
         # Set for this request only, and restored after it: an in-process call runs in its caller's task.
-        # An empty correlationId is one the request carries: kept as it is.
-        # TODO(spec-gap): SG-9
-        info = MessageInfo(id_, request.type, headers.get(CORRELATION_ID, id_), MappingProxyType(headers))
-        current = _CURRENT.set(info)
+        current = _CURRENT.set(self._info(request))
         calling = _CALLER.set(caller)
         try:
             result: Any = await handler.fn(message)
@@ -297,18 +395,7 @@ class Dispatcher:
         if n > 0:
             arrival.put(hub_pb2.ClientMessage(permits=hub_pb2.Permits(count=n)))
 
-    # Modes that have no handler here yet.
-
-    def _refuse_stream(self, arrival: Arrival, request: hub_pb2.Request) -> None:
-        query = self._registry.find("query", request.type)
-        if query is None:
-            error = (ErrorCode.NO_HANDLER, f"no handler for type {request.type}")
-        else:
-            error = (
-                ErrorCode.INVALID_REQUEST,
-                f"handler {query.label} for {request.type} is not a streaming query handler (it answers mode UNARY)",
-            )
-        self._end(arrival, request.id, *error)
+    # The modes that have no handler here yet.
 
     def _refuse_subscription(self, arrival: Arrival, request: hub_pb2.Request) -> None:
         query = self._registry.find("query", request.type)

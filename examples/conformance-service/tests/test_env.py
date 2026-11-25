@@ -47,6 +47,15 @@ def test_the_service_routes_every_call_through_the_hub_and_reads_the_callers_iss
         settings_from_env(base | {"CONFORMANCE_JWKS_URL": "http://127.0.0.1:9000/jwks"})
 
 
+def test_the_streaming_credit_bound() -> None:
+    base = {"CONFORMANCE_SERVICE_NAME": "conformance-python"}
+    assert settings_from_env(base).stream_credit_timeout == 600.0
+    assert settings_from_env(base | {"CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS": "2000"}).stream_credit_timeout == 2.0
+    for bad in ("0", "-1", "soon", "1.5"):
+        with pytest.raises(ConfigurationError, match="CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS"):
+            settings_from_env(base | {"CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS": bad})
+
+
 def test_the_service_reads_its_credentials() -> None:
     base = {"CONFORMANCE_SERVICE_NAME": "conformance-python"}
     s = settings_from_env(base)

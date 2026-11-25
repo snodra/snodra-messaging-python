@@ -27,3 +27,4 @@ def test_default_timings() -> None:
         10.0,
         30.0,
     )
+    assert t.default_credit == 64  # Request.initial_credit 0 reads as 64 at the hub

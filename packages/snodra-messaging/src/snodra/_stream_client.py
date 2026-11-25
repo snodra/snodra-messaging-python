@@ -1,0 +1,342 @@
+"""A streaming query this instance sends: its request, its credit, its parts and its end.
+
+The caller opens the stream with ``async with`` and reads its items with ``async for``; nothing is sent before the block
+is entered, and leaving it early (a ``break``, an exception, a cancellation) cancels the stream on the hub and releases
+everything of it here.
+
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Streaming").
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import logging
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from typing import Final, Literal, cast
+
+from snodra._connection import Lost, OutboundRequest
+from snodra._errors import ErrorCode, HubError, LostParts, OutcomeUnknown, error_from_wire
+from snodra._hubpb import hub_pb2
+from snodra._messages import type_name
+from snodra._retry import RetryPolicy
+from snodra._send import Prepared, Sender
+
+log = logging.getLogger(__name__)
+
+CANCEL_REASON: Final = "collector cancelled"
+"""Why the caller's own end of a stream (a ``break``, an exception, a cancellation) cancels it."""
+
+NO_PART_GUARD: Final = "no part within the local guard"
+"""Why the local guard of a stream that waited too long for its next frame cancels it."""
+
+_UINT32_MAX: Final = 2**32 - 1
+
+_LOST: Final = "stream {type} lost {n} part(s)"
+_OUT_OF_ORDER: Final = "stream {type} part seq {seq} out of order (expected {expected})"
+_TIMEOUT: Final = "Timed out waiting for reply to '{type}'"
+
+
+class _State(enum.Enum):
+    NEW = "new"
+    """Nothing was sent; ``async with`` sends the request."""
+    OPEN = "open"
+    """Entered: the request is on the wire and its items may be read."""
+    CLOSED = "closed"
+    """Left: the stream ended or was cancelled, and nothing of it is pending here."""
+
+
+class _StreamEntry(OutboundRequest):
+    """A stream waiting for its frames: its parts, its end (or the hub's error for the request itself) and the loss of
+    the stream it was sent on, in arrival order.
+
+    A gap in the seq the target gave is a part the hub dropped (``gap``); the stream is still open there, so leaving it
+    cancels it. A clean ``ReplyEnd`` that counts more parts than arrived is the last part dropped too (``short``), but
+    the stream has ended: there is nothing left to cancel."""
+
+    def __init__(self, message: hub_pb2.ClientMessage) -> None:
+        super().__init__(message)
+        self.frames: asyncio.Queue[hub_pb2.ServerMessage | Lost] = asyncio.Queue()
+        self.received = 0
+        """The parts taken for the caller so far."""
+        self.gap: str | None = None
+        """Why the parts stopped arriving while the stream is still open: a gap, or a seq out of order."""
+        self.short: str | None = None
+        """Why the end counted parts that never arrived: the stream ended, short of them."""
+
+    def take(self, m: hub_pb2.ServerMessage) -> bool:
+        kind = m.WhichOneof("message")
+        if kind == "part":
+            if self.gap is None:
+                seq = m.part.seq
+                if seq == self.received + 1:
+                    self.received += 1
+                elif seq > self.received + 1:
+                    self.gap = _LOST.format(type=self.message.request.type, n=seq - self.received - 1)
+                else:
+                    self.gap = _OUT_OF_ORDER.format(type=self.message.request.type, seq=seq, expected=self.received + 1)
+            self.frames.put_nowait(m)  # the frame that reports the gap wakes the reader; no part of it is kept
+            self.resolve(m)  # the first frame opens the stream; a later one changes nothing
+            return True
+        if kind in ("end", "error"):
+            if kind == "end" and self.short is None and self.gap is None and m.end.parts > self.received:
+                self.short = _LOST.format(type=self.message.request.type, n=m.end.parts - self.received)
+            self.frames.put_nowait(m)
+            self.resolve(m)
+            return True
+        return False  # a Reply is no answer to a stream
+
+    def resolve(self, outcome: hub_pb2.ServerMessage | Lost) -> None:
+        super().resolve(outcome)
+        if isinstance(outcome, Lost):
+            self.frames.put_nowait(outcome)  # its caller waits for the next part: the stream is gone
+
+
+class Stream[T]:
+    """The items of a streaming query, read inside ``async with``.
+
+    ``stream = app.stream(query, Item)`` sends nothing; ``async with stream as items`` sends the request and waits for
+    the stream to open (its first part, or its end), and ``async for item in items`` yields the items as the hub relays
+    them, under the credit this library grants. Leaving the block cancels the stream on the hub when it has not ended,
+    whether the caller broke out of the loop, an exception left the block or its task was cancelled: nothing is left
+    running here, and the credits stop.
+
+    A stream is entered once (a second ``async with`` is a ``RuntimeError``), and its items are read inside the block
+    only (``async for`` outside it is a ``RuntimeError``).
+    """
+
+    def __init__(
+        self,
+        sender: Sender,
+        prepared: Prepared,
+        item: type[T],
+        *,
+        credit: int,
+        type_: str,
+    ) -> None:
+        self._sender = sender
+        self._prepared = prepared
+        self._item = item
+        self._credit = credit
+        self._refill = max(1, credit // 2)
+        self._type = type_
+        self._state = _State.NEW
+        self._entry: _StreamEntry | None = None
+        self._items: AsyncIterator[T] | None = None
+        self._consumed = 0
+        self._ended = False
+        """Its terminal frame arrived (a ``ReplyEnd``, or the loss of the hub's stream): nothing is cancelled then."""
+
+    async def __aenter__(self) -> Stream[T]:
+        """Sends the request and returns once the stream is open: its first part, or its end."""
+        if self._state is not _State.NEW:
+            raise RuntimeError(
+                f"a stream of {self._type} is entered once: `async with app.stream(...)` is the one block that sends it"
+            )
+        self._state = _State.OPEN
+        try:
+            await self._sender.with_retry(self._prepared, self._attempt, whole_timeout=True)
+        except BaseException:
+            self._state = _State.CLOSED
+            raise
+        self._items = self._read()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Cancels the stream when it has not ended, and releases what this library holds of it: no task is left."""
+        try:
+            await self._close_items()
+        finally:
+            if self._ended:
+                self._release(cancel=False)
+            else:
+                self._release(cancel=True, reason=_cancel_reason(exc))
+            self._state = _State.CLOSED
+
+    def __aiter__(self) -> AsyncIterator[T]:
+        if self._state is not _State.OPEN or self._items is None:
+            raise RuntimeError(
+                f"the items of {self._type} are read inside `async with app.stream(...) as items`, with `async for`"
+            )
+        return self._items
+
+    async def _attempt(self, template: hub_pb2.Request, chosen: float | None) -> None:
+        """One attempt: the request on one hub, and the wait for its first frame; a retryable failure of it is the
+        retry's, and a stream that opened keeps its entry for the items that follow."""
+        entry: _StreamEntry | None = None
+
+        def make(message: hub_pb2.ClientMessage) -> OutboundRequest:
+            nonlocal entry
+            entry = _StreamEntry(message)
+            return entry
+
+        try:
+            answered = await self._sender.route(template, chosen, entry=make, walk=False, queue_wait=True)
+        except BaseException as e:
+            # Only this library's own guard, or a cancellation, gives up a stream the hub may still be serving: the
+            # hub's own errors and a never-sent request need no Cancel.
+            local_timeout = _is_local_timeout(e)
+            if entry is not None and (local_timeout or isinstance(e, asyncio.CancelledError)):
+                self._let_go(entry, cancel=True, reason=NO_PART_GUARD if local_timeout else CANCEL_REASON)
+            raise
+        message = answered.message
+        kind = message.WhichOneof("message")
+        if kind == "error":
+            raise error_from_wire(message.error, self._type)
+        if message.end.HasField("error"):
+            raise error_from_wire(message.end.error, self._type)
+        opened = cast("_StreamEntry", answered.entry)
+        if opened.stream is not None:
+            opened.stream.regain(opened)  # its parts and its end reach it after the first frame
+            self._sender.pending[opened.id] = opened
+        self._entry = opened
+
+    async def _read(self) -> AsyncGenerator[T, None]:
+        """The items, in the seq the handler gave them, refilling the credit as the caller consumes them."""
+        entry = self._entry
+        assert entry is not None  # a stream is open only once its entry is here
+        codec = self._sender.codec
+        while True:
+            frame = await self._next(entry)
+            if isinstance(frame, Lost):
+                self._ended = True
+                raise OutcomeUnknown(frame.why)
+            kind = frame.WhichOneof("message")
+            if kind == "part":
+                item = codec.decode(frame.part.payload or b"{}", self._item)
+                self._consumed += 1
+                if self._consumed >= self._refill:
+                    self._consumed = 0
+                    self._flow(entry, self._refill)
+                yield item
+                continue
+            self._ended = True
+            if kind == "error":
+                raise error_from_wire(frame.error, self._type)
+            if frame.end.HasField("error"):
+                raise error_from_wire(frame.end.error, self._type)
+            return
+
+    async def _next(self, entry: _StreamEntry) -> hub_pb2.ServerMessage | Lost:
+        """The next frame of the stream, at most the hub's bound for the request plus the local margin after the one
+        before it: a gap fails it as lost parts and cancels the open stream, an end short of parts fails it as lost
+        parts with nothing to cancel, and a hub stream that ends fails it as an unknown outcome."""
+        if entry.gap is not None:
+            self._ended = True
+            self._let_go(entry, cancel=True, reason=entry.gap)
+            raise LostParts(entry.gap)
+        try:
+            async with asyncio.timeout(self._guard(entry)):
+                frame = await entry.frames.get()
+        except TimeoutError:
+            self._ended = True
+            self._let_go(entry, cancel=True, reason=NO_PART_GUARD)
+            raise HubError(ErrorCode.TIMEOUT, _TIMEOUT.format(type=self._type)) from None
+        if entry.gap is not None:  # the frame that reported it is no part of the stream
+            self._ended = True
+            self._let_go(entry, cancel=True, reason=entry.gap)
+            raise LostParts(entry.gap)
+        if entry.short is not None:  # the stream ended, short of the parts its end counted
+            self._ended = True
+            raise LostParts(entry.short)
+        return frame
+
+    def _guard(self, entry: _StreamEntry) -> float:
+        """The local guard of the wait for the next frame: the hub's bound for the request plus the margin."""
+        stream = entry.stream
+        return self._sender.guard_for(None if stream is None else stream.ack, self._type, self._prepared.chosen)
+
+    def _flow(self, entry: _StreamEntry, credits: int) -> None:
+        """Grants credits more parts for the stream, on the stream it was sent on."""
+        stream = entry.stream
+        if stream is not None:
+            stream.put(hub_pb2.ClientMessage(flow=hub_pb2.Flow(request_id=entry.id, credits=credits)))
+
+    def _release(self, *, cancel: bool, reason: str = CANCEL_REASON) -> None:
+        """Drops what this library holds of the stream, and with cancel writes the ``Cancel`` (when the stream has not
+        ended): its entry waits for no frame, and the credits stop."""
+        entry, self._entry = self._entry, None
+        if entry is not None:
+            self._let_go(entry, cancel=cancel, reason=reason)
+
+    def _let_go(self, entry: _StreamEntry, *, cancel: bool, reason: str) -> None:
+        """Forgets a stream's entry here and, with cancel, tells the hub to stop it on the stream it was sent on."""
+        stream = entry.stream
+        if cancel and stream is not None:
+            stream.put(hub_pb2.ClientMessage(cancel=hub_pb2.Cancel(request_id=entry.id, reason=reason)))
+        if self._sender.pending.get(entry.id) is entry:
+            del self._sender.pending[entry.id]
+        if stream is not None:
+            stream.forget(entry)
+
+    async def _close_items(self) -> None:
+        """Closes the generator the caller was reading, so that nothing of it stays suspended."""
+        items, self._items = self._items, None
+        if items is not None:
+            await cast("AsyncGenerator[T, None]", items).aclose()
+
+
+def stream[T](
+    sender: Sender,
+    query: object,
+    item: type[T],
+    *,
+    initial_credit: int | None = None,
+    max_results: int = 0,
+    timeout: float | None = None,
+    priority: int | None = None,
+    headers: Mapping[str, str] | None = None,
+    retry: RetryPolicy | Literal[False] | None = None,
+) -> Stream[T]:
+    """A stream of query's items: its request built here, once its options are checked (nothing sent yet), and sent by
+    ``async with``. ``initial_credit`` is the sender's window (None or 0: the protocol's 64); ``max_results`` ends the
+    stream after that many parts at the hub (0: until the handler completes)."""
+    credit = _credit(initial_credit, sender)
+    _check_max_results(max_results)
+    prepared = sender.prepare(
+        query,
+        "query",
+        routing_key=None,
+        timeout=timeout,
+        priority=priority,
+        headers=headers,
+        retry=retry,
+        mode=hub_pb2.STREAMING,
+    )
+    prepared.template.initial_credit = credit
+    prepared.template.max_results = max_results
+    return Stream(sender, prepared, item, credit=credit, type_=type_name(query))
+
+
+def _credit(initial_credit: int | None, sender: Sender) -> int:
+    if initial_credit is None:
+        return sender.default_credit
+    if isinstance(initial_credit, bool) or not isinstance(initial_credit, int):
+        raise TypeError(f"initial_credit must be an integer or None, got {initial_credit!r}")
+    if not 0 <= initial_credit <= _UINT32_MAX:
+        raise ValueError(f"initial_credit must be from 0 to {_UINT32_MAX}, got {initial_credit!r}")
+    # 0 reads as 64 at the hub; this library sends the window it will refill from instead.
+    return initial_credit or sender.default_credit
+
+
+def _check_max_results(max_results: int) -> None:
+    if isinstance(max_results, bool) or not isinstance(max_results, int):
+        raise TypeError(f"max_results must be an integer, got {max_results!r}")
+    if not 0 <= max_results <= _UINT32_MAX:
+        raise ValueError(f"max_results must be from 0 (no limit) to {_UINT32_MAX}, got {max_results!r}")
+
+
+def _is_local_timeout(exc: BaseException) -> bool:
+    """Whether exc is this library's own guard giving up a request (``HubError`` ``TIMEOUT`` from the wait, not from
+    the hub): only that one leaves a stream the hub may still be serving."""
+    return isinstance(exc, HubError) and exc.code == ErrorCode.TIMEOUT
+
+
+def _cancel_reason(exc: tuple[object, ...]) -> str:
+    """Why the caller's end of the stream cancels it: a break or a cancellation, or the exception that left the body."""
+    failure = exc[1] if len(exc) > 1 else None
+    if failure is None or isinstance(failure, asyncio.CancelledError):
+        return CANCEL_REASON
+    if isinstance(failure, BaseException):
+        return f"collector failed: {type(failure).__name__}: {failure}"
+    return CANCEL_REASON

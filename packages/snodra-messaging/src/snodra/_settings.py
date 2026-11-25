@@ -75,6 +75,9 @@ class Settings:
     always_route_through_hub: bool = False
     """Every command and query goes through a hub, also one of a type this instance handles
     (``SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB``); by default those are answered in-process."""
+    stream_credit_timeout: float = 600.0
+    """The longest a streaming handler waits for a credit before it ends its stream with ``TIMEOUT``
+    (``SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS``, 10 minutes by default: the hub's default maximum stream duration)."""
     credentials: Credential | None = None
     """The instance's credential towards the hubs, for a hub whose access control asks for one: a :class:`Token`
     (``SNODRA_SERVER_TOKEN``), a :class:`TokenFile` (``SNODRA_SERVER_TOKEN_FILE``, which wins over the token), a JWT
@@ -131,6 +134,12 @@ class Settings:
                     f"priorities (SNODRA_SERVER_PRIORITIES): {k!r}={n!r} is not a type name and a 32-bit integer"
                 )
         object.__setattr__(self, "priorities", MappingProxyType(dict(self.priorities)))
+        credit = self.stream_credit_timeout
+        if not _is_number(credit) or not math.isfinite(credit) or credit <= 0:
+            raise ConfigurationError(
+                "stream_credit_timeout (SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS) must be a positive number of seconds, "
+                f"got {credit!r}"
+            )
         self._check_identity()
         self._check_credentials()
         for name, variable in (
@@ -270,6 +279,8 @@ class Settings:
             values["forward_jwt"] = _env_bool("SNODRA_FORWARD_JWT", v)
         if (v := get("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB")) is not None:
             values["always_route_through_hub"] = _env_bool("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB", v)
+        if (v := get("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS")) is not None:
+            values["stream_credit_timeout"] = _env_positive_int("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", v) / 1000
         grant = _env_credentials(get, values)
         _env_tls(get, values)
         values |= overrides
@@ -460,6 +471,13 @@ def _env_int(name: str, value: str) -> int:
     if not re.fullmatch(r"\d+", value):
         raise ConfigurationError(f"{name} must be a non-negative integer, got {value!r}")
     return int(value)
+
+
+def _env_positive_int(name: str, value: str) -> int:
+    n = _env_int(name, value)
+    if n < 1:
+        raise ConfigurationError(f"{name} must be a positive integer, got {value!r}")
+    return n
 
 
 def _env_bool(name: str, value: str) -> bool:

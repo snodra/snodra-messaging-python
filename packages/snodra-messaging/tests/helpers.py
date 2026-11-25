@@ -478,6 +478,14 @@ class GetStock:
     sku: str
 
 
+@message_type("orders.ListOrders")
+@dataclass
+class ListOrders:
+    """A streaming query: its handler yields one item per order."""
+
+    order_id: str
+
+
 @dataclass
 class Stock:
     count: int

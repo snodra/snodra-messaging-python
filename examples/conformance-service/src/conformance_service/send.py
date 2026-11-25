@@ -21,7 +21,18 @@ from snodra import (
     RetryPolicy,
 )
 
-from conformance_service.messages import Echo, EchoQuery, Missing, Outcome, Probe, ProbeQuery, Send, SharedQuery
+from conformance_service.messages import (
+    Echo,
+    EchoQuery,
+    Missing,
+    Outcome,
+    Probe,
+    ProbeQuery,
+    ProbeStream,
+    Send,
+    SharedQuery,
+    Stream,
+)
 
 _UNARY: dict[str, tuple[type[RawJson], bool]] = {
     "probe": (Probe, False),
@@ -32,6 +43,12 @@ _UNARY: dict[str, tuple[type[RawJson], bool]] = {
     "shared-query": (SharedQuery, True),
 }
 """The unary targets: the message class and whether it is a query."""
+
+_STREAMED: dict[str, type] = {
+    "probe-stream": ProbeStream,
+    "stream": Stream,
+}
+"""The streaming targets: the message class of each (its items are read as ``RawJson``)."""
 
 _GATHERED: dict[str, type[RawJson]] = {
     "probe-query": ProbeQuery,
@@ -113,7 +130,9 @@ class Sends:
             out = await self._unary(m)
         elif m.op == "scatter":
             out = await self._scatter(m)
-        elif m.op in ("stream", "subscribe"):
+        elif m.op == "stream":
+            out = await self._stream(m)
+        elif m.op == "subscribe":
             out = _unsupported(f"op {m.op} is not supported by this service yet")
         else:
             out = _unsupported(f"op {m.op} is not a contract op")
@@ -136,6 +155,35 @@ class Sends:
         except Exception as e:
             return {"result": "error", "error": classify(e)}
         return {"result": "ok", "payload": None if reply is None else reply.value}
+
+    async def _stream(self, m: Send) -> dict[str, Any]:
+        """A streaming query of the target, read as the contract's outcome: the items in order, and whether the stream
+        completed or the caller stopped after ``read`` items (which cancels it)."""
+        cls = _STREAMED.get(m.target)
+        if cls is None:
+            return _unsupported(f"target {m.target} is not a streaming target of this service")
+        items: list[Any] = []
+        stopped = False
+        try:
+            options = _options(m)
+            del options["routing_key"]  # a stream goes to one target: unkeyed
+            async with self._app.stream(
+                cls(m.payload),
+                RawJson,
+                initial_credit=m.initial_credit,
+                max_results=m.max_results or 0,
+                **options,
+            ) as stream:
+                async for item in stream:
+                    items.append(item.value)
+                    if m.read_delay_ms:
+                        await asyncio.sleep(m.read_delay_ms / 1000)
+                    if m.read is not None and len(items) >= m.read:
+                        stopped = True
+                        break
+        except Exception as e:
+            return {"result": "error", "items": items, "error": classify(e)}
+        return {"result": "ok", "items": items, "end": "stopped" if stopped else "completed"}
 
     async def _scatter(self, m: Send) -> dict[str, Any]:
         """A scatter-gather of the query target with the library's gather: one part per answer, in arrival order,

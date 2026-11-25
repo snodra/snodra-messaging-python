@@ -45,6 +45,20 @@ class SharedQuery(RawJson):
     """A query registered in ``Register.shared_query_types``: other services may own it too."""
 
 
+@message_type("conformance.Stream")
+@dataclass
+class Stream:
+    """A streaming query: count items {n: 1..count}, each after delayMs."""
+
+    count: int = 0
+    delay_ms: int = 0
+
+
+@message_type("conformance.runner.ProbeStream")
+class ProbeStream(RawJson):
+    """A streaming query the runner answers part by part; the service passes the payload unchanged."""
+
+
 @message_type("conformance.Fail")
 @dataclass
 class Fail:

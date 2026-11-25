@@ -81,9 +81,31 @@ async def test_the_register_lists_the_contracts_unary_types(hub: FakeHub, servic
         "conformance.EchoQuery",
         "conformance.Outcome",
         "conformance.SleepQuery",
+        "conformance.Stream",
         "conformance.View",
     ]
     assert list(r.shared_query_types) == ["conformance.SharedQuery"]
+
+
+async def test_stream_answers_count_items_one_part_at_a_time(hub: FakeHub, service: App) -> None:
+    s = await _stream(hub)
+    request = hub_pb2.Request(
+        id="stream-1#1",
+        kind=hub_pb2.QUERY,
+        type="conformance.Stream",
+        payload=b'{"count":3,"delayMs":10}',
+        mode=hub_pb2.STREAMING,
+        initial_credit=2,
+    )
+    await s.send(forward(request))
+    one, two = await s.recv_part(), await s.recv_part()
+    assert [(p.request_id, p.seq) for p in (one, two)] == [("stream-1#1", 1), ("stream-1#1", 2)]
+    assert [json.loads(p.payload) for p in (one, two)] == [{"n": 1}, {"n": 2}]
+    await s.send(hub_pb2.ServerMessage(flow=hub_pb2.Flow(request_id="stream-1#1", credits=1)))
+    three = await s.recv_part()
+    end = await s.recv_end()
+    assert (three.seq, json.loads(three.payload)) == (3, {"n": 3})
+    assert (end.request_id, end.parts, end.HasField("error")) == ("stream-1#1", 3, False)
 
 
 async def test_echo_answers_what_it_got(hub: FakeHub, service: App) -> None:

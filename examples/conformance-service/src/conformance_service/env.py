@@ -26,6 +26,8 @@ def settings_from_env(environ: Mapping[str, str]) -> Settings:
     capacity = get("CONFORMANCE_CAPACITY")
     values["max_concurrent"] = DEFAULT_CAPACITY if capacity is None else int(capacity)
     values["default_retry"] = _retry(get)
+    if (credit := get("CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS")) is not None:
+        values["stream_credit_timeout"] = _positive_ms("CONFORMANCE_STREAM_CREDIT_TIMEOUT_MS", credit) / 1000
     # Every call goes through the hub, also one of the service's own types: the runner sees what is sent.
     values["always_route_through_hub"] = True
     # The callers' tokens are verified only where the runner gives its issuer (conformance.Guarded needs it).
@@ -54,6 +56,13 @@ def _credentials(get: Callable[[str], str | None], values: dict[str, Any]) -> No
     cert, key = get("CONFORMANCE_TLS_CLIENT_CERT"), get("CONFORMANCE_TLS_CLIENT_KEY")
     if cert is not None or key is not None:
         values["client_certificate"] = ClientCertificate(cert or "", key or "")
+
+
+def _positive_ms(name: str, value: str) -> int:
+    """A positive whole number of milliseconds, as the runner's timeout variables are."""
+    if not (value.isascii() and value.isdigit()) or int(value) < 1:
+        raise ConfigurationError(f"{name} must be a positive integer of milliseconds, got {value!r}")
+    return int(value)
 
 
 def _retry(get: Callable[[str], str | None]) -> RetryPolicy | None:

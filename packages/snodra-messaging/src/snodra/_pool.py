@@ -59,6 +59,7 @@ class Pool:
                 on_rejection=self._rejected,
                 on_request=None if dispatcher is None else dispatcher.on_request,
                 on_cancel=None if dispatcher is None else dispatcher.on_cancel,
+                on_flow=None if dispatcher is None else dispatcher.on_flow,
                 on_answer=on_answer,
                 credentials=credentials,
                 tls=settings.tls,

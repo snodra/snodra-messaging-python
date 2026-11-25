@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
 
 from snodra import App, HandlerError, RawJson, Settings, caller_matches, current_caller, current_message
 
@@ -26,6 +27,7 @@ from conformance_service.messages import (
     Sleep,
     SleepAnswer,
     SleepQuery,
+    Stream,
     Strict,
     StrictAnswer,
     View,
@@ -73,6 +75,13 @@ def register_handlers(app: App, settings: Settings) -> Sends:
     @app.query_handler(shared=True)  # other services may own it too
     async def on_shared_query(m: SharedQuery) -> SharedQueryAnswer:
         return SharedQueryAnswer(settings.service, instance)
+
+    @app.stream_handler
+    async def on_stream(m: Stream) -> AsyncIterator[dict[str, int]]:
+        for n in range(1, m.count + 1):
+            if m.delay_ms > 0:
+                await asyncio.sleep(m.delay_ms / 1000)
+            yield {"n": n}
 
     @app.command_handler
     async def on_fail(m: Fail) -> None:

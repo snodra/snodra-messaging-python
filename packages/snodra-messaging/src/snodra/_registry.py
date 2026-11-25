@@ -39,6 +39,8 @@ class Handler:
     """Who may call it; None: anyone, an anonymous caller too."""
     shared: bool = False
     """A query type many services may own (``Register.shared_query_types``); a command is never shared."""
+    stream: bool = False
+    """A streaming query handler: an async generator function, whose query type is served in mode ``STREAMING``."""
 
 
 def label_of(fn: object) -> str:
@@ -58,14 +60,22 @@ class Registry:
         """No handler is registered from now on."""
         self._closed = True
 
-    def add(self, kind: Kind, fn: object, guard: Guard | None = None, *, shared: bool = False) -> Handler:
+    def add(
+        self, kind: Kind, fn: object, guard: Guard | None = None, *, shared: bool = False, stream: bool = False
+    ) -> Handler:
         """Registers fn as the kind's handler of the type its first parameter is annotated with, for the callers
-        guard lets through; a shared query type when shared. Raises :class:`RegistrationClosed` once closed and
+        guard lets through; a shared query type when shared, a streaming query handler when stream (an async generator
+        function, whose type is served in mode ``STREAMING``). Raises :class:`RegistrationClosed` once closed and
         ``TypeError`` for what cannot be served, naming the handler."""
         label = label_of(fn)
         if self._closed:
             raise RegistrationClosed(f"handler {label}: handlers are registered before the app starts")
-        if not inspect.iscoroutinefunction(fn):
+        if stream:
+            if kind != "query":
+                raise TypeError(f"handler {label}: a command type is never streamed")
+            if not inspect.isasyncgenfunction(fn):
+                raise TypeError(f"stream handler {label} must be an async generator function taking the message")
+        elif not inspect.iscoroutinefunction(fn):
             raise TypeError(f"handler {label} must be an async def taking the message")
         message = _message_class(fn, label)
         name = type_name(message)
@@ -79,7 +89,7 @@ class Registry:
             raise TypeError(f"handler {label}: type {name} already has the {kind} handler {taken.label}")
         if shared and kind != "query":
             raise TypeError(f"handler {label}: a command type is never shared")
-        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard, shared)
+        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard, shared, stream)
         self._handlers[kind][name] = handler
         return handler
 

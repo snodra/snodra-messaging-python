@@ -223,6 +223,12 @@ class _Stream:
             request.withdrawn = True
             self._left_buffer()
 
+    def regain(self, request: OutboundRequest) -> None:
+        """Its caller keeps waiting for frames after the request's first answer (a stream's parts): the frames of its
+        id reach it again, and a stream that ends fails it like any other request of the stream."""
+        request.stream = self
+        self.requests[request.id] = request
+
     def stop_requests(self, why: str) -> None:
         """The connection stops: every waiting request ends now. One still buffered is withdrawn (never written,
         never sent); a written one has an unknown outcome (``why``)."""
@@ -356,6 +362,7 @@ class HubConnection:
         on_rejection: Callable[[Rejection], None],
         on_request: Callable[[_Stream, hub_pb2.Request], None] | None = None,
         on_cancel: Callable[[_Stream, hub_pb2.Cancel], None] | None = None,
+        on_flow: Callable[[_Stream, hub_pb2.Flow], None] | None = None,
         on_answer: Callable[[_Stream, hub_pb2.ServerMessage], None] | None = None,
         credentials: HubCredentials | None = None,
         tls: _tls.TLSConfig | None = None,
@@ -369,6 +376,7 @@ class HubConnection:
         self._on_rejection = on_rejection
         self._on_request = on_request
         self._on_cancel = on_cancel
+        self._on_flow = on_flow
         self._on_answer = on_answer
         self._gate: asyncio.Event | None = None  # the writer waits on it before writing a frame (a test hook)
         self._options = [
@@ -796,6 +804,8 @@ class HubConnection:
                         self._hand_over(self._on_request, stream, m.request)
                     case "cancel" if self._on_cancel is not None:
                         self._hand_over(self._on_cancel, stream, m.cancel)
+                    case "flow" if self._on_flow is not None:
+                        self._hand_over(self._on_flow, stream, m.flow)
                     case "reply" | "error" | "part" | "end" if self._on_answer is not None:
                         self._hand_over(self._on_answer, stream, m)
         except grpc.aio.AioRpcError as e:
