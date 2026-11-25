@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from fakehub import FakeHub, FakeStream, ack
-from helpers import WatchInitial, WatchOrders, WatchUpdate, acknowledged, eventually, library_tasks, new_app
+from helpers import WatchInitial, WatchOrders, WatchUpdate, acknowledged, eventually, library_tasks, new_app, within
 from snodra import App, ErrorCode, HubError, LostParts, RetryPolicy
 from snodra._hubpb import hub_pb2
 
@@ -255,7 +255,7 @@ async def test_the_subscriptions_guard_and_retries(hub: FakeHub) -> None:
     with pytest.raises(HubError) as raised:
         await call
     assert raised.value.code == ErrorCode.TIMEOUT
-    assert time.monotonic() - started >= 1.15
+    within(time.monotonic() - started, 1.15, 1.6)  # the hub's 200 ms bound plus the 1 s margin, and no more
     cancel = await _next_cancel(s)
     assert (cancel.request_id, cancel.reason) == (r.id, "no initial result within the local guard")
     assert not app._sender.pending

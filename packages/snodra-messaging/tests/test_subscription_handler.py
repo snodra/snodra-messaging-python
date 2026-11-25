@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 
 import pytest
 from fakehub import FakeHub, FakeStream, ack, cancel, forward
@@ -214,6 +215,72 @@ async def test_the_checks_when_the_request_is_read(hub: FakeHub, jwks: Jwks) -> 
     assert app.subscriptions_served == 2
 
 
+async def test_the_limit_is_decided_before_the_type_is_served(hub: FakeHub) -> None:
+    """The specification (protocol.md, "Subscription"): "The limit, and an id already open (`ReplyEnd{error =
+    INVALID_REQUEST}` `subscription <id> is already open`, the open one kept), are decided when the request is read,
+    before the token check." The handler lookup runs later, in the admission, so a type this instance does not serve
+    is refused by the limit first."""
+    app = new_app(hub, max_subscriptions=1)
+    _watch(app)
+    await app.start()
+    s = await acknowledged(hub)
+    await s.send(_target("w#1"))
+    await eventually(lambda: app.subscriptions_served == 1)
+    await s.send(_target("x#1", type="orders.NotServed"))
+    end = await s.recv_end()
+    assert (end.request_id, end.parts) == ("x#1", 0)
+    assert (end.error.code, end.error.message) == (hub_pb2.RESOURCE_EXHAUSTED, "subscription limit (1) reached")
+    assert app.subscriptions_served == 1
+
+
+async def test_a_refused_admission_writes_only_its_end(hub: FakeHub, jwks: Jwks) -> None:
+    """A target is registered when its request is read, so an emit lands while its admission still runs; a refused
+    admission drops what was held and writes the one ``ReplyEnd`` with ``parts`` 0: no part precedes it."""
+    jwks.delay = 0.2  # the admission waits for the token's keys, so the emit below is held by the target
+    app = new_app(hub, jwks_url=jwks.url, issuer=ISSUER)
+    updates = _watch(app)
+    await app.start()
+    s = await acknowledged(hub)
+    refused = forward(
+        hub_pb2.Request(
+            id="w#1",
+            kind=hub_pb2.QUERY,
+            type="orders.WatchOrders",
+            payload=TARGET,
+            headers={"authorization": f"Bearer {jwks.mint(exp=time.time() - 60)}"},
+            mode=hub_pb2.SUBSCRIPTION,
+            initial_credit=1,
+        )
+    )
+    await s.send(refused)
+    await eventually(lambda: app.subscriptions_served == 1)  # registered before the admission decided
+    assert updates.emit(lambda w: w.topic == "t", WatchUpdate("t", 7)) == 1  # held for the pending admission
+    end = await s.recv_end(within=3.0)
+    assert (end.request_id, end.parts) == ("w#1", 0)
+    assert (end.error.code, end.error.message) == (hub_pb2.UNAUTHENTICATED, "token expired")
+    assert app.subscriptions_served == 0
+    await s.nothing(0.2, "part", "end")  # the held part was dropped, and the refusal ended it once
+
+    # An empty token is refused the same way, immediately: the only frame of the target is its end.
+    await s.send(
+        forward(
+            hub_pb2.Request(
+                id="w#2",
+                kind=hub_pb2.QUERY,
+                type="orders.WatchOrders",
+                payload=TARGET,
+                headers={"authorization": "Bearer "},
+                mode=hub_pb2.SUBSCRIPTION,
+                initial_credit=1,
+            )
+        )
+    )
+    end = await s.recv_end()
+    assert (end.request_id, end.parts) == ("w#2", 0)
+    assert (end.error.code, end.error.message) == (hub_pb2.UNAUTHENTICATED, "malformed authorization header")
+    await s.nothing(0.2, "part", "end")
+
+
 async def test_fail_ends_with_the_error(hub: FakeHub) -> None:
     app = new_app(hub)
     watch = _watch(app)
@@ -272,6 +339,22 @@ async def test_emit_from_another_thread_is_refused(hub: FakeHub) -> None:
             await asyncio.to_thread(call)
     assert app.subscriptions_served == 1  # nothing was written or ended
     await s.nothing(0.2, "part", "end")
+
+
+async def test_an_emit_before_start_says_the_app_is_not_started(hub: FakeHub) -> None:
+    app = new_app(hub)
+    watch = _watch(app)
+    # No loop is bound yet: the emitter is on the app's loop but the app is not started. That is the reason given,
+    # not "another thread" (which the thread rule names for a call the loop does not run).
+    calls: tuple[Callable[[], object], ...] = (
+        lambda: watch.emit(lambda w: True, WatchUpdate("t", 1)),
+        lambda: watch.complete(lambda w: True),
+        lambda: watch.fail(lambda w: True, "gone"),
+    )
+    for call in calls:
+        with pytest.raises(RuntimeError, match="not started") as raised:
+            call()
+        assert "another thread" not in str(raised.value)
 
 
 async def test_concurrent_emit_cancel_and_complete(hub: FakeHub) -> None:

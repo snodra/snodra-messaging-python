@@ -75,11 +75,6 @@ class ServedSubscription:
         self._held: list[bytes | _End] | None = [] if payload is not None else None
         """The updates and the end held while pending; None once the admission decided."""
 
-    @property
-    def pending(self) -> bool:
-        """True while its admission runs."""
-        return self._held is not None
-
     def update(self, payload: bytes) -> bool:
         """Writes one update (holds it while pending); False when the subscription ended or its stream is gone."""
         if self._ended:
@@ -171,10 +166,6 @@ class Subscriptions:
 
     def __len__(self) -> int:
         return len(self._open)
-
-    def all(self) -> list[ServedSubscription]:
-        """Every open subscription, in no particular order."""
-        return list(self._open.values())
 
     def of(self, type_: str) -> list[ServedSubscription]:
         """The open subscriptions of type_, in no particular order."""
@@ -335,13 +326,19 @@ class Updates[Q, U]:
         return found
 
     def _check_loop(self, method: str) -> None:
-        """Refuses a call from another thread: it must be handed to the app's loop with ``call_soon_threadsafe``."""
+        """Refuses a call before the app started, and one from another thread: the latter must be handed to the app's
+        loop with ``call_soon_threadsafe``."""
         loop = self._subscriptions.loop
+        if loop is None:
+            raise RuntimeError(
+                f"Updates.{method} runs on the app's event loop only, and the app is not started: call it after "
+                "`await app.start()`"
+            )
         try:
             current = asyncio.get_running_loop()
         except RuntimeError:
             current = None
-        if loop is None or current is not loop:
+        if current is not loop:
             raise RuntimeError(
                 f"Updates.{method} runs on the app's event loop only: from another thread, use "
                 f"loop.call_soon_threadsafe(updates.{method}, ...)"

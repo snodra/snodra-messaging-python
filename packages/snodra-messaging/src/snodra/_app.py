@@ -505,13 +505,14 @@ class App:
 
     async def shutdown(self, timeout: float = 15.0) -> None:  # noqa: ASYNC109 (the API takes a timeout)
         """Leaves the hubs in order and stops every connection, within ``timeout``: a ``Register`` with no types on
-        every live stream (its ack awaited for at most 1 s), then the handlers in flight drained (awaited for at most
-        5 s, then cancelled and never awaited again), then each stream half-closed and its end awaited (at most 2 s).
-        A handler still running when ``timeout`` is reached is cancelled and left behind: one warning names it. A
-        second call returns at once. The handlers being drained can still send commands and queries, and a stream
-        lost meanwhile is opened again with no types (no new work arrives on it); once the drain is over nothing is
-        sent: a call fails as :class:`NeverSent`, and one still waiting for its answer as :class:`OutcomeUnknown`
-        ("hub connection stopped").
+        every live stream (its ack awaited for at most 1 s), then a clean ``ReplyEnd`` on every subscription target this
+        instance serves (so their subscribers hear them end before the stream is gone), then the handlers in flight
+        drained (awaited for at most 5 s, then cancelled and never awaited again), then each stream half-closed and its
+        end awaited (at most 2 s). A handler still running when ``timeout`` is reached is cancelled and left behind: one
+        warning names it. A second call returns at once. The handlers being drained can still send commands and queries,
+        and a stream lost meanwhile is opened again with no types (no new work arrives on it); once the drain is over
+        nothing is sent: a call fails as :class:`NeverSent`, and one still waiting for its answer as
+        :class:`OutcomeUnknown` ("hub connection stopped").
 
         The unexpected error that crashed a connection (a library bug, logged at error level when it happened) is
         raised here once everything is stopped, unless another exception or a cancellation is already propagating

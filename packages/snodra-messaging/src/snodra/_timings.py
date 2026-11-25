@@ -24,7 +24,8 @@ class Timings:
     deregister_wait: float
     """Shutdown: the longest wait for the acks of the empty ``Register``."""
     subscription_end: float
-    """Shutdown: the longest wait for the served subscriptions to end."""
+    """Shutdown: the phase the served subscriptions end in. Their ``ReplyEnd``\\ s are queued before the half-close, so
+    nothing waits on this (the shipped value is part of the published timings)."""
     handler_drain: float
     """Shutdown: the longest wait for the handlers in flight."""
     close_wait: float
