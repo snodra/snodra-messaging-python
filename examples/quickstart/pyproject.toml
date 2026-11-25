@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.33,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orders-quickstart"
+version = "0.0.0"
+description = "Quick start service of snodra-messaging; not published."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+classifiers = ["Private :: Do Not Upload"]
+dependencies = ["snodra-messaging"]
+
+[tool.uv.sources]
+snodra-messaging = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orders_quickstart"]

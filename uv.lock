@@ -8,6 +8,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "orders-quickstart",
     "snodra-conformance-service",
     "snodra-messaging",
     "snodra-messaging-observability",
@@ -873,6 +874,17 @@ wheels = [
 ]
 
 [[package]]
+name = "orders-quickstart"
+version = "0.0.0"
+source = { editable = "examples/quickstart" }
+dependencies = [
+    { name = "snodra-messaging" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "snodra-messaging", editable = "packages/snodra-messaging" }]
+
+[[package]]
 name = "packaging"
 version = "26.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1144,6 +1156,7 @@ source = { virtual = "." }
 dev = [
     { name = "mypy" },
     { name = "opentelemetry-sdk" },
+    { name = "orders-quickstart" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
@@ -1165,6 +1178,7 @@ gen = [
 dev = [
     { name = "mypy", specifier = "==2.4.1" },
     { name = "opentelemetry-sdk", specifier = "==1.45.2" },
+    { name = "orders-quickstart", editable = "examples/quickstart" },
     { name = "pytest", specifier = "==9.2.0" },
     { name = "pytest-asyncio", specifier = "==1.5.0" },
     { name = "pytest-timeout", specifier = "==2.4.0" },

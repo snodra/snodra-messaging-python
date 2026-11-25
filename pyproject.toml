@@ -15,6 +15,7 @@ members = ["packages/*", "examples/*"]
 snodra-messaging = { workspace = true }
 snodra-conformance-service = { workspace = true }
 snodra-messaging-observability = { workspace = true }
+orders-quickstart = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -29,6 +30,7 @@ dev = [
     "snodra-messaging",
     "snodra-conformance-service",
     "snodra-messaging-observability",
+    "orders-quickstart",
     "opentelemetry-sdk==1.45.2",
 ]
 gen = ["grpcio-tools==1.85.4"]

@@ -19,7 +19,7 @@
 # the AirPlay Receiver holds port 7000, so run there with, say, SNODRA_HUB_PORT=17000.
 set -euo pipefail
 
-runner_version=v0.3.0
+runner_version=v0.4.1
 server_image="snodra/snodra-server:${SNODRA_SERVER_VERSION:-0.6.0}"
 base_port="${SNODRA_HUB_PORT:-7000}"
 port_error="SNODRA_HUB_PORT must be a port number from 1 to 65435, got '$base_port'"

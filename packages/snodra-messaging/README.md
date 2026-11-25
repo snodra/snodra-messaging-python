@@ -1,6 +1,15 @@
 # snodra-messaging
 
-The official Python client library of the Snodra messaging suite, for asyncio services routed by Snodra Server.
-Documentation: https://snodra.damoreira.com/
+Commands, queries, streams, scatter-gathers and subscriptions for asyncio services, routed by Snodra Server.
 
-Apache-2.0.
+## Install
+
+```sh
+pip install snodra-messaging
+```
+
+## Links
+
+- Documentation: <https://snodra.damoreira.com/docs/messaging/python/>
+- Repository: <https://github.com/snodra/snodra-messaging-python>
+- PyPI: <https://pypi.org/project/snodra-messaging/>

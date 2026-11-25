@@ -95,3 +95,70 @@ jobs:
       - run: >-
           "$RUNNER_TEMP/v/bin/python" -c
           "import snodra, snodra._hubpb.hub_pb2_grpc; print(snodra.__version__)"
+
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SNODRA_CONFORMANCE_VERSION: v0.4.1
+      SNODRA_SERVER_VERSION: ${{ vars.SNODRA_SERVER_VERSION || '0.6.0' }}
+      SNODRA_CONFORMANCE_REPORT_DIR: ${{ github.workspace }}/conformance-reports
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - run: uv sync --frozen --all-packages --python 3.13
+
+      - name: Fetch the conformance runner
+        run: |
+          archive="snodra-conformance-${SNODRA_CONFORMANCE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          mkdir -p "$RUNNER_TEMP/runner"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/snodra/snodra-conformance/releases/download/${SNODRA_CONFORMANCE_VERSION}/${archive}"
+          # The sha256 pinned for every platform, shared with scripts/conformance.sh.
+          sha256="$(awk -v a="$archive" '$2 == a { print $1 }' scripts/conformance-runner.sha256)"
+          test -n "$sha256"
+          echo "${sha256}  $RUNNER_TEMP/$archive" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/runner"
+          test -x "$RUNNER_TEMP/runner/snodra-conformance"
+          "$RUNNER_TEMP/runner/snodra-conformance" --version
+          echo "SNODRA_CONFORMANCE_BIN=$RUNNER_TEMP/runner/snodra-conformance" >> "$GITHUB_ENV"
+
+      - name: Pull the hub image
+        run: docker pull "snodra/snodra-server:${SNODRA_SERVER_VERSION}"
+
+      - name: Level 1, every check
+        run: |
+          mkdir -p "$SNODRA_CONFORMANCE_REPORT_DIR"
+          SNODRA_CONFORMANCE_REPORT="$SNODRA_CONFORMANCE_REPORT_DIR/level-1.json" \
+            scripts/conformance.sh --report json
+          # Exit 0 is not enough: a check the runner skipped does not fail it.
+          jq -e '.passed == true and .complete == true and .level_reached == 1
+                 and ([.checks[]] | length == 33)
+                 and ([.checks[] | select(.status != "PASS")] | length == 0)' \
+            "$SNODRA_CONFORMANCE_REPORT_DIR/level-1.json" >/dev/null \
+            || { jq -r '.checks[] | select(.status != "PASS") | .id + " " + .status + " " + .detail' \
+                   "$SNODRA_CONFORMANCE_REPORT_DIR/level-1.json"; \
+                 echo "level 1 was not reached, or a check did not pass"; exit 1; }
+
+      - name: Level 1, the two-hub check against two real hubs
+        run: |
+          mkdir -p "$SNODRA_CONFORMANCE_REPORT_DIR"
+          SNODRA_CONFORMANCE_REPORT="$SNODRA_CONFORMANCE_REPORT_DIR/l1-hubs.json" \
+            scripts/conformance.sh --hubs 2 --only L1-HUBS --report json
+          jq -e '[.checks[] | select(.id == "L1-HUBS" and .status == "PASS"
+                                     and (.detail | contains("registered on both real hubs")))] | length == 1' \
+            "$SNODRA_CONFORMANCE_REPORT_DIR/l1-hubs.json" >/dev/null \
+            || { jq -r '.checks[] | .id + " " + .status + " " + .detail' \
+                   "$SNODRA_CONFORMANCE_REPORT_DIR/l1-hubs.json"; \
+                 echo "L1-HUBS did not register on both real hubs"; exit 1; }
+
+      - name: Keep the runner's reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conformance-reports
+          path: conformance-reports/
+          if-no-files-found: warn
+
