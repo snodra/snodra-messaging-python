@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
 import snodra
 from fakehub import FakeHub, ack, hub_error
 from helpers import TokenAnswer, eventually, new_app, next_reply, start_app
-from snodra import JsonCodec, NoTelemetry, RetryPolicy, message_type
+from snodra import JsonCodec, NoTelemetry, RetryPolicy, TokenFile, message_type
 from snodra._credentials import ClientCredentialsSource, TokenError
 from snodra._errors import HubError, error_from_wire
 from snodra._hubpb import hub_pb2
@@ -344,3 +345,124 @@ async def test_inject_may_replace_the_forwarded_traceparent(hub: FakeHub) -> Non
 
     # Invalid was dropped, incoming traceparent was forwarded
     assert sent_headers["traceparent"] == incoming_tp
+
+
+async def test_certificate_rotation_is_counted(hub: FakeHub) -> None:
+    rec = TelemetryRecorder()
+    app = new_app(hub, telemetry=rec)
+    # First certificate presented: not counted as rotation
+    app._cert_presented("fp-1")
+    assert rec.certificate_rotations == 0
+
+    # Renewed certificate presented: counted as 1 rotation
+    app._cert_presented("fp-2")
+    assert rec.certificate_rotations == 1
+
+    # A second hub rolls over to it (same fingerprint): not counted again
+    app._cert_presented("fp-2")
+    assert rec.certificate_rotations == 1
+
+    # An older pair is presented (reconnect with old): not counted
+    app._cert_presented("fp-1")
+    assert rec.certificate_rotations == 1
+
+    # A third renewed pair is presented: counted as second rotation
+    app._cert_presented("fp-3")
+    assert rec.certificate_rotations == 2
+
+
+async def test_credentials_refreshes_are_counted(hub: FakeHub, tmp_path: Path) -> None:
+    rec = TelemetryRecorder()
+    file = tmp_path / "hub-token"
+    file.write_text("token-initial\n")
+
+    await start_app(hub, credentials=TokenFile(str(file)), telemetry=rec)
+    s = await hub.next_stream()
+    await s.recv_register()
+    await s.ack(ack("hub-1", interval_ms=100))
+
+    assert rec.credentials_refreshes == 0
+
+    # Modify token file
+    file.write_text("token-renewed\n")
+    c = await s.recv_credentials(within=2.0)
+    assert c.token == "token-renewed"
+
+    await eventually(lambda: rec.credentials_refreshes == 1)
+    assert rec.credentials_refreshes == 1
+
+
+class BuggyTelemetry(NoTelemetry):
+    def request_done(self, kind: str, type_: str, outcome: str, seconds: float) -> None:
+        raise RuntimeError("boom: request_done")
+
+    def token_fetched(self, result: str) -> None:
+        raise RuntimeError("boom: token_fetched")
+
+    def certificate_rotated(self) -> None:
+        raise RuntimeError("boom: certificate_rotated")
+
+    def credentials_refresh_sent(self) -> None:
+        raise RuntimeError("boom: credentials_refresh_sent")
+
+    def observe_gauges(self, read: Any) -> None:
+        raise RuntimeError("boom: observe_gauges")
+
+    def inject(self, headers: dict[str, str]) -> None:
+        raise RuntimeError("boom: inject")
+
+    def handling(self, h: Any) -> Any:
+        class BuggyContext:
+            def __enter__(self) -> None:
+                raise RuntimeError("boom: __enter__")
+
+            def __exit__(self, *args: Any) -> None:
+                raise RuntimeError("boom: __exit__")
+
+        return BuggyContext()
+
+
+async def test_buggy_telemetry_does_not_crash(hub: FakeHub, token_endpoint: Any) -> None:
+    token_endpoint.script = [TokenAnswer(status=200, token="jwt-1")]
+    creds = snodra.ClientCredentials(token_url=token_endpoint.url, client_id="orders-service", client_secret="sec")
+
+    telemetry = BuggyTelemetry()
+    app = new_app(hub, credentials=creds, telemetry=telemetry)
+
+    @app.command_handler
+    async def place_order(cmd: PlaceOrder) -> OrderPlaced:
+        # Outbound call within handler
+        await app.send(GetOrder("o-out"), None)
+        return OrderPlaced("o-1")
+
+    # 1. start() must not crash even if observe_gauges raises
+    await app.start()
+    s = await hub.next_stream()
+    await s.recv_register()
+    await s.ack(ack("hub-1"))
+
+    # 2. certificate_rotated must not crash
+    app._cert_presented("fp-1")
+    app._cert_presented("fp-2")  # triggers certificate_rotated() which raises
+
+    # 3. Request dispatch must not crash even if handling.__enter__ / __exit__ raises
+    await s.send(
+        hub_pb2.ServerMessage(
+            request=hub_pb2.Request(
+                id="req-buggy",
+                kind=hub_pb2.COMMAND,
+                type="orders.PlaceOrder",
+                payload=JsonCodec().encode(PlaceOrder("o-1")),
+            )
+        )
+    )
+
+    # Answering the outbound send from handler (inject raises, request_done raises)
+    m = await s.recv_request()
+    assert m.type == "orders.GetOrder"
+    await s.send(hub_pb2.ServerMessage(reply=hub_pb2.Reply(request_id=m.id, payload=b"{}")))
+
+    # Reply arrives back to hub from handler
+    reply = await next_reply(s)
+    assert reply.request_id == "req-buggy"
+    assert JsonCodec().decode(reply.payload, OrderPlaced) == OrderPlaced("o-1")

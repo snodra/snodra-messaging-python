@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+import logging
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -17,6 +18,8 @@ from snodra._errors import (
     OutcomeUnknown,
     ReservedHeader,
 )
+
+_log = logging.getLogger("snodra.telemetry")
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,91 @@ class NoTelemetry:
 
     def inject(self, headers: dict[str, str]) -> None:
         pass
+
+
+class _GuardedTelemetry:
+    """Wraps a :class:`Telemetry` implementation so that exceptions raised by it are logged and never propagate
+    to crash callers, read loops, handlers, or token renewals."""
+
+    def __init__(self, inner: Telemetry) -> None:
+        self._inner = inner
+
+    def request_done(self, kind: str, type_: str, outcome: str, seconds: float) -> None:
+        try:
+            self._inner.request_done(kind, type_, outcome, seconds)
+        except Exception:
+            _log.warning("telemetry.request_done failed", exc_info=True)
+
+    def token_fetched(self, result: str) -> None:
+        try:
+            self._inner.token_fetched(result)
+        except Exception:
+            _log.warning("telemetry.token_fetched failed", exc_info=True)
+
+    def certificate_rotated(self) -> None:
+        try:
+            self._inner.certificate_rotated()
+        except Exception:
+            _log.warning("telemetry.certificate_rotated failed", exc_info=True)
+
+    def credentials_refresh_sent(self) -> None:
+        try:
+            self._inner.credentials_refresh_sent()
+        except Exception:
+            _log.warning("telemetry.credentials_refresh_sent failed", exc_info=True)
+
+    def observe_gauges(self, read: Callable[[], Gauges]) -> None:
+        def safe_read() -> Gauges:
+            try:
+                return read()
+            except Exception:
+                _log.warning("Reading gauges failed", exc_info=True)
+                return Gauges(handlers_in_flight=0, connected_hubs=0)
+
+        try:
+            self._inner.observe_gauges(safe_read)
+        except Exception:
+            _log.warning("telemetry.observe_gauges failed", exc_info=True)
+
+    def inject(self, headers: dict[str, str]) -> None:
+        try:
+            self._inner.inject(headers)
+        except Exception:
+            _log.warning("telemetry.inject failed", exc_info=True)
+
+    @contextmanager
+    def handling(self, h: Handling) -> Iterator[None]:
+        cm: AbstractContextManager[None] | None = None
+        try:
+            cm = self._inner.handling(h)
+        except Exception:
+            _log.warning("telemetry.handling failed", exc_info=True)
+
+        if cm is None:
+            yield
+            return
+
+        try:
+            cm.__enter__()
+        except Exception:
+            _log.warning("telemetry.handling.__enter__ failed", exc_info=True)
+            yield
+            return
+
+        exc: BaseException | None = None
+        try:
+            yield
+        except BaseException as e:
+            exc = e
+            raise
+        finally:
+            try:
+                if exc is not None:
+                    cm.__exit__(type(exc), exc, exc.__traceback__)
+                else:
+                    cm.__exit__(None, None, None)
+            except Exception:
+                _log.warning("telemetry.handling.__exit__ failed", exc_info=True)
 
 
 def request_outcome(exc: BaseException | None) -> str | None:

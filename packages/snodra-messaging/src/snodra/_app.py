@@ -26,7 +26,7 @@ from snodra._settings import Settings, hub_targets
 from snodra._stream_client import Stream, stream
 from snodra._subscribe import Subscription, subscribe
 from snodra._subscription_handler import Updates
-from snodra._telemetry import Gauges, NoTelemetry, Telemetry
+from snodra._telemetry import Gauges, NoTelemetry, Telemetry, _GuardedTelemetry
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ class App:
         _timings: Timings | None = None,
     ) -> None:
         self._settings = settings
-        self._telemetry: Telemetry = NoTelemetry() if telemetry is None else telemetry
+        self._telemetry: Telemetry = NoTelemetry() if telemetry is None else _GuardedTelemetry(telemetry)
         # The status period is the app's own setting: the shipped timings as given, with it applied.
         self._timings = (
             replace(DEFAULT_TIMINGS, status_interval=settings.status_interval) if _timings is None else _timings

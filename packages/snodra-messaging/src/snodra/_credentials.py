@@ -594,55 +594,53 @@ class ClientCredentialsSource:
 
     async def token(self) -> AccessToken:
         grant = self._grant
-        if grant.client_secret_file is not None:
-            try:
-                secret = await asyncio.to_thread(self._read_secret)
-            except ConfigurationError as e:
-                if self._on_token_fetched is not None:
-                    self._on_token_fetched("io_error")
-                raise TokenError(str(e)) from None
-        else:
-            secret = grant.client_secret or ""
-        user = f"{_form(grant.client_id)}:{_form(secret)}"
-        basic = base64.b64encode(user.encode()).decode("ascii")
-        hidden = [basic, user, _form(secret), secret]  # what an endpoint might echo back in a text
-        fields = {"grant_type": "client_credentials"} | ({} if grant.scope is None else {"scope": grant.scope})
-        result = "ok"
+        result = "io_error"
         try:
-            tok = await _http.exchange(
-                grant.token_url,
-                method="POST",
-                data=urllib.parse.urlencode(fields).encode("ascii"),
-                headers={
-                    "Authorization": f"Basic {basic}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                    "User-Agent": client_version(),
-                },
-                timeout=self._timeout,
-                max_bytes=MAX_TOKEN_RESPONSE,
-                ca_file=grant.ca_file,
-                read=functools.partial(self._read, hidden),
-            )
-            return tok
-        except _FetchFailed as e:
-            result = e.result
-            raise TokenError(e.message) from None
-        except TokenError:
-            raise
-        except _http.TooLarge:
-            result = "bad_response"
-            raise TokenError(
-                f"the token endpoint {self._host} answered with more than {MAX_TOKEN_RESPONSE} bytes"
-            ) from None
-        except TimeoutError:
-            result = "io_error"
-            raise TokenError(f"no answer from the token endpoint {self._host} within {self._timeout:g} s") from None
-        except Exception as e:
-            result = "io_error"
-            raise TokenError(
-                _masked(f"the token endpoint {self._host} cannot be reached: {_describe(e)}", hidden)
-            ) from None
+            if grant.client_secret_file is not None:
+                try:
+                    secret = await asyncio.to_thread(self._read_secret)
+                except ConfigurationError as e:
+                    raise TokenError(str(e)) from None
+            else:
+                secret = grant.client_secret or ""
+            user = f"{_form(grant.client_id)}:{_form(secret)}"
+            basic = base64.b64encode(user.encode()).decode("ascii")
+            hidden = [basic, user, _form(secret), secret]  # what an endpoint might echo back in a text
+            fields = {"grant_type": "client_credentials"} | ({} if grant.scope is None else {"scope": grant.scope})
+            try:
+                tok = await _http.exchange(
+                    grant.token_url,
+                    method="POST",
+                    data=urllib.parse.urlencode(fields).encode("ascii"),
+                    headers={
+                        "Authorization": f"Basic {basic}",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "application/json",
+                        "User-Agent": client_version(),
+                    },
+                    timeout=self._timeout,
+                    max_bytes=MAX_TOKEN_RESPONSE,
+                    ca_file=grant.ca_file,
+                    read=functools.partial(self._read, hidden),
+                )
+                result = "ok"
+                return tok
+            except _FetchFailed as e:
+                result = e.result
+                raise TokenError(e.message) from None
+            except _http.TooLarge:
+                result = "bad_response"
+                raise TokenError(
+                    f"the token endpoint {self._host} answered with more than {MAX_TOKEN_RESPONSE} bytes"
+                ) from None
+            except TimeoutError:
+                result = "io_error"
+                raise TokenError(f"no answer from the token endpoint {self._host} within {self._timeout:g} s") from None
+            except Exception as e:
+                result = "io_error"
+                raise TokenError(
+                    _masked(f"the token endpoint {self._host} cannot be reached: {_describe(e)}", hidden)
+                ) from None
         finally:
             if self._on_token_fetched is not None:
                 self._on_token_fetched(result)
