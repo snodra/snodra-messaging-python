@@ -104,6 +104,10 @@ class OutboundRequest:
     to the transport). Its ``answer`` is resolved once: with the hub's ``Reply`` or ``Error`` frame, or with
     :class:`Lost` when the stream ends first."""
 
+    keeps_frames = False
+    """A request whose frames keep coming after the first answer (a stream's parts): its entry stays registered for
+    them once the hub's first frame is a part, so that a frame landing before its caller resumes is not dropped."""
+
     def __init__(self, message: hub_pb2.ClientMessage) -> None:
         self.message = message
         self.id: str = message.request.id

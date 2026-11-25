@@ -147,6 +147,20 @@ def test_a_command_type_is_never_shared() -> None:
         Registry().add("command", place_order, shared=True)
 
 
+def test_a_command_type_is_never_streamed() -> None:
+    async def place_order(cmd: PlaceOrder) -> None: ...
+
+    with pytest.raises(TypeError, match="a command type is never streamed"):
+        Registry().add("command", place_order, stream=True)
+
+
+def test_a_streaming_handler_must_be_an_async_generator() -> None:
+    async def get_order(q: GetOrder) -> None: ...
+
+    with pytest.raises(TypeError, match=r"get_order.*async generator"):
+        Registry().add("query", get_order, stream=True)
+
+
 def test_extra_parameters_with_defaults_are_allowed() -> None:
     app = _app()
 

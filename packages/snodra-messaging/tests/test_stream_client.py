@@ -11,7 +11,7 @@ import time
 import grpc
 import pytest
 from fakehub import FakeHub, FakeStream, ack
-from helpers import ListOrders, Placed, acknowledged, eventually, new_app
+from helpers import ListOrders, Placed, acknowledged, eventually, library_tasks, new_app
 from snodra import App, ErrorCode, HubError, LostParts, OutcomeUnknown, RetryPolicy
 from snodra._hubpb import hub_pb2
 
@@ -41,11 +41,6 @@ async def _collect(app: App, *, read: int | None = None, **options: object) -> l
             if read is not None and len(received) >= read:
                 break
     return received
-
-
-def _library_tasks() -> set[str]:
-    """The names of the library's tasks still running."""
-    return {t.get_name() for t in asyncio.all_tasks() if t.get_name().startswith("snodra:") and not t.done()}
 
 
 _BESIDE_CANCELS = frozenset({"heartbeat", "status", "permits", "flow"})
@@ -102,7 +97,7 @@ async def test_leaving_the_stream_block_early_cancels_and_leaks_nothing(hub: Fak
     app = new_app(hub)
     await app.start()
     s = await acknowledged(hub)
-    before = _library_tasks()
+    before = library_tasks()
 
     # A break after 2 items: a Cancel at once, and nothing of the stream left here or in a task.
     call = asyncio.create_task(_collect(app, read=2))
@@ -113,7 +108,7 @@ async def test_leaving_the_stream_block_early_cancels_and_leaks_nothing(hub: Fak
     cancel = await _next_cancel(s)
     assert (cancel.request_id, cancel.reason) == (r.id, "collector cancelled")
     assert not app._sender.pending
-    assert _library_tasks() == before  # no task of the stream's own is left behind
+    assert library_tasks() == before  # no task of the stream's own is left behind
 
     # An exception in the body: the Cancel names the failure, and the exception reaches the caller.
     async def failing() -> None:
@@ -169,32 +164,55 @@ async def test_leaving_the_stream_block_early_cancels_and_leaks_nothing(hub: Fak
             pass
 
 
+async def _lost_after(app: App, *, delay: float = 0.0) -> tuple[list[Placed], str]:
+    """The items a stream handed the caller before ``LostParts``, with ``delay`` seconds spent on each item (a consumer
+    slower than the stream's reader, which keeps queueing frames meanwhile)."""
+    received: list[Placed] = []
+
+    async def collect() -> None:
+        async with app.stream(ListOrders("o-1"), Placed) as items:
+            async for item in items:
+                received.append(item)
+                if delay:
+                    await asyncio.sleep(delay)
+
+    with pytest.raises(LostParts) as raised:
+        await collect()
+    return received, str(raised.value)
+
+
 async def test_a_gap_or_a_short_end_is_lost_parts(hub: FakeHub) -> None:
     app = new_app(hub)
     await app.start()
     s = await acknowledged(hub)
 
-    # A gap in the seq the target gave: a Cancel with the loss, then LostParts.
-    call = asyncio.create_task(_collect(app))
-    r = await s.recv_request()
-    for seq in (1, 2, 4):
-        await s.send(_part(r.id, seq, seq))
-    with pytest.raises(LostParts, match=r"^stream orders\.ListOrders lost 1 part\(s\)$"):
-        await call
-    cancel = await _next_cancel(s)
-    assert (cancel.request_id, cancel.reason) == (r.id, "stream orders.ListOrders lost 1 part(s)")
-    assert not app._sender.pending
+    # A gap in the seq the target gave: the parts before it stay, then a Cancel with the loss and LostParts; a consumer
+    # slower than the reader loses none of them.
+    for delay in (0.0, 0.05):
+        call = asyncio.create_task(_lost_after(app, delay=delay))
+        r = await s.recv_request()
+        for seq in (1, 2, 4):
+            await s.send(_part(r.id, seq, seq))
+        received, failure = await call
+        assert received == [Placed("o-1", 1), Placed("o-1", 2)]
+        assert failure == "stream orders.ListOrders lost 1 part(s)"
+        cancel = await _next_cancel(s)
+        assert (cancel.request_id, cancel.reason) == (r.id, failure)
+        assert not app._sender.pending
 
-    # An end that counts more parts than arrived: the stream has ended, so nothing is cancelled.
-    call = asyncio.create_task(_collect(app))
-    r = await s.recv_request()
-    for seq in (1, 2):
-        await s.send(_part(r.id, seq, seq))
-    await s.send(_end(r.id, 3))
-    with pytest.raises(LostParts, match=r"^stream orders\.ListOrders lost 1 part\(s\)$"):
-        await call
-    await s.nothing(0.2, "cancel")
-    assert not app._sender.pending
+    # An end that counts more parts than arrived: the stream has ended, so nothing is cancelled, and the parts read
+    # before the end stay too.
+    for seqs, parts, lost, delay in (((1, 2), 3, 1, 0.0), ((1, 2, 3), 5, 2, 0.05)):
+        call = asyncio.create_task(_lost_after(app, delay=delay))
+        r = await s.recv_request()
+        for seq in seqs:
+            await s.send(_part(r.id, seq, seq))
+        await s.send(_end(r.id, parts))
+        received, failure = await call
+        assert received == [Placed("o-1", n) for n in seqs]
+        assert failure == f"stream orders.ListOrders lost {lost} part(s)"
+        await s.nothing(0.2, "cancel")
+        assert not app._sender.pending
 
 
 async def test_the_ends_error_reaches_the_caller(hub: FakeHub) -> None:

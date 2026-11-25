@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from fakehub import FakeHub, FakeStream, cancel, flow, forward
-from helpers import CancelOrder, GetOrder, ListOrders, Placed, acknowledged, new_app, next_reply
+from helpers import CancelOrder, GetOrder, ListOrders, Placed, acknowledged, library_tasks, new_app, next_reply
 from snodra import ErrorCode, HubError
 from snodra._hubpb import hub_pb2
 
@@ -100,13 +100,15 @@ async def test_a_stream_stops_on_cancel(hub: FakeHub) -> None:
 
     await app.start()
     s = await acknowledged(hub)
+    before = library_tasks()
     await s.send(_stream(credit=2))
     assert _totals(await s.recv_part()) == [1]
     await s.send(cancel("s#1", "conformance"))
     await asyncio.wait_for(stopped.wait(), 1.0)  # the handler's task is cancelled
-    # No part, no End: the hub has forgotten the request. Its permit goes back, once.
+    # No part, no End: the hub has forgotten the request. Its permit goes back, once, and no task is left behind.
     await s.nothing(0.5, "part", "end")
     assert (await s.recv_permits()).count == 1
+    assert library_tasks() == before
 
 
 async def test_no_credit_within_the_bound_ends_with_timeout(hub: FakeHub) -> None:
@@ -125,7 +127,7 @@ async def test_no_credit_within_the_bound_ends_with_timeout(hub: FakeHub) -> Non
     assert (end.request_id, end.parts) == ("s#1", 1)
     assert end.HasField("error")
     assert (end.error.code, end.error.message) == (hub_pb2.TIMEOUT, "no credit within 300 ms")
-    await s.nothing(0.2, "part")  # the handler is over: its second item never came
+    await s.nothing(0.2, "part", "end")  # the handler is over: its second item never came, and it ends once
 
 
 async def test_a_stream_handlers_failure_ends_the_stream(hub: FakeHub) -> None:
@@ -144,7 +146,7 @@ async def test_a_stream_handlers_failure_ends_the_stream(hub: FakeHub) -> None:
     assert (end.request_id, end.parts) == ("s#1", 1)
     assert end.HasField("error")
     assert (end.error.code, end.error.message) == (hub_pb2.HANDLER_ERROR, "RuntimeError: out of stock")
-    await s.nothing(0.2, "part")  # nothing after the end
+    await s.nothing(0.2, "part", "end")  # nothing after the end
     assert (await s.recv_permits()).count == 1
 
 
@@ -217,14 +219,14 @@ async def test_the_streaming_cells_of_the_mode_table(hub: FakeHub) -> None:
         "handler test_the_streaming_cells_of_the_mode_table.get_order for orders.GetOrder is not a streaming query "
         "handler (it answers mode UNARY)"
     )
-    await s.nothing(0.2, "part")
+    await s.nothing(0.2, "part", "end")
     # Streaming to a command handler, and to a type nobody serves: one End, NO_HANDLER, no part each.
     for id, type in (("s-2#1", "orders.CancelOrder"), ("s-3#1", "orders.Unknown")):
         await s.send(_stream(id, type=type, payload=b"{}"))
         end = await _next_end(s)
         assert (end.request_id, end.parts, end.error.code) == (id, 0, hub_pb2.NO_HANDLER)
         assert end.error.message == f"no handler for type {type}"
-    await s.nothing(0.2, "part")
+    await s.nothing(0.2, "part", "end")
     # Answered on the stream they arrived on, which is still up and served.
     await s.send(
         forward(hub_pb2.Request(id="q-1", kind=hub_pb2.QUERY, type="orders.GetOrder", payload=b'{"orderId":"o-3"}'))

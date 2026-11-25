@@ -80,9 +80,14 @@ async def stop_apps() -> None:
     assert_no_library_tasks()
 
 
+def library_tasks() -> set[str]:
+    """The names of the library's tasks (``snodra:...``) still running."""
+    return {t.get_name() for t in asyncio.all_tasks() if t.get_name().startswith("snodra:") and not t.done()}
+
+
 def assert_no_library_tasks() -> None:
     """Fails if a task named ``snodra:...`` is still running."""
-    left = sorted(t.get_name() for t in asyncio.all_tasks() if t.get_name().startswith("snodra:") and not t.done())
+    left = sorted(library_tasks())
     assert not left, f"library tasks left: {left}"
 
 

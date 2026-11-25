@@ -409,9 +409,11 @@ class Sender:
         if not stream.put_request(outbound):
             return _NotTaken()
         self.pending[outbound.id] = outbound
+        keep = False
         try:
             async with asyncio.timeout(guard):
                 outcome = await outbound.answer
+            keep = outbound.keeps_frames and not isinstance(outcome, Lost) and outcome.WhichOneof("message") == "part"
         except TimeoutError:
             # The hub answers TIMEOUT itself; this guard covers a hub that never answers.
             raise HubError(ErrorCode.TIMEOUT, f"Timed out waiting for reply to '{request.type}'") from None
@@ -419,6 +421,9 @@ class Sender:
             if self.pending.get(outbound.id) is outbound:
                 del self.pending[outbound.id]
             stream.forget(outbound)
+            if keep:  # a stream's parts keep coming: its entry stays registered, with no window in between
+                stream.regain(outbound)
+                self.pending[outbound.id] = outbound
         if isinstance(outcome, Lost):
             if outcome.written:
                 raise OutcomeUnknown(outcome.why)

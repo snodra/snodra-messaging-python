@@ -50,41 +50,25 @@ class _StreamEntry(OutboundRequest):
     """A stream waiting for its frames: its parts, its end (or the hub's error for the request itself) and the loss of
     the stream it was sent on, in arrival order.
 
-    A gap in the seq the target gave is a part the hub dropped (``gap``); the stream is still open there, so leaving it
-    cancels it. A clean ``ReplyEnd`` that counts more parts than arrived is the last part dropped too (``short``), but
-    the stream has ended: there is nothing left to cancel."""
+    Every frame is queued in the order the hub relayed it; the reader decides what a part out of seq or an end that
+    counts more parts than it received means when it reaches that frame, so a part that arrived before a loss is still
+    handed to the consumer. A gap in the seq the target gave is a part the hub dropped while the stream is still open:
+    leaving it cancels the stream. An end short of the parts it counts arrives after the stream ended: nothing is left
+    to cancel."""
+
+    keeps_frames = True
+    """Its frames keep coming after the first answer (its parts): the entry stays registered for them."""
 
     def __init__(self, message: hub_pb2.ClientMessage) -> None:
         super().__init__(message)
         self.frames: asyncio.Queue[hub_pb2.ServerMessage | Lost] = asyncio.Queue()
-        self.received = 0
-        """The parts taken for the caller so far."""
-        self.gap: str | None = None
-        """Why the parts stopped arriving while the stream is still open: a gap, or a seq out of order."""
-        self.short: str | None = None
-        """Why the end counted parts that never arrived: the stream ended, short of them."""
 
     def take(self, m: hub_pb2.ServerMessage) -> bool:
-        kind = m.WhichOneof("message")
-        if kind == "part":
-            if self.gap is None:
-                seq = m.part.seq
-                if seq == self.received + 1:
-                    self.received += 1
-                elif seq > self.received + 1:
-                    self.gap = _LOST.format(type=self.message.request.type, n=seq - self.received - 1)
-                else:
-                    self.gap = _OUT_OF_ORDER.format(type=self.message.request.type, seq=seq, expected=self.received + 1)
-            self.frames.put_nowait(m)  # the frame that reports the gap wakes the reader; no part of it is kept
-            self.resolve(m)  # the first frame opens the stream; a later one changes nothing
-            return True
-        if kind in ("end", "error"):
-            if kind == "end" and self.short is None and self.gap is None and m.end.parts > self.received:
-                self.short = _LOST.format(type=self.message.request.type, n=m.end.parts - self.received)
-            self.frames.put_nowait(m)
-            self.resolve(m)
-            return True
-        return False  # a Reply is no answer to a stream
+        if m.WhichOneof("message") not in ("part", "end", "error"):
+            return False  # a Reply is no answer to a stream
+        self.frames.put_nowait(m)
+        self.resolve(m)  # the first frame opens the stream; a later one changes nothing
+        return True
 
     def resolve(self, outcome: hub_pb2.ServerMessage | Lost) -> None:
         super().resolve(outcome)
@@ -186,16 +170,16 @@ class Stream[T]:
         if message.end.HasField("error"):
             raise error_from_wire(message.end.error, self._type)
         opened = cast("_StreamEntry", answered.entry)
-        if opened.stream is not None:
-            opened.stream.regain(opened)  # its parts and its end reach it after the first frame
-            self._sender.pending[opened.id] = opened
         self._entry = opened
 
     async def _read(self) -> AsyncGenerator[T, None]:
-        """The items, in the seq the handler gave them, refilling the credit as the caller consumes them."""
+        """The items, in the seq the handler gave them, refilling the credit as the caller consumes them: a part out of
+        seq or an end that counts more parts than were delivered is reported when the reader reaches that frame, so the
+        parts already delivered stay."""
         entry = self._entry
         assert entry is not None  # a stream is open only once its entry is here
         codec = self._sender.codec
+        delivered = 0
         while True:
             frame = await self._next(entry)
             if isinstance(frame, Lost):
@@ -203,6 +187,17 @@ class Stream[T]:
                 raise OutcomeUnknown(frame.why)
             kind = frame.WhichOneof("message")
             if kind == "part":
+                seq = frame.part.seq
+                if seq != delivered + 1:
+                    reason = (
+                        _LOST.format(type=self._type, n=seq - delivered - 1)
+                        if seq > delivered + 1
+                        else _OUT_OF_ORDER.format(type=self._type, seq=seq, expected=delivered + 1)
+                    )
+                    self._ended = True
+                    self._let_go(entry, cancel=True, reason=reason)
+                    raise LostParts(reason)
+                delivered += 1
                 item = codec.decode(frame.part.payload or b"{}", self._item)
                 self._consumed += 1
                 if self._consumed >= self._refill:
@@ -215,31 +210,20 @@ class Stream[T]:
                 raise error_from_wire(frame.error, self._type)
             if frame.end.HasField("error"):
                 raise error_from_wire(frame.end.error, self._type)
+            if frame.end.parts > delivered:  # the stream ended, short of the parts its end counted
+                raise LostParts(_LOST.format(type=self._type, n=frame.end.parts - delivered))
             return
 
     async def _next(self, entry: _StreamEntry) -> hub_pb2.ServerMessage | Lost:
-        """The next frame of the stream, at most the hub's bound for the request plus the local margin after the one
-        before it: a gap fails it as lost parts and cancels the open stream, an end short of parts fails it as lost
-        parts with nothing to cancel, and a hub stream that ends fails it as an unknown outcome."""
-        if entry.gap is not None:
-            self._ended = True
-            self._let_go(entry, cancel=True, reason=entry.gap)
-            raise LostParts(entry.gap)
+        """The next frame of the stream in arrival order, at most the hub's bound for the request plus the local margin
+        after the one before it; a hub stream that ends before that frame fails it as an unknown outcome."""
         try:
             async with asyncio.timeout(self._guard(entry)):
-                frame = await entry.frames.get()
+                return await entry.frames.get()
         except TimeoutError:
             self._ended = True
             self._let_go(entry, cancel=True, reason=NO_PART_GUARD)
             raise HubError(ErrorCode.TIMEOUT, _TIMEOUT.format(type=self._type)) from None
-        if entry.gap is not None:  # the frame that reported it is no part of the stream
-            self._ended = True
-            self._let_go(entry, cancel=True, reason=entry.gap)
-            raise LostParts(entry.gap)
-        if entry.short is not None:  # the stream ended, short of the parts its end counted
-            self._ended = True
-            raise LostParts(entry.short)
-        return frame
 
     def _guard(self, entry: _StreamEntry) -> float:
         """The local guard of the wait for the next frame: the hub's bound for the request plus the margin."""
