@@ -115,6 +115,17 @@ def _value(r: RawJson) -> Any:
     return r.value
 
 
+def _part(id: str, seq: int, instance: str, payload: object = None, error: tuple[int, str] | None = None) -> Any:
+    part = hub_pb2.ReplyPart(
+        request_id=id, seq=seq, responder_service="conformance-runner", responder_instance=instance
+    )
+    if error is None:
+        part.payload = json.dumps(payload).encode()
+    else:
+        part.error.CopyFrom(hub_pb2.Error(request_id=id, code=error[0], message=error[1]))  # type: ignore[arg-type]
+    return hub_pb2.ServerMessage(part=part)
+
+
 def test_classify() -> None:
     def kinds(e: BaseException) -> dict[str, Any]:
         return classify(e)
@@ -222,17 +233,6 @@ async def test_the_other_ops_are_not_supported_yet(service: _Service) -> None:
         outcome = _payload(reply)
         assert outcome["result"] == "unsupported"
         assert outcome["reason"]
-
-
-def _part(id: str, seq: int, instance: str, payload: object = None, error: tuple[int, str] | None = None) -> Any:
-    part = hub_pb2.ReplyPart(
-        request_id=id, seq=seq, responder_service="conformance-runner", responder_instance=instance
-    )
-    if error is None:
-        part.payload = json.dumps(payload).encode()
-    else:
-        part.error.CopyFrom(hub_pb2.Error(request_id=id, code=error[0], message=error[1]))  # type: ignore[arg-type]
-    return hub_pb2.ServerMessage(part=part)
 
 
 async def test_scatter_goes_through_the_librarys_gather(service: _Service) -> None:

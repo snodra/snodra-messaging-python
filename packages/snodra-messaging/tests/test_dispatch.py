@@ -288,36 +288,6 @@ async def test_a_slow_handler_never_delays_heartbeats_or_other_requests(hub: Fak
     assert (await next_reply(s)).request_id == "slow"
 
 
-async def test_a_cancel_from_the_hub_stops_the_handler_and_sends_nothing(hub: FakeHub) -> None:
-    cancelled = asyncio.Event()
-    started = asyncio.Event()
-    app = new_app(hub, max_concurrent=1)
-
-    @app.query_handler
-    async def get_order(q: GetOrder) -> Placed:
-        if q.order_id == "o-1":
-            started.set()
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-        return Placed(q.order_id, 1)
-
-    await app.start()
-    s = await acknowledged(hub)
-    await s.send(_request("g#1", kind=hub_pb2.QUERY, type="orders.GetOrder", payload=b'{"orderId":"o-1"}'))
-    await asyncio.wait_for(started.wait(), 1.0)
-    await s.send(cancel("g#1", "deadline"))
-    await asyncio.wait_for(cancelled.wait(), 1.0)
-    assert (await s.recv_permits()).count == 1  # its permit goes back, nothing else
-    await s.nothing(0.2, "reply")
-    await s.send(cancel("g#1", "deadline"))  # a Cancel for an id that ended is ignored
-    await s.send(cancel("never-forwarded", "deadline"))
-    await s.send(_request("g#2", kind=hub_pb2.QUERY, type="orders.GetOrder", payload=b'{"orderId":"o-2"}'))
-    assert (await s.recv_reply()).request_id == "g#2"  # the stream is up and served
-
-
 async def test_a_cancelled_handler_keeps_its_permit_until_it_ends(hub: FakeHub) -> None:
     release = asyncio.Event()
     caught = asyncio.Event()

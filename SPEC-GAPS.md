@@ -23,7 +23,9 @@ library does there. Where an entry is settled, its behaviour is this library's r
   codes the hub produces: `No handler registered for '<type>'` (`NO_HANDLER`), `Timed out waiting for reply to
   '<type>'` (`TIMEOUT`), `Handler for '<type>' disconnected` (`HANDLER_DISCONNECTED`), `Handler for '<type>' is busy:
   its hub queue or session buffer is full` (`RESOURCE_EXHAUSTED`), `cancelled by the hub` for an empty `CANCELLED`
-  message, and the wire message for every other code. A handler's `Unauthenticated`, `PermissionDenied` and
+  message, and the wire message for every other code. A scatter-gather part's `error` keeps the message the target or
+  the hub gave for every code (`snodra/_gather.py`, `_part_error`), and an unknown code reads as `HANDLER_ERROR` with
+  its details kept. A handler's `Unauthenticated`, `PermissionDenied` and
   `InvalidRequest` answer their code with their own message; `HandlerError(message, details=...)` answers
   `HANDLER_ERROR` with JSON details; a `ValueError` answers `HANDLER_ERROR` with its plain message and the details
   `[]`; any other exception answers `HANDLER_ERROR` `<ClassName>: <message>`. Every line break in a message becomes

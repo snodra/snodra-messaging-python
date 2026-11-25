@@ -1,5 +1,8 @@
 """The hub's ``Cancel`` of a request this instance serves: a scatter-gather target past its gather's end.
 
+The one test of a ``Cancel`` (a unary request and a gather target alike): nothing is answered, the handler's task is
+cancelled, and the stream stays up.
+
 See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Cancel", "Scatter-gather").
 """
 
@@ -33,14 +36,15 @@ async def test_a_cancelled_target_sends_nothing(hub: FakeHub) -> None:
 
     await app.start()
     s = await acknowledged(hub)
-    await s.send(_target("g#1", "slow"))
+    await s.send(_target("g#1#0", "slow"))
     await asyncio.wait_for(started.wait(), 1.0)
-    await s.send(cancel("g#1", "max results"))
+    await s.send(cancel("g#1#0", "max results"))
     await asyncio.wait_for(cancelled.wait(), 1.0)  # the handler's task is cancelled
-    await s.nothing(2.5, "reply")  # past the 2 s the handler would have slept: never answered
+    # Past the 2 s the handler would have slept: never answered, neither a reply nor a part or an end.
+    await s.nothing(2.5, "reply", "part", "end")
     assert (await s.recv_permits()).count == 1  # its permit goes back
-    await s.send(cancel("g#1", "max results"))  # a Cancel for an id that ended is ignored
-    await s.send(cancel("g#9", "deadline"))  # and one for an id never forwarded here
-    await s.send(_target("g#2", "fast"))
+    await s.send(cancel("g#1#0", "max results"))  # a Cancel for an id that ended is ignored
+    await s.send(cancel("g#9#0", "deadline"))  # and one for an id never forwarded here
+    await s.send(_target("g#2#0", "fast"))
     reply = await next_reply(s)
-    assert (reply.request_id, reply.payload) == ("g#2", b'{"count":1}')  # the stream is up and served
+    assert (reply.request_id, reply.payload) == ("g#2#0", b'{"count":1}')  # the stream is up and served

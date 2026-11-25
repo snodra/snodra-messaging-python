@@ -8,6 +8,7 @@ import pytest
 from fakehub import FakeHub
 from helpers import SCALED, CancelOrder, GetOrder, Placed, PlaceOrder, new_app, start_app
 from snodra import App, RegistrationClosed, Settings
+from snodra._registry import Registry
 
 
 def _app() -> App:
@@ -137,6 +138,13 @@ async def test_registration_refuses_what_it_cannot_serve() -> None:
         app.command_handler(get_order)
     with pytest.raises(TypeError, match=r"get_order.*orders\.GetOrder"):
         app.query_handler(get_order)
+
+
+def test_a_command_type_is_never_shared() -> None:
+    async def place_order(cmd: PlaceOrder) -> None: ...
+
+    with pytest.raises(TypeError, match="a command type is never shared"):
+        Registry().add("command", place_order, shared=True)
 
 
 def test_extra_parameters_with_defaults_are_allowed() -> None:
