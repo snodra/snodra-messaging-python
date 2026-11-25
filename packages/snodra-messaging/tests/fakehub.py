@@ -314,12 +314,13 @@ class FakeStream:
 
     async def _recv_kind(self, kind: str, within: float) -> hub_pb2.ClientMessage:
         """The next frame that is not a heartbeat or a status, which must be of kind; the bound covers the whole
-        wait, the skipped frames included."""
+        wait, the skipped frames included. A ``Permits`` frame is skipped too unless it is the kind awaited: with
+        several hubs a top-up may arrive at any moment, as a batching timer's permits already may."""
         deadline = asyncio.get_running_loop().time() + within
         while True:
             m = await self._take(deadline, f"no {kind} frame within {within} s")
             got = _kind(m)
-            if got in _QUIET:
+            if got in _QUIET or (got == "permits" and kind != "permits"):
                 continue
             if got != kind:
                 raise AssertionError(f"expected a {kind} frame, got {got}: {_show(m)}")

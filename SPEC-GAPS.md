@@ -86,6 +86,21 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** open: should the specification name the period, the delay's bound and the limits, or leave them to
   each library?
 
+### SG-5: the next hub of an unkeyed request that one did not take
+
+- **Specification:** `protocol.md` ("Several hubs") fixes the rendezvous order for a keyed request, and says the order
+  among the untried hubs for an unkeyed request is not fixed: the official libraries differ with three or more hubs,
+  and a caller must not rely on which hub comes next.
+- **Other Snodra libraries:** they differ, as the specification says: one takes the untried live hubs as a list and
+  picks `list[counter % size]` with its shared round-robin counter, another takes a new round-robin turn over all live
+  hubs and picks the first hub not tried.
+- **This library:** `snodra/_pool.py` (`Pool.pick`) and `snodra/_send.py` (`Sender.route`). An unkeyed request takes
+  the live untried hubs as a list and picks `candidates[counter % len(candidates)]`, one counter shared by every call
+  and advanced by every pick (the first hop included); a keyed one takes the untried live hub with the highest
+  rendezvous score.
+- **Question:** settled: the reference implementation's order, pinned by
+  `test_the_unkeyed_next_hub_is_the_reference_order` and by the `L1-HUB-FAILOVER` check.
+
 ### SG-7: JSON details of the default payload codec
 
 - **Specification:** `messages.md` (Payloads) fixes camelCase names, UTC ISO 8601 timestamps, string ids, unknown fields

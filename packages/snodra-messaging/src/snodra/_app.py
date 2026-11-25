@@ -440,7 +440,8 @@ class App:
         )
 
     def hub_ids(self) -> list[str]:
-        """``RegisterAck.hub_id`` of every acknowledged stream (its address when empty), sorted."""
+        """``RegisterAck.hub_id`` of every hub this instance holds a live stream to (its address when empty), one per
+        hub id, sorted."""
         return self._pool.hub_ids()
 
     @property

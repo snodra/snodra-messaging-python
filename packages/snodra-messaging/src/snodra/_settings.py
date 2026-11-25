@@ -16,6 +16,7 @@ from snodra._credentials import ClientCredentials, Credential, Token, TokenFile,
 from snodra._errors import ConfigurationError
 from snodra._ids import new_id
 from snodra._retry import RetryPolicy
+from snodra._targets import parse_targets
 from snodra._tls import ClientCertificate, TLSConfig
 
 log = logging.getLogger(__name__)
@@ -24,10 +25,6 @@ _UINT32_MAX: Final = 2**32 - 1
 _INT32: Final = range(-(2**31), 2**31)
 _TRUE: Final = frozenset({"true", "1", "yes", "on"})
 _FALSE: Final = frozenset({"false", "0", "no", "off"})
-_STATIC: Final = "static://"
-_DNS: Final = "dns:///"
-_DNS_TARGET: Final = re.compile(r"dns:///([^/:]+|\[[^/\]]+\]):(\d+)")
-_ACCEPTED_FORMS: Final = "host:port, static://host:port, or one dns:///name:port"
 _DEFAULT_BACKOFF: Final = (0.5, 5.0)
 
 
@@ -81,6 +78,9 @@ class Settings:
     stream_credit_timeout: float = 600.0
     """The longest a streaming handler waits for a credit before it ends its stream with ``TIMEOUT``
     (``SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS``, 10 minutes by default: the hub's default maximum stream duration)."""
+    status_interval: float = 5.0
+    """How often every hub stream gets an ``InstanceStatus`` (``SNODRA_SERVER_STATUS_INTERVAL_MS``, at least 1 ms); an
+    extra report goes out on every stream whenever the acknowledged hubs change."""
     credentials: Credential | None = None
     """The instance's credential towards the hubs, for a hub whose access control asks for one: a :class:`Token`
     (``SNODRA_SERVER_TOKEN``), a :class:`TokenFile` (``SNODRA_SERVER_TOKEN_FILE``, which wins over the token), a JWT
@@ -147,6 +147,12 @@ class Settings:
             raise ConfigurationError(
                 "stream_credit_timeout (SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS) must be a positive number of seconds, "
                 f"got {credit!r}"
+            )
+        status = self.status_interval
+        if not _is_number(status) or not math.isfinite(status) or status <= 0:
+            raise ConfigurationError(
+                "status_interval (SNODRA_SERVER_STATUS_INTERVAL_MS) must be a positive number of seconds, "
+                f"got {status!r}"
             )
         self._check_identity()
         self._check_credentials()
@@ -291,6 +297,8 @@ class Settings:
             values["always_route_through_hub"] = _env_bool("SNODRA_SERVER_ALWAYS_ROUTE_THROUGH_HUB", v)
         if (v := get("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS")) is not None:
             values["stream_credit_timeout"] = _env_positive_int("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", v) / 1000
+        if (v := get("SNODRA_SERVER_STATUS_INTERVAL_MS")) is not None:
+            values["status_interval"] = _env_positive_int("SNODRA_SERVER_STATUS_INTERVAL_MS", v) / 1000
         grant = _env_credentials(get, values)
         _env_tls(get, values)
         values |= overrides
@@ -305,35 +313,7 @@ class Settings:
 def hub_targets(hubs: tuple[str, ...]) -> list[str]:
     """The gRPC targets of the hub addresses, in order, repeats dropped: ``host:port`` (``static://`` removed), or the
     one ``dns:///name:port``. Raises :class:`ConfigurationError` for anything else."""
-    entries = [h.strip() if isinstance(h, str) else h for h in hubs]
-    if not entries or any(not isinstance(e, str) or not e for e in entries):
-        raise ConfigurationError(
-            f"the hub addresses (hubs, SNODRA_SERVER_ADDRESS) name no hub, or an empty one: {hubs!r}"
-        )
-    if any(e.startswith("dns:") for e in entries):
-        if len(entries) > 1:
-            raise ConfigurationError(
-                f"the hub addresses (hubs, SNODRA_SERVER_ADDRESS) {hubs!r}: a dns:/// address must be the only one"
-            )
-        m = _DNS_TARGET.fullmatch(entries[0])
-        if m is None or not 1 <= int(m.group(2)) <= 65535:
-            raise ConfigurationError(
-                f"hub address {entries[0]!r} (hubs, SNODRA_SERVER_ADDRESS) is not dns:///name:port with a port from 1"
-                " to 65535"
-            )
-        return [entries[0]]
-    targets: list[str] = []
-    for e in entries:
-        target = e.removeprefix(_STATIC).strip()
-        # TODO(spec-gap): SG-2
-        if not target or "://" in target:
-            raise ConfigurationError(
-                f"hub address {e!r} (hubs, SNODRA_SERVER_ADDRESS) is not accepted: "
-                f"the accepted forms are {_ACCEPTED_FORMS}"
-            )
-        if target not in targets:
-            targets.append(target)
-    return targets
+    return [target.address for target in parse_targets(hubs)]
 
 
 def _is_int(value: object) -> bool:

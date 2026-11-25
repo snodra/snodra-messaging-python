@@ -372,9 +372,18 @@ class HubConnection:
         credentials: HubCredentials | None = None,
         tls: _tls.TLSConfig | None = None,
         certificates: _tls.Certificates | None = None,
+        permits: Callable[[HubConnection], int] | None = None,
+        server_name: str | None = None,
     ) -> None:
         self.address = address
         self._register = register
+        self._permits = permits
+        self._server_name = server_name
+        """The name a TLS hub certificate is checked against when the configuration names none (a resolved address's
+        DNS name)."""
+        self._withdrawn = False
+        """Its later streams register with no types (its address left the DNS answer)."""
+        self._first_attempt_ended = False
         self._backoff = backoff
         self._timings = timings
         self._on_change = on_change
@@ -423,6 +432,39 @@ class HubConnection:
         return s
 
     @property
+    def first_attempt(self) -> bool:
+        """True until the first connect attempt has ended: such a hub is counted in the permits' N."""
+        return not self._first_attempt_ended
+
+    @property
+    def pending(self) -> int:
+        """The requests of this connection's stream still waiting for their answer (a stream's or a subscription's
+        frames included)."""
+        s = self._stream
+        return 0 if s is None else len(s.requests)
+
+    def withdraw(self) -> None:
+        """Every later stream registers with no types (its address left the DNS answer: the hub stops routing to the
+        instance there)."""
+        self._withdrawn = True
+
+    def restore(self) -> None:
+        """The address is back in the DNS answer: later streams register the declared types again."""
+        self._withdrawn = False
+
+    def top_up(self, share: int) -> int:
+        """Tops the live stream up to share permits with ``Permits{count, grant = share}`` (the grant raises the hub's
+        cap on the session first, so the count is kept); the count written, 0 for none."""
+        s = self.live_stream()
+        if s is None:
+            return 0
+        count = s.permits.raise_to(share)
+        if count <= 0:
+            return 0
+        s.put(hub_pb2.ClientMessage(permits=hub_pb2.Permits(count=count, grant=share)))
+        return count
+
+    @property
     def presented(self) -> tuple[int, _tls.Pair] | None:
         """The client certificate the registered stream presents, and its generation; None without one."""
         s = self._stream
@@ -466,10 +508,11 @@ class HubConnection:
             )
 
     def reregister(self, *, empty: bool) -> None:
-        """A later ``Register`` on the current stream (with no types when empty), then a heartbeat."""
+        """A later ``Register`` on the current stream (with no types when empty, or when the address left the DNS
+        answer), then a heartbeat."""
         s = self._stream
         if s is not None:
-            s.write_register(empty=empty)
+            s.write_register(empty=empty or self._withdrawn)
 
     # Credentials.
 
@@ -716,10 +759,19 @@ class HubConnection:
             channel = grpc.aio.insecure_channel(self.address, options=self._options)
         else:
             channel = await _tls.channel(
-                self.address, self._tls, None if certificate is None else certificate[1], self._options
+                self.address,
+                self._tls,
+                None if certificate is None else certificate[1],
+                self._options,
+                self._server_name,
             )
         register = hub_pb2.Register()
         register.CopyFrom(self._register)
+        if self._permits is not None:  # several hubs: this stream's share of the instance's capacity
+            register.initial_permits = self._permits(self)
+        if self._withdrawn:  # its address left the DNS answer: a reconnect registers no types either
+            for name in _TYPE_LISTS:
+                register.ClearField(name)
         if credentials is not None:
             register.credentials.CopyFrom(credentials)
         stream = _Stream(register, self._timings.heartbeat_before_ack, self._timings.permit_batch)
@@ -745,6 +797,7 @@ class HubConnection:
             # to their end even when a cancellation lands meanwhile (it is raised after).
             stream.writable = False
             self._reached_ack = stream.ack is not None
+            self._first_attempt_ended = True
             if self._stream is stream:
                 self._stream = None
             stream.finish()
@@ -797,7 +850,8 @@ class HubConnection:
                 match m.WhichOneof("message"):
                     case "register_ack":
                         self._last_hub_id = m.register_ack.hub_id or self.address
-                        if stream.on_ack(m.register_ack, loop.time()):
+                        first = stream.on_ack(m.register_ack, loop.time())
+                        if first:
                             log.info(
                                 "Connected to hub %s at %s as %s (%s): heartbeat every %d ms",
                                 m.register_ack.hub_id,
@@ -806,9 +860,11 @@ class HubConnection:
                                 self._register.instance_id,
                                 round(stream.interval * 1000),
                             )
-                            self._on_change()
                             if self._credentials is not None:  # one renewed between the Register and the ack
                                 self._follow(stream, self._credentials.latest())
+                        # Every ack: a hub may answer another id (its target now reaches another hub), and the hub it
+                        # owned is then free for the address parked behind it.
+                        self._on_change()
                     case "heartbeat":
                         stream.on_echo(loop.time(), m.heartbeat.sent_at_ms)
                     case "request" if self._on_request is not None:  # also before the ack

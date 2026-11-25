@@ -72,6 +72,13 @@ class Timings:
     """A hub being rolled over: the longest wait for the requests of its stream to finish before the half-close."""
     roll_reconnect_limit: float
     """A hub being rolled over: the longest wait for its new stream's ``RegisterAck`` before the roll stops."""
+    status_interval: float
+    """How often every hub stream gets an ``InstanceStatus`` (also once on every change of the acknowledged hubs)."""
+    dns_refresh: float
+    """How often a ``dns:///`` target is resolved again."""
+    dns_drain_limit: float
+    """An address that left the DNS answer: the longest wait for nothing of the instance to be in flight on it before
+    its stream is closed."""
 
 
 DEFAULT_TIMINGS: Final = Timings(
@@ -104,5 +111,8 @@ DEFAULT_TIMINGS: Final = Timings(
     roll_delay_max=30.0,
     roll_idle_limit=10.0,
     roll_reconnect_limit=30.0,
+    status_interval=5.0,
+    dns_refresh=30.0,
+    dns_drain_limit=65.0,
 )
 """The shipped timings."""

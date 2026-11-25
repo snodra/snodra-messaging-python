@@ -34,8 +34,11 @@ SCALED: Final = replace(
     subscription_end=0.2,
     handler_drain=1.0,
     close_wait=0.2,
+    status_interval=300.0,
+    dns_refresh=300.0,
 )
-"""The shipped timings, shortened for the tests."""
+"""The shipped timings, shortened for the tests. The status reports and a DNS re-resolution are pushed far away: a test
+that observes them names its own interval (the frames would otherwise land in the middle of a scripted stream)."""
 
 _apps: list[App] = []
 

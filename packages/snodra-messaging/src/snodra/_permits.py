@@ -1,6 +1,7 @@
-"""The permit accounting of one hub stream: when the permits of finished requests go back to the hub.
+"""The permit accounting of one hub stream: when the permits of finished requests go back to the hub, and the top-up
+that moves a departed hub's share to the surviving streams.
 
-See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Flow control").
+See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Flow control", "Several hubs").
 """
 
 from __future__ import annotations
@@ -9,15 +10,18 @@ from snodra._timings import DEFAULT_TIMINGS
 
 
 class PermitLedger:
-    """What one stream offered (its ``Register.initial_permits``), the requests that arrived on it, the permits written
-    back and those pending. The hub still holds ``offered - arrived + returned`` permits of the stream.
+    """What one stream offered the hub (its ``Register.initial_permits`` plus earlier top-ups), the requests it
+    carried, the permits written back and those pending. The hub still holds ``offered - arrived + returned`` permits
+    of the stream.
 
     On each finished request one grant is pending; then all the pending grants are written at once while the hub holds
-    ``min(batch, offered // 2)`` or fewer (with one permit: every completion), or once ``batch`` are pending; else they
-    wait for the flush timer (50 ms), armed by the first one.
+    ``min(batch, initial_permits // 2)`` or fewer (with one permit: every completion), or once ``batch`` are pending;
+    else they wait for the flush timer (50 ms), armed by the first one. That low-water mark is the stream's own
+    ``Register`` permits: a top-up raises what the hub holds, never the mark.
     """
 
     def __init__(self, offered: int, *, batch: int = DEFAULT_TIMINGS.permit_batch) -> None:
+        self._initial = offered
         self._offered = offered
         self._batch = batch
         self._low_water = min(batch, offered // 2)
@@ -25,6 +29,20 @@ class PermitLedger:
         self._returned = 0
         self._pending = 0
         self._armed = False
+
+    @property
+    def offered(self) -> int:
+        """What the stream offers the hub now: its ``Register.initial_permits`` and every top-up."""
+        return self._offered
+
+    def raise_to(self, share: int) -> int:
+        """Tops the stream up to share permits in all when it offered fewer; the grants to write with the top-up (0 when
+        it offered that much already). It never lowers what the hub holds."""
+        if share <= self._offered:
+            return 0
+        added = share - self._offered
+        self._offered = share
+        return added
 
     def arrived(self) -> None:
         """A request arrived on the stream: it took one of the hub's permits."""

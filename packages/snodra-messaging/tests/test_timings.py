@@ -28,3 +28,9 @@ def test_default_timings() -> None:
         30.0,
     )
     assert t.default_credit == 64  # Request.initial_credit 0 reads as 64 at the hub
+
+
+def test_default_timings_of_several_hubs() -> None:
+    t = DEFAULT_TIMINGS
+    assert (t.status_interval, t.dns_refresh) == (5.0, 30.0)
+    assert (t.dns_drain_limit, t.max_unwritten_moves) == (65.0, 8)

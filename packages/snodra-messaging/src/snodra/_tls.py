@@ -193,10 +193,15 @@ def check_ca(tls: TLSConfig) -> None:
 
 
 async def channel(
-    address: str, tls: TLSConfig, pair: Pair | None, options: Sequence[tuple[str, int | str]]
+    address: str,
+    tls: TLSConfig,
+    pair: Pair | None,
+    options: Sequence[tuple[str, int | str]],
+    server_name: str | None = None,
 ) -> grpc.aio.Channel:
-    """A TLS channel to address: the CA file read now (off the event loop), the server name to verify, and the client
-    pair when there is one."""
+    """A TLS channel to address: the CA file read now (off the event loop), the server name to verify (the
+    configuration's, else server_name for a resolved address, else the address's host), and the client pair when there
+    is one."""
     roots = None if tls.ca_file is None else await asyncio.to_thread(Path(tls.ca_file).read_bytes)
     credentials = grpc.ssl_channel_credentials(
         root_certificates=roots,
@@ -204,8 +209,9 @@ async def channel(
         certificate_chain=None if pair is None else pair.chain_pem,
     )
     opts = list(options)
-    if tls.server_name is not None:
-        opts.append(("grpc.ssl_target_name_override", tls.server_name))
+    name = tls.server_name if tls.server_name is not None else server_name
+    if name is not None:
+        opts.append(("grpc.ssl_target_name_override", name))
     return grpc.aio.secure_channel(address, credentials, options=opts)
 
 

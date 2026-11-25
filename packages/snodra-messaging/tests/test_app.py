@@ -34,10 +34,9 @@ async def test_shutdown_leaves_the_hub_in_order(hub: FakeHub) -> None:
     app = await start_app(hub)
     s = await _acknowledged(app, hub)
     leaving = asyncio.create_task(app.shutdown())
-    first = await s.recv()
-    assert _kind(first) == "register"
-    assert (first.register.service_name, first.register.instance_id) == ("orders-service", "i-1")
-    assert _empty(first.register)
+    first = await s.recv_register()  # statuses may go out until the shutdown begins; heartbeats are skipped too
+    assert (first.service_name, first.instance_id) == ("orders-service", "i-1")
+    assert _empty(first)
     assert _kind(await s.recv()) == "heartbeat"
     await s.ack(ack("hub-1"))  # the hub acks every accepted Register
     await s.half_closed(within=1.0)

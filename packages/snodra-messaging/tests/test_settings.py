@@ -237,6 +237,20 @@ def test_the_streaming_settings_from_env() -> None:
             Settings.from_env(base | {"SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS": value})
 
 
+def test_the_status_interval() -> None:
+    assert Settings(service="orders-service").status_interval == 5.0
+    assert (
+        Settings.from_env({"SNODRA_SERVICE_NAME": "s", "SNODRA_SERVER_STATUS_INTERVAL_MS": "250"}).status_interval
+        == 0.25
+    )
+    _refused("SNODRA_SERVER_STATUS_INTERVAL_MS", status_interval=0)
+    _refused("SNODRA_SERVER_STATUS_INTERVAL_MS", status_interval=-1.0)
+    _refused("SNODRA_SERVER_STATUS_INTERVAL_MS", status_interval=float("inf"))
+    for value in ("0", "-1", "soon", "1.5"):
+        with pytest.raises(ConfigurationError, match="SNODRA_SERVER_STATUS_INTERVAL_MS"):
+            Settings.from_env({"SNODRA_SERVICE_NAME": "s", "SNODRA_SERVER_STATUS_INTERVAL_MS": value})
+
+
 @pytest.mark.parametrize(
     ("variable", "value"),
     [

@@ -71,10 +71,10 @@ def _uri_sans(c: x509.Certificate) -> list[str]:
     )
 
 
-async def _registered(hub: FakeHub, interval_ms: int = 3000) -> FakeStream:
+async def _registered(hub: FakeHub, interval_ms: int = 3000, hub_id: str = "hub-1") -> FakeStream:
     s = await hub.next_stream()
     await s.recv_register()
-    await s.ack(ack("hub-1", interval_ms=interval_ms))
+    await s.ack(ack(hub_id, interval_ms=interval_ms))
     return s
 
 
@@ -152,7 +152,7 @@ async def test_a_renewed_certificate_is_presented_before_not_after(
         return None
 
     await app.start()
-    old1, old2 = await _registered(tls_hub, 100), await _registered(tls_hub2, 100)
+    old1, old2 = await _registered(tls_hub, 100), await _registered(tls_hub2, 100, hub_id="hub-2")
     assert old1.peer_certificates[0].serial_number == first.certificate.serial_number
 
     renewed = ca.issue_client("orders-service")

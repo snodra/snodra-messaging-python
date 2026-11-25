@@ -116,6 +116,11 @@ class Dispatcher:
         """How many subscription targets this instance serves now."""
         return len(self._subscriptions)
 
+    @property
+    def handlers_in_flight(self) -> int:
+        """The handlers of every hub running now (a request waiting for a local permit included)."""
+        return sum(1 for task in self._tasks if not task.done())
+
     # Called by the stream's reader: never raises, runs no user code, never waits.
 
     def on_request(self, arrival: Arrival, request: hub_pb2.Request) -> None:

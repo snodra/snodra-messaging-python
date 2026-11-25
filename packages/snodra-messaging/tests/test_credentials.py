@@ -53,19 +53,21 @@ def _client(endpoint: TokenEndpoint, **fields: str) -> ClientCredentials:
     return ClientCredentials(endpoint.url, "orders-service", **values)
 
 
-async def _registered(hub: FakeHub, interval_ms: int = 3000) -> tuple[FakeStream, hub_pb2.Register]:
-    """The hub's next stream, acknowledged, and its Register."""
+async def _registered(
+    hub: FakeHub, interval_ms: int = 3000, hub_id: str = "hub-1"
+) -> tuple[FakeStream, hub_pb2.Register]:
+    """The hub's next stream, acknowledged with hub_id, and its Register."""
     s = await hub.next_stream()
     r = await s.recv_register()
-    await s.ack(ack("hub-1", interval_ms=interval_ms))
+    await s.ack(ack(hub_id, interval_ms=interval_ms))
     return s, r
 
 
 async def test_the_token_is_on_every_stream(hub: FakeHub, hub2: FakeHub) -> None:
     await start_app([hub, hub2], credentials=Token(SECRET))
     streams = []
-    for h in (hub, hub2):
-        s, r = await _registered(h)
+    for h, hub_id in ((hub, "hub-1"), (hub2, "hub-2")):
+        s, r = await _registered(h, hub_id=hub_id)
         assert r.credentials.WhichOneof("kind") == "token"
         assert r.credentials.token == SECRET
         streams.append(s)
@@ -181,7 +183,7 @@ async def test_the_jwt_registers_and_each_renewal_is_sent_once(hub: FakeHub, tok
                 raise
             break
         kind = m.WhichOneof("message")
-        assert kind in ("heartbeat", "credentials"), m
+        assert kind in ("heartbeat", "credentials", "status"), m  # a status may report the acknowledged hub
         if kind == "credentials":
             assert m.credentials.WhichOneof("kind") == "jwt"
             seen.append(m.credentials.jwt)
@@ -285,7 +287,7 @@ async def test_a_slow_token_endpoint_never_delays_heartbeats(hub: FakeHub, token
                 assert m.credentials.jwt == "jwt-2"
                 renewed = True
             case kind:
-                assert kind == "permits", m
+                assert kind in ("permits", "status"), m
     assert 0 < answered - started < 0.2  # served while the fetch goes on
     assert time.monotonic() - started >= 0.8
     assert len(beats) >= 7
@@ -438,7 +440,7 @@ async def test_each_renewal_goes_to_every_stream(hub: FakeHub, hub2: FakeHub, to
     token_endpoint.default = TokenAnswer(expires_in=2)  # renewed every second
     await start_app([hub, hub2], credentials=_client(token_endpoint))
     s1, r1 = await _registered(hub, interval_ms=200)
-    s2, r2 = await _registered(hub2, interval_ms=200)
+    s2, r2 = await _registered(hub2, interval_ms=200, hub_id="hub-2")
     assert (r1.credentials.jwt, r2.credentials.jwt) == ("jwt-1", "jwt-1")  # one token for both hubs
     assert (await s1.recv_credentials(within=3.0)).jwt == "jwt-2"
     assert (await s2.recv_credentials(within=3.0)).jwt == "jwt-2"

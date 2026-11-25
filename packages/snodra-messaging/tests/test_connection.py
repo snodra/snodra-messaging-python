@@ -157,9 +157,8 @@ async def test_a_heartbeat_follows_every_later_register_and_counts(hub: FakeHub)
     await s.ack(ack("hub-1", interval_ms=200))
     await app.ready(1.0)
     app._connections()[0].reregister(empty=False)
-    later = await s.recv()
-    assert _kind(later) == "register"
-    assert later.register.service_name == "orders-service"
+    later = await s.recv_register()  # a status may go out at the ack; the Register follows it
+    assert later.service_name == "orders-service"
     assert _kind(await s.recv()) == "heartbeat"
     ended = await _end(s)
     # the third tick (600 ms) drops the stream, not the fourth (800 ms): the extra heartbeat counted
