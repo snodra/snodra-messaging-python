@@ -6,6 +6,7 @@ import asyncio
 import logging
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import replace
 from typing import Any, Literal, TypeVar, overload
 
 from snodra import _credentials, _tls
@@ -52,7 +53,10 @@ class App:
 
     def __init__(self, settings: Settings, *, codec: Codec | None = None, _timings: Timings | None = None) -> None:
         self._settings = settings
-        self._timings = DEFAULT_TIMINGS if _timings is None else _timings
+        # The status period is the app's own setting: the shipped timings as given, with it applied.
+        self._timings = (
+            replace(DEFAULT_TIMINGS, status_interval=settings.status_interval) if _timings is None else _timings
+        )
         if settings.tls is not None:
             _tls.check_ca(settings.tls)
         self._credentials = _credentials.build(settings.credentials, service=settings.service, timings=self._timings)

@@ -30,7 +30,7 @@ from helpers import (
     start_app,
     within,
 )
-from snodra import App, ClientCertificate, ErrorCode, HubError, NeverSent, OutcomeUnknown, TLSConfig
+from snodra import App, ClientCertificate, ErrorCode, HubError, NeverSent, OutcomeUnknown, Settings, TLSConfig
 from snodra._connection import HubConnection
 from snodra._hubpb import hub_pb2
 from snodra._permits import PermitLedger
@@ -252,6 +252,19 @@ async def test_a_failed_first_attempt_shrinks_n(hub: FakeHub, hub2: FakeHub) -> 
     await s.ack(ack("hub-1"))
     permits = await s.recv_permits()
     assert (permits.count, permits.grant) == (2, 5)  # its first attempt failed: N is 1 now
+
+
+async def test_a_first_attempt_that_never_acked_shrinks_n(hub: FakeHub, hub2: FakeHub) -> None:
+    """The second hub accepts the stream and never acknowledges it: the attempt that ended without the ack counts as
+    gone too, and the survivor is raised to the instance's whole capacity."""
+    await start_app([hub, hub2], max_concurrent=5)
+    s1 = await hub.next_stream()
+    assert (await s1.recv_register()).initial_permits == 3
+    s2 = await hub2.next_stream()
+    assert (await s2.recv_register()).initial_permits == 3
+    await s1.ack(ack("hub-1"))  # the other hub's handshake times out, unacknowledged
+    permits = await s1.recv_permits()
+    assert (permits.count, permits.grant) == (2, 5)  # the attempt ended without an ack: N is 1 now
 
 
 def test_the_low_water_mark_is_the_streams_register() -> None:
@@ -491,6 +504,41 @@ async def test_no_new_hop_after_the_deadline(hub: FakeHub, hub2: FakeHub) -> Non
     await s1.nothing(0.2, "request")  # hub-1 was untried, and never saw it
 
 
+async def test_a_hub_that_did_not_take_the_request_is_not_tried_again(
+    hub: FakeHub, hub2: FakeHub, hub3: FakeHub
+) -> None:
+    """The request was lost in the first hub's buffer, which is live again by the time the second hub declines: the
+    third takes it, and the first — live, but tried — never sees it."""
+    app = await start_app([hub, hub2, hub3])
+    s1 = await acknowledged(hub, "hub-1")
+    s2 = await acknowledged(hub2, "hub-2")
+    s3 = await acknowledged(hub3, "hub-3")
+    order = ["hub-1", "hub-2", "hub-3"]
+    key = next(k for k in (f"k-{n}" for n in range(1000)) if rank(order, k) == order)
+
+    first = _connection(app, hub.address)
+    first._block_writer(True)  # the first hub's writer is held: the request waits in its buffer
+    call = asyncio.create_task(app.send(PLACE, Placed, routing_key=key, timeout=5.0))
+    await eventually(lambda: _buffered(app))
+    (id_,) = _pending(app)
+    await _close_held(s1, first)  # its stream breaks before it was written: the request moves
+    r2 = await s2.recv_request()
+    assert (r2.id, r2.timeout_ms) == (id_, 5000)
+
+    # The first hub reconnects and is acknowledged before the second declines.
+    again = await hub.next_stream()
+    await again.recv_register()
+    await again.ack(ack("hub-1"))
+    await eventually(lambda: app.hub_ids() == ["hub-1", "hub-2", "hub-3"])
+    await s2.send(hub_error(r2.id, hub_pb2.NO_HANDLER, "no live instance"))
+
+    r3 = await s3.recv_request()
+    assert r3.id == id_  # the third, never the first that did not take it
+    await s3.send(_reply(r3.id))
+    assert (await call).order_id == "o-1"
+    await again.nothing(0.2, "request")  # the live first hub was tried already: it sees no request
+
+
 async def test_the_unkeyed_next_hub_is_the_reference_order(hub: FakeHub, hub2: FakeHub, hub3: FakeHub) -> None:
     app = await start_app([hub, hub2, hub3])
     s1 = await acknowledged(hub, "hub-1")
@@ -538,6 +586,19 @@ async def test_streams_stay_on_their_hub_once_written(hub: FakeHub, hub2: FakeHu
 # The DNS answer.
 
 
+def _resolver(monkeypatch: pytest.MonkeyPatch, answer: dict[str, list[str]]) -> list[tuple[str, int]]:
+    """A stub on the running loop's ``getaddrinfo``: the addresses ``answer`` holds now, on the port asked; returns the
+    calls it received."""
+    calls: list[tuple[str, int]] = []
+
+    async def resolve(host: str, port: int, **options: object) -> list[tuple[object, ...]]:
+        calls.append((host, port))
+        return [(2, 1, 6, "", (address, port)) for address in answer["addresses"]]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+    return calls
+
+
 async def test_dns_targets(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> None:
     """A resolver stub on ``loop.getaddrinfo``: a new address connects, a vanished one leaves the routing, announces
     the empty ``Register`` and is closed once nothing of the instance is in flight on it."""
@@ -562,11 +623,12 @@ async def test_dns_targets(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> Non
     await first.ack(ack("hub-1"))
     await eventually(lambda: app.hub_ids() == ["hub-1"])
 
-    # A vanished address leaves the routing at once: the empty Register, then the stream is closed once nothing of the
-    # instance is in flight on it.
+    # A vanished address leaves the routing at once: the empty Register and its Heartbeat, then the stream is closed
+    # once nothing of the instance is in flight on it.
     answer["addresses"] = ["127.0.0.9"]  # resolved, and nothing listens there
     empty = await first.recv_register()
     assert not empty.command_types
+    assert (await first.recv()).WhichOneof("message") == "heartbeat"  # the Register is followed by its Heartbeat
     await eventually(lambda: app.hub_ids() == [])
     await first.half_closed(2.0)
     await hub.no_stream_within(0.2)
@@ -578,3 +640,79 @@ async def test_dns_targets(hub: FakeHub, monkeypatch: pytest.MonkeyPatch) -> Non
     await second.ack(ack("hub-1"))
     await eventually(lambda: app.hub_ids() == ["hub-1"])
     await second.nothing(0.2, "register")
+
+
+async def test_a_drained_stream_withdraws_its_types_before_its_ack(
+    hub: FakeHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An address that leaves the DNS answer registers no types on its stream even before the hub acknowledged it: the
+    hub must not route new work there while the stream is closed."""
+    port = int(hub.address.rsplit(":", 1)[1])
+    answer = {"addresses": ["127.0.0.1"]}
+    _resolver(monkeypatch, answer)
+    app = new_app(
+        [hub],
+        hubs=(f"dns:///hubs.test:{port}",),
+        _timings=replace(SCALED, dns_refresh=0.05, dns_drain_limit=1.0),
+    )
+
+    @app.command_handler
+    async def place_order(m: PlaceOrder) -> None:
+        return None
+
+    await app.start()
+    first = await hub.next_stream()
+    assert list((await first.recv_register()).command_types) == ["orders.PlaceOrder"]
+    answer["addresses"] = ["127.0.0.9"]  # gone, its handshake still unanswered
+    empty = await first.recv_register()
+    assert not empty.command_types  # the withdrawal does not wait for the ack
+    await first.half_closed(2.0)
+
+
+async def test_a_draining_address_is_connected_again_once_its_connection_stopped(
+    hub: FakeHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An address back in the DNS answer after its drain already stopped the connection is a fresh connection, not the
+    stopped one revived: that one opens no stream ever again."""
+    port = int(hub.address.rsplit(":", 1)[1])
+    answer = {"addresses": ["127.0.0.1"]}
+    _resolver(monkeypatch, answer)
+    # The half-closed stream stays open on the hub longer than the drain needs to stop its connection (the drain then
+    # waits for that end): the window in which the address comes back.
+    monkeypatch.setattr("fakehub._EOF_GRACE", 0.5)
+    app = await start_app(
+        [hub],
+        hubs=(f"dns:///hubs.test:{port}",),
+        _timings=replace(SCALED, dns_refresh=0.05, dns_drain_limit=1.0, close_wait=2.0),
+    )
+    first = await hub.next_stream()
+    await first.recv_register()
+    await first.ack(ack("hub-1"))
+    await eventually(lambda: app.hub_ids() == ["hub-1"])
+
+    answer["addresses"] = ["127.0.0.9"]  # gone: the empty Register, then the half-close and the stop
+    assert not (await first.recv_register()).command_types
+    await eventually(lambda: first._eof)  # the drain half-closed: its connection no longer connects
+    answer["addresses"] = ["127.0.0.1"]  # back while the old stream has not ended yet
+
+    second = await hub.next_stream(within=2.0)
+    await second.recv_register()
+    await second.ack(ack("hub-1"))
+    await eventually(lambda: app.hub_ids() == ["hub-1"])  # the new connection holds the hub again
+
+
+def test_a_parked_address_that_leaves_the_dns_answer_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A parked duplicate whose address the DNS answer no longer names is dropped when the hub it was parked behind
+    goes, not connected again; an address the answer still names is."""
+    app = App(Settings(service="orders-service", hubs=("dns:///hubs.test:7000",)), _timings=SCALED)
+    pool = app._pool
+    added: list[list[str]] = []
+    monkeypatch.setattr(pool, "_add", lambda addresses: added.append(list(addresses)))
+    pool._resolved = ["10.0.0.1:7000"]
+    pool._parked["10.0.0.2:7000"] = "hub-x"  # parked behind the target that answered hub-x, now unowned
+    pool._revive()
+    assert not pool._parked  # dropped
+    assert added == []  # and not connected: its address left the answer
+    pool._parked["10.0.0.1:7000"] = "hub-x"
+    pool._revive()
+    assert added == [["10.0.0.1:7000"]]  # an address the answer still names is connected again

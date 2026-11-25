@@ -13,8 +13,8 @@ from dataclasses import replace
 
 import grpc
 from fakehub import FakeHub, FakeStream, forward
-from helpers import SCALED, Noop, acknowledged, eventually, new_app
-from snodra import App
+from helpers import SCALED, Noop, acknowledged, eventually, new_app, within
+from snodra import App, Settings
 from snodra._hubpb import hub_pb2
 
 INTERVAL = 0.2
@@ -68,8 +68,31 @@ async def test_instance_status_on_every_stream(hub: FakeHub, hub2: FakeHub) -> N
         within=1.0,
     )
 
-    # A change of the acknowledged hubs reports at once on every stream: the hub that is left names only the other.
+
+async def test_a_change_of_the_acknowledged_hubs_reports_at_once(hub: FakeHub, hub2: FakeHub) -> None:
+    """A change reports at once, not on the tick: with a status interval of a second, the surviving stream's new
+    report lands within the interval of the periodic one."""
+    app = new_app([hub, hub2], _timings=replace(SCALED, status_interval=1.0))
+    await app.start()
+    s1, s2 = await _pair(app, hub, hub2)
+    await eventually(lambda: bool(s1.statuses), within=INTERVAL)
     before = len(s1.statuses)
-    await s2.close(grpc.StatusCode.UNAVAILABLE, "restart")
+    last = s1.statuses[-1][0]
+    at = time.monotonic()
+    await s2.close(grpc.StatusCode.UNAVAILABLE, "restart")  # the hub that is left
     await eventually(lambda: len(s1.statuses) > before, within=INTERVAL)
-    assert list(s1.statuses[-1][1].connected_hub_ids) == ["hub-1"]
+    assert s1.statuses[-1][0] - last < INTERVAL  # at once, not one status interval later
+    within(s1.statuses[-1][0] - at, 0.0, INTERVAL / 4)  # nor later than a quarter interval after the change
+    assert len(_reports(s1, at)) == 1  # one report per change: the immediate one, not one more from the wake-up
+    assert list(s1.statuses[-1][1].connected_hub_ids) == ["hub-1"]  # the hub that is left names only the other
+
+
+def test_the_settings_status_interval_reaches_the_pool(hub: FakeHub) -> None:
+    """``Settings.status_interval`` is the pool's report period; the ``_timings`` hook still wins when given."""
+    app = App(Settings(service="orders-service", hubs=(hub.address,), status_interval=0.75))
+    assert app._pool._timings.status_interval == 0.75
+    hooked = App(
+        Settings(service="orders-service", hubs=(hub.address,), status_interval=0.75),
+        _timings=replace(SCALED, status_interval=7.0),
+    )
+    assert hooked._pool._timings.status_interval == 7.0

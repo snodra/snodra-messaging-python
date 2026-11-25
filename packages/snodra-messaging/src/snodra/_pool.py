@@ -173,12 +173,11 @@ class Pool:
 
     def _changed(self) -> None:
         """A stream was acknowledged or ended, or a rollover began or ended: dedupe, revive a parked address, raise the
-        permit shares, report the status and wake the calls waiting for a hub."""
+        permit shares and wake the calls waiting for a hub; the status loop reports the change at once, once."""
         self._dedupe()
         if self.hub_ids():
             self._acknowledged.set()
         self._top_up()
-        self._report_status()
         self._signal_change()
 
     def _dedupe(self) -> None:
@@ -423,7 +422,7 @@ class Pool:
         if connection in self._active:
             self._active.remove(connection)
         connection.withdraw()  # the hub stops routing to this instance there
-        if connection.live_stream() is not None:
+        if connection._stream is not None:  # an unacknowledged stream withdraws the types too
             connection.reregister(empty=True)
         log.info("Hub address %s is no longer resolved; closing it once idle", connection.address)
         self._draining[connection] = asyncio.create_task(
@@ -453,10 +452,19 @@ class Pool:
         self._changed()
 
     def _revive_draining(self, connection: HubConnection) -> None:
-        """A draining address that is back in the DNS answer: kept, its declared types registered again."""
+        """A draining address that is back in the DNS answer: kept, its declared types registered again. A connection
+        whose drain already stopped it opens no stream ever again: the address is connected afresh instead."""
         task = self._draining.pop(connection, None)
         if task is not None:
             task.cancel()
+        if connection.stopping:
+            self._retired.append(connection)  # its task is awaited at the close with the other stopped ones
+            self._add([connection.address])
+            log.info(
+                "Hub address %s is resolved again; its drained connection had stopped, connecting it afresh",
+                connection.address,
+            )
+            return
         connection.restore()
         self._active.append(connection)
         if connection.live_stream() is not None:

@@ -27,6 +27,7 @@ from snodra._backoff import jitter, next_wait
 from snodra._credentials import HubCredentials, NoToken
 from snodra._hubpb import hub_pb2, hub_pb2_grpc
 from snodra._permits import PermitLedger
+from snodra._targets import hub_id_of
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
@@ -421,7 +422,7 @@ class HubConnection:
         s = self._stream
         if s is None or s.ack is None:
             return None
-        return s.ack.hub_id or self.address
+        return hub_id_of(s.ack.hub_id, self.address)
 
     def live_stream(self) -> _Stream | None:
         """The current stream when a request may be sent on it: acknowledged and taking frames (not half-closed);
@@ -442,6 +443,11 @@ class HubConnection:
         frames included)."""
         s = self._stream
         return 0 if s is None else len(s.requests)
+
+    @property
+    def stopping(self) -> bool:
+        """No stream is opened after the current one: the connection is closing (a drain, a duplicate, a shutdown)."""
+        return self._stopping
 
     def withdraw(self) -> None:
         """Every later stream registers with no types (its address left the DNS answer: the hub stops routing to the
@@ -797,6 +803,7 @@ class HubConnection:
             # to their end even when a cancellation lands meanwhile (it is raised after).
             stream.writable = False
             self._reached_ack = stream.ack is not None
+            was_first = self.first_attempt  # a first attempt that ends without the ack counts as gone: N shrinks
             self._first_attempt_ended = True
             if self._stream is stream:
                 self._stream = None
@@ -806,7 +813,8 @@ class HubConnection:
                     self._on_lost(stream)  # its streaming handlers and subscriptions ended here: the hub forgot them
                 except Exception:
                     log.exception("Hub stream to %s: ending what it carried failed", self.address)
-            if stream.ack is not None:
+            if stream.ack is not None or was_first:
+                # An acknowledged stream changes the hubs; a first attempt that ended without the ack leaves N.
                 self._on_change()
             for t in tasks:
                 t.cancel()  # the reader's cancellation cancels the call when it still runs
@@ -849,7 +857,7 @@ class HubConnection:
                 assert isinstance(m, hub_pb2.ServerMessage)
                 match m.WhichOneof("message"):
                     case "register_ack":
-                        self._last_hub_id = m.register_ack.hub_id or self.address
+                        self._last_hub_id = hub_id_of(m.register_ack.hub_id, self.address)
                         first = stream.on_ack(m.register_ack, loop.time())
                         if first:
                             log.info(

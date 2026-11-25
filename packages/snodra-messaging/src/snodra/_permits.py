@@ -21,7 +21,6 @@ class PermitLedger:
     """
 
     def __init__(self, offered: int, *, batch: int = DEFAULT_TIMINGS.permit_batch) -> None:
-        self._initial = offered
         self._offered = offered
         self._batch = batch
         self._low_water = min(batch, offered // 2)
@@ -29,11 +28,6 @@ class PermitLedger:
         self._returned = 0
         self._pending = 0
         self._armed = False
-
-    @property
-    def offered(self) -> int:
-        """What the stream offers the hub now: its ``Register.initial_permits`` and every top-up."""
-        return self._offered
 
     def raise_to(self, share: int) -> int:
         """Tops the stream up to share permits in all when it offered fewer; the grants to write with the top-up (0 when
