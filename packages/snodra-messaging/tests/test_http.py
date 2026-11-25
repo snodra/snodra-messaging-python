@@ -5,6 +5,8 @@ import http.client
 import json
 import socket
 import ssl
+import threading
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -71,27 +73,78 @@ def test_the_connections_use_only_public_http_client_api() -> None:
         assert "connect" in vars(_http._Attach)  # the socket is taken in the documented connect()
 
 
-def test_the_tls_socket_is_taken_before_the_handshake(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A peer that stalls the handshake can be cut: the TCP socket reaches the cut before the TLS wrap."""
+def test_the_tls_wrap_is_made_without_the_handshake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wrap must leave the handshake to ``connect()``: it detaches the socket it is given, so only the TLS socket
+    it returns can be cut, and that one is attached before the handshake starts. The ordering itself is proved by
+    ``test_a_stalled_handshake_is_cut_at_the_deadline``."""
     listener = socket.create_server(("127.0.0.1", 0))
     cut = _http._Cut()
     conn = _http._HTTPSConnection(
         "127.0.0.1", listener.getsockname()[1], cut=cut, context=ssl.create_default_context(), timeout=2.0
     )
-    taken: list[bool] = []
+    handshakes: list[Any] = []
 
     def spy(self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
-        taken.append(cut._socket is sock)  # the socket the cut holds, before the handshake
-        raise OSError("the handshake is not performed here")
+        handshakes.append(kwargs.get("do_handshake_on_connect"))
+        raise OSError("the wrap is not performed here")
 
     monkeypatch.setattr(ssl.SSLContext, "wrap_socket", spy)
     try:
-        with pytest.raises(OSError, match="the handshake is not performed here"):
+        with pytest.raises(OSError, match="the wrap is not performed here"):
             conn.connect()
     finally:
         conn.close()
         listener.close()
-    assert taken == [True]
+    assert handshakes == [False]  # not inside the wrap: after the cut holds the TLS socket
+
+
+async def test_a_stalled_handshake_is_cut_at_the_deadline() -> None:
+    """A peer that accepts and never answers the handshake is cut at the deadline, not at the socket's own timeout."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    held: list[socket.socket] = []
+    stop = threading.Event()
+
+    def stall() -> None:
+        sock, _ = listener.accept()  # accepted, never answered: the handshake never completes
+        held.append(sock)
+        stop.wait(10.0)
+
+    threading.Thread(target=stall, name="tests:stalled-handshake", daemon=True).start()
+    cut = _http._Cut()
+    conn = _http._HTTPSConnection(
+        "127.0.0.1",
+        listener.getsockname()[1],
+        cut=cut,
+        context=ssl.create_default_context(),
+        timeout=5.0,  # the socket's own bound: the cut must end the handshake far sooner
+    )
+    errors: list[BaseException] = []
+
+    def connect() -> None:
+        try:
+            conn.connect()
+        except OSError as e:  # the handshake, ended by the cut
+            errors.append(e)
+
+    worker = threading.Thread(target=connect, name="tests:connect", daemon=True)
+    worker.start()
+    try:
+        await eventually(lambda: cut._socket is not None)  # the TCP connect returned, the handshake is under way
+        attached = cut._socket
+        assert attached is not None  # the handshake is under way
+        assert attached.fileno() != -1, "the cut holds a socket that was detached"
+        started = time.monotonic()
+        cut.cut()  # what the exchange's deadline does
+        await asyncio.to_thread(worker.join, 1.0)
+        assert not worker.is_alive(), "the handshake was not cut: it waits for the socket's own timeout"
+        assert time.monotonic() - started < 1.0
+        assert len(errors) == 1, errors
+    finally:
+        stop.set()
+        conn.close()
+        listener.close()
+        for sock in held:
+            sock.close()
 
 
 async def test_a_deadline_cut_ends_the_exchange_at_once(jwks: Jwks) -> None:
@@ -102,16 +155,22 @@ async def test_a_deadline_cut_ends_the_exchange_at_once(jwks: Jwks) -> None:
     assert asyncio.get_running_loop().time() - started < 0.6
     # A read nothing else bounds ends at the cut itself, and the answer written after it cannot reach the socket: the
     # server's own write fails. Without the cut this read would return that answer and no failure would be recorded.
-    jwks.write_failed = False
-    cut = _http._Cut()
-    parts = urlsplit(jwks.url)
-    conn = _http._HTTPConnection(parts.hostname or "", parts.port, cut=cut, timeout=5.0)
+    # The probe has an issuer of its own, so no other request (the exchange above still holds its answer back) can set
+    # the failure it observes.
+    probe = await asyncio.to_thread(Jwks)
     try:
-        await asyncio.to_thread(conn.connect)
-        await asyncio.to_thread(conn.request, "GET", parts.path)
-        cut.cut()  # what the exchange's deadline does
-        with pytest.raises(http.client.RemoteDisconnected):
-            await asyncio.to_thread(conn.getresponse)
+        probe.delay = 0.35  # the answer comes long after the cut, and finds the client gone
+        cut = _http._Cut()
+        parts = urlsplit(probe.url)
+        conn = _http._HTTPConnection(parts.hostname or "", parts.port, cut=cut, timeout=5.0)
+        try:
+            await asyncio.to_thread(conn.connect)
+            await asyncio.to_thread(conn.request, "GET", parts.path)
+            cut.cut()  # what the exchange's deadline does
+            with pytest.raises(http.client.RemoteDisconnected):
+                await asyncio.to_thread(conn.getresponse)
+        finally:
+            conn.close()
+        await eventually(lambda: probe.write_failed, within=1.0)
     finally:
-        conn.close()
-    await eventually(lambda: jwks.write_failed, within=0.5)
+        await asyncio.to_thread(probe.stop)

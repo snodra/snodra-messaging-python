@@ -479,13 +479,24 @@ async def test_the_token_endpoints_answers(token_endpoint: TokenEndpoint) -> Non
 
 
 async def test_a_token_url_or_jwks_url_with_userinfo_is_refused() -> None:
-    for url in ("https://id:pw@idp.test/token", "https://id@idp.test/token"):
+    for url in (
+        "https://id:pw@idp.test/token",
+        "https://id@idp.test/token",
+        "ftp://id:pw@idp.test/token",  # another scheme: refused before it, so it is never echoed either
+        "user:pw@idp.test/token",  # no scheme: parsed as scheme "user", the credentials in its path
+    ):
         with pytest.raises(ConfigurationError, match="user") as e:
             Settings(service="orders-service", credentials=ClientCredentials(url, "c", "s"))
-        assert "pw" not in str(e.value)
-    with pytest.raises(ConfigurationError, match="user") as e:
-        Settings(service="orders-service", jwks_url="https://id:pw@idp.test/jwks", issuer="https://idp.test")
-    assert "pw" not in str(e.value)
+        assert "pw" not in str(e.value), url
+    for url in (
+        "https://id:pw@idp.test/jwks",
+        "https://id@idp.test/jwks",
+        "ftp://id:pw@idp.test/jwks",
+        "user:pw@idp.test/jwks",
+    ):
+        with pytest.raises(ConfigurationError, match="user") as e:
+            Settings(service="orders-service", jwks_url=url, issuer="https://idp.test")
+        assert "pw" not in str(e.value), url
 
 
 async def test_a_plain_http_token_url_warns(caplog: pytest.LogCaptureFixture) -> None:

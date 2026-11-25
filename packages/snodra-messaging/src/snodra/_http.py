@@ -199,7 +199,7 @@ class _Attach:
         super().connect()  # type: ignore[misc]  # the http.client connection this is mixed into
         sock = self.sock
         if sock is not None:
-            self._cut.attach(sock)  # a TLS socket too: shutting it down ends a read or a handshake on it
+            self._cut.attach(sock)  # the socket the TCP connect left here (a TLS connection takes it in its own)
 
 
 class _HTTPConnection(_Attach, http.client.HTTPConnection):
@@ -207,20 +207,24 @@ class _HTTPConnection(_Attach, http.client.HTTPConnection):
 
 
 class _HTTPSConnection(_Attach, http.client.HTTPSConnection):
-    """The TCP socket is taken before the TLS handshake, so a peer that stalls the handshake is cut at the deadline,
-    and the proxy tunnel (plaintext, on that same socket) is set up as ``http.client`` does it."""
+    """The live TLS socket is taken before the handshake, so a peer that stalls it is cut at the deadline, and the proxy
+    tunnel (plaintext, on the TCP socket) is set up as ``http.client`` does it."""
 
     _tunnel_host: str | None  # set by http.client when a proxy CONNECT tunnel is needed
     _context: ssl.SSLContext  # the SSL context of the connection
 
     def connect(self) -> None:
         http.client.HTTPConnection.connect(self)  # the TCP socket, and the proxy tunnel on it
+        server_hostname = self._tunnel_host if self._tunnel_host else self.host
+        # The wrap ``http.client.HTTPSConnection.connect`` does once its TCP connect returned, without its handshake:
+        # ``wrap_socket`` detaches the socket it is given, so the TCP socket is gone once the wrap returned, and only
+        # the TLS socket it returns can be shut down. That one is attached before the handshake starts.
         sock = self.sock
         assert sock is not None  # http.client's connect() left it there
-        self._cut.attach(sock)  # before the handshake: a peer that stalls it is cut at the deadline
-        server_hostname = self._tunnel_host if self._tunnel_host else self.host
-        # The wrap ``http.client.HTTPSConnection.connect`` does once its TCP connect returned.
-        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
+        tls = self._context.wrap_socket(sock, server_hostname=server_hostname, do_handshake_on_connect=False)
+        self.sock = tls
+        self._cut.attach(tls)  # the live socket: a peer that stalls the handshake is cut at the deadline
+        tls.do_handshake()
 
 
 class _HTTPHandler(urllib.request.HTTPHandler):

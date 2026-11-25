@@ -147,7 +147,7 @@ class Settings:
                 raise ConfigurationError(f"jwks_url (SNODRA_JWKS_URL) must be a URL or None, got {url!r}")
             url = url.strip()
             parts = urlsplit(url)
-            if parts.username is not None or parts.password is not None:
+            if _carries_userinfo(url):
                 # Before the scheme check: a URL with credentials is never written into an error, whatever its scheme.
                 raise ConfigurationError(
                     "jwks_url (SNODRA_JWKS_URL) must carry no userinfo: the credentials of the issuer's endpoint are "
@@ -342,6 +342,15 @@ def _optional_text(value: object) -> bool:
     return value is None or isinstance(value, str)
 
 
+def _carries_userinfo(url: str) -> bool:
+    """Whether the authority of url carries ``@``, read from the text so that every form is refused whatever
+    :func:`~urllib.parse.urlsplit` makes of it: a scheme-less ``user:pw@host/x`` is read as the scheme ``user``, with
+    the credentials in its path."""
+    rest = url[url.find("://") + 3 :] if "://" in url else url
+    ends = [i for i in (rest.find(c) for c in "/?#") if i != -1]
+    return "@" in rest[: min(ends, default=len(rest))]
+
+
 def _blank_none(value: str | None) -> str | None:
     return None if value is None or not value.strip() else value.strip()
 
@@ -354,7 +363,7 @@ def _checked_grant(grant: ClientCredentials) -> ClientCredentials:
             raise ConfigurationError(f"ClientCredentials.{name} must be a text, got a {type(value).__name__}")
     url = grant.token_url.strip()
     parts = urlsplit(url)
-    if parts.username is not None or parts.password is not None:
+    if _carries_userinfo(url):
         # Before the scheme check: a URL with credentials is never written into an error, whatever its scheme.
         raise ConfigurationError(
             "ClientCredentials.token_url (SNODRA_SERVER_OAUTH2_TOKEN_URI) must carry no userinfo: the client is "
