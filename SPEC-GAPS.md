@@ -101,6 +101,21 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** settled: the reference implementation's order, pinned by
   `test_the_unkeyed_next_hub_is_the_reference_order` and by the `L1-HUB-FAILOVER` check.
 
+### SG-6: telemetry instrumentation scope name and request span
+
+- **Specification:** `writing-a-library.md` (Observability) and `protocol.md` describe the metrics and trace
+  propagation across hub requests, but do not specify an instrumentation scope name or whether handled requests start a
+  server span.
+- **Other Snodra libraries:** they differ: some create spans only through an external tracing bridge, while others
+  provide direct OpenTelemetry instrumentation with a dedicated scope name and server spans.
+- **This library:** `packages/snodra-messaging-observability` (`src/snodra_observability/__init__.py`). The instrumentation
+  scope name is `"snodra"`. Each handled request (command or query) runs inside a `SERVER` span named after the
+  request's message type, as a child of the request's incoming `traceparent` (and `tracestate`). An outbound request
+  sent during the handling of a request injects the active span context through the configured propagator into its
+  headers.
+- **Question:** open: should the specification standardize the instrumentation scope name and span attributes across
+  all Snodra libraries?
+
 ### SG-7: JSON details of the default payload codec
 
 - **Specification:** `messages.md` (Payloads) fixes camelCase names, UTC ISO 8601 timestamps, string ids, unknown fields

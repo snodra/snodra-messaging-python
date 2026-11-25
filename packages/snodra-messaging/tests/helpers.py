@@ -22,7 +22,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fakehub import FakeHub, FakeStream, ack
-from snodra import App, Codec, Settings, message_type
+from snodra import App, Codec, Settings, Telemetry, message_type
 from snodra._hubpb import hub_pb2
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
@@ -48,6 +48,7 @@ def new_app(
     /,
     *,
     codec: Codec | None = None,
+    telemetry: Telemetry | None = None,
     _timings: Timings | None = None,
     **settings: Any,
 ) -> App:
@@ -61,14 +62,26 @@ def new_app(
         "reconnect_backoff": (0.05, 0.2),
         "hubs": tuple(h.address for h in targets),
     }
-    app = App(Settings(**(values | settings)), codec=codec, _timings=SCALED if _timings is None else _timings)
+    app = App(
+        Settings(**(values | settings)),
+        codec=codec,
+        telemetry=telemetry,
+        _timings=SCALED if _timings is None else _timings,
+    )
     _apps.append(app)
     return app
 
 
-async def start_app(hubs: FakeHub | Sequence[FakeHub], /, *, _timings: Timings | None = None, **settings: Any) -> App:
+async def start_app(
+    hubs: FakeHub | Sequence[FakeHub],
+    /,
+    *,
+    telemetry: Telemetry | None = None,
+    _timings: Timings | None = None,
+    **settings: Any,
+) -> App:
     """:func:`new_app`, started."""
-    app = new_app(hubs, _timings=_timings, **settings)
+    app = new_app(hubs, telemetry=telemetry, _timings=_timings, **settings)
     await app.start()
     return app
 

@@ -26,6 +26,7 @@ from snodra._settings import Settings, hub_targets
 from snodra._stream_client import Stream, stream
 from snodra._subscribe import Subscription, subscribe
 from snodra._subscription_handler import Updates
+from snodra._telemetry import Gauges, NoTelemetry, Telemetry
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
@@ -51,15 +52,28 @@ class App:
     client certificate pair): one that cannot be used is a :class:`ConfigurationError`.
     """
 
-    def __init__(self, settings: Settings, *, codec: Codec | None = None, _timings: Timings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        codec: Codec | None = None,
+        telemetry: Telemetry | None = None,
+        _timings: Timings | None = None,
+    ) -> None:
         self._settings = settings
+        self._telemetry: Telemetry = NoTelemetry() if telemetry is None else telemetry
         # The status period is the app's own setting: the shipped timings as given, with it applied.
         self._timings = (
             replace(DEFAULT_TIMINGS, status_interval=settings.status_interval) if _timings is None else _timings
         )
         if settings.tls is not None:
             _tls.check_ca(settings.tls)
-        self._credentials = _credentials.build(settings.credentials, service=settings.service, timings=self._timings)
+        self._credentials = _credentials.build(
+            settings.credentials,
+            service=settings.service,
+            timings=self._timings,
+            on_token_fetched=self._telemetry.token_fetched,
+        )
         certificates = None
         if settings.client_certificate is not None:
             certificates = _tls.Certificates(settings.client_certificate, settings.service)
@@ -92,8 +106,10 @@ class App:
             identity=self._identity,
             stream_credit_timeout=settings.stream_credit_timeout,
             max_subscriptions=settings.max_subscriptions,
+            telemetry=self._telemetry,
         )
-        self._sender = Sender(self._codec, settings, self._timings)
+        self._sender = Sender(self._codec, settings, self._timings, telemetry=self._telemetry)
+        self._cert_seen: set[str] = set()
         self._pool = Pool(
             settings,
             self._timings,
@@ -101,6 +117,8 @@ class App:
             on_answer=self._sender.on_answer,
             credentials=self._credentials,
             certificates=certificates,
+            telemetry=self._telemetry,
+            on_cert_presented=self._cert_presented,
         )
         self._sender.pool = self._pool
         self._sender.local = LocalCalls(self._registry, self._dispatcher, self._codec, settings)
@@ -109,6 +127,22 @@ class App:
         self._shutting_down = False
         self._stop = asyncio.Event()  # a signal, or shutdown: run() stops waiting
         self._down = asyncio.Event()  # shutdown is over
+
+    def _cert_presented(self, fp: str) -> None:
+        seen = fp in self._cert_seen
+        first = len(self._cert_seen) == 0
+        if not seen:
+            self._cert_seen.add(fp)
+        if not seen and not first:
+            self._telemetry.certificate_rotated()
+
+    def _read_gauges(self) -> Gauges:
+        if self._shutting_down:
+            return Gauges(handlers_in_flight=0, connected_hubs=0)
+        return Gauges(
+            handlers_in_flight=self._dispatcher.handlers_in_flight,
+            connected_hubs=len(self._pool._live()),
+        )
 
     @property
     def instance_id(self) -> str:
@@ -470,6 +504,8 @@ class App:
             registry.subscription_types(),
         )
         self._started = True
+        if not self._shutting_down:
+            self._telemetry.observe_gauges(self._read_gauges)
         self._pool.start()
 
     async def ready(self, timeout: float | None = None) -> None:  # noqa: ASYNC109 (the API takes a timeout)

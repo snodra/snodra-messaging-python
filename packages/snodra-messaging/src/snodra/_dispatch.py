@@ -8,10 +8,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final, Protocol, cast
 
+from snodra import _traceparent
 from snodra._codec import Codec
 from snodra._context import _CALLER, _CURRENT, MessageInfo
 from snodra._errors import DecodeError, ErrorCode, Unauthenticated, error_to_wire
@@ -21,6 +23,7 @@ from snodra._permits import PermitLedger
 from snodra._registry import Handler, Kind, Registry
 from snodra._stream_handler import StreamCredit, end_of_stream, failure, serve
 from snodra._subscription_handler import ServedSubscription, Subscriptions
+from snodra._telemetry import Handling, Telemetry
 from snodra._timings import Timings
 
 log = logging.getLogger(__name__)
@@ -75,6 +78,15 @@ def _kind_name(kind: int) -> str:
         return "UNRECOGNIZED"
 
 
+def _handling_of(request: hub_pb2.Request) -> Handling:
+    """Builds the :class:`Handling` record for a request about to be handled."""
+    tp = request.headers.get("traceparent")
+    valid_tp = tp if tp is not None and _traceparent.valid(tp) else None
+    ts = request.headers.get("tracestate") if valid_tp is not None else None
+    kind = "command" if request.kind == hub_pb2.COMMAND else "query"
+    return Handling(type=request.type, kind=kind, traceparent=valid_tp, tracestate=ts)
+
+
 class Dispatcher:
     """Serves the requests of every hub stream of an app: each one in a task of its own, ``snodra:handler:<id>``,
     at most ``max_concurrent`` at once over every hub (a request beyond waits for a local permit)."""
@@ -89,6 +101,7 @@ class Dispatcher:
         *,
         stream_credit_timeout: float = 600.0,
         max_subscriptions: int = 1024,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._registry = registry
         self._codec = codec
@@ -97,6 +110,7 @@ class Dispatcher:
         self._slots: asyncio.Semaphore | None = None
         self._timings = timings
         self._stream_credit_timeout = stream_credit_timeout
+        self._telemetry = telemetry
         self._running: dict[tuple[object, str], _Running] = {}
         self._tasks: dict[asyncio.Task[None], _Running] = {}
         self._subscriptions = Subscriptions(max_subscriptions)
@@ -280,15 +294,17 @@ class Dispatcher:
         items = cast("AsyncIterator[object]", handler.fn(message))  # a streaming handler is an async generator
         current = _CURRENT.set(self._info(request))
         calling = _CALLER.set(caller)
+        cm = self._telemetry.handling(_handling_of(request)) if self._telemetry is not None else nullcontext()
         try:
-            await serve(
-                items,
-                request,
-                arrival=run.arrival,
-                codec=self._codec,
-                credit=credit,
-                credit_timeout=self._stream_credit_timeout,
-            )
+            with cm:
+                await serve(
+                    items,
+                    request,
+                    arrival=run.arrival,
+                    codec=self._codec,
+                    credit=credit,
+                    credit_timeout=self._stream_credit_timeout,
+                )
         finally:
             _CALLER.reset(calling)
             _CURRENT.reset(current)
@@ -395,9 +411,11 @@ class Dispatcher:
         # Set for this request only, and restored after it: an in-process call runs in its caller's task.
         current = _CURRENT.set(self._info(request))
         calling = _CALLER.set(caller)
+        cm = self._telemetry.handling(_handling_of(request)) if self._telemetry is not None else nullcontext()
         try:
-            result: Any = await handler.fn(message)
-            payload = self._codec.encode(result)
+            with cm:
+                result: Any = await handler.fn(message)
+                payload = self._codec.encode(result)
         except asyncio.CancelledError as e:
             task = asyncio.current_task()
             if task is not None and task.cancelling():

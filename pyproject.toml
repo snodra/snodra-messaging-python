@@ -14,6 +14,7 @@ members = ["packages/*", "examples/*"]
 [tool.uv.sources]
 snodra-messaging = { workspace = true }
 snodra-conformance-service = { workspace = true }
+snodra-messaging-observability = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -27,6 +28,8 @@ dev = [
     "twine==7.0.0",
     "snodra-messaging",
     "snodra-conformance-service",
+    "snodra-messaging-observability",
+    "opentelemetry-sdk==1.45.2",
 ]
 gen = ["grpcio-tools==1.85.4"]
 
@@ -51,7 +54,7 @@ module = "snodra._hubpb.*"
 ignore_errors = true
 
 [tool.pytest.ini_options]
-testpaths = ["packages/snodra-messaging/tests", "examples"]
+testpaths = ["packages/snodra-messaging/tests", "packages/snodra-messaging-observability/tests", "examples"]
 pythonpath = ["packages/snodra-messaging/tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

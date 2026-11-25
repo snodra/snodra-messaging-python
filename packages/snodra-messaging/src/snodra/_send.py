@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Final, Literal
@@ -24,6 +25,7 @@ from snodra._pool import Pool
 from snodra._propagation import outgoing_headers
 from snodra._retry import RetryPolicy, retryable
 from snodra._settings import Settings
+from snodra._telemetry import Telemetry, request_outcome
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 log = logging.getLogger(__name__)
@@ -119,10 +121,11 @@ class Sender:
     """Sends commands, point queries and scatter-gathers through the hubs and keeps the calls waiting for an answer:
     one entry per request id, buffered while in a stream's outbound buffer, written once the writer took it."""
 
-    def __init__(self, codec: Codec, settings: Settings, timings: Timings) -> None:
+    def __init__(self, codec: Codec, settings: Settings, timings: Timings, telemetry: Telemetry | None = None) -> None:
         self._codec = codec
         self._settings = settings
         self._timings = timings
+        self._telemetry = telemetry
         self.pool: Pool | None = None
         """The hubs; set by the app once built (they deliver the answers to :meth:`on_answer`)."""
         self.pending: dict[str, OutboundRequest] = {}
@@ -194,10 +197,21 @@ class Sender:
         t = p.template
         if self.local is not None and (local := self.local.handler(kind, t.type)) is not None:
             return await self.local.call(local, kind, t.payload, dict(t.headers), result)
-        payload = await self.with_retry(p, self._attempt)
-        if result is None:
-            return None
-        return self._codec.decode(payload or b"{}", result)
+        started = time.monotonic()
+        exc: BaseException | None = None
+        try:
+            payload = await self.with_retry(p, self._attempt)
+            if result is None:
+                return None
+            return self._codec.decode(payload or b"{}", result)
+        except BaseException as e:
+            exc = e
+            raise
+        finally:
+            if self._telemetry is not None:
+                outcome = request_outcome(exc)
+                if outcome is not None:
+                    self._telemetry.request_done(kind, t.type, outcome, time.monotonic() - started)
 
     def prepare(
         self,
@@ -215,7 +229,7 @@ class Sender:
         before anything is sent for an option it refuses."""
         type_ = type_name(message)
         # The own headers are checked before anything else is built: a reserved name sends nothing.
-        request_headers = outgoing_headers(headers, forward_jwt=self._settings.forward_jwt)
+        request_headers = outgoing_headers(headers, forward_jwt=self._settings.forward_jwt, telemetry=self._telemetry)
         chosen = self._chosen(timeout)
         policy = self._policy(retry)
         if priority is not None and (

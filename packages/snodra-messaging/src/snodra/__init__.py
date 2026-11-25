@@ -31,6 +31,7 @@ from snodra._settings import Settings
 from snodra._stream_client import Stream
 from snodra._subscribe import Subscription
 from snodra._subscription_handler import Updates
+from snodra._telemetry import Gauges, Handling, NoTelemetry, Telemetry
 from snodra._tls import ClientCertificate, TLSConfig
 
 __version__: str = version("snodra-messaging")
@@ -46,14 +47,17 @@ __all__ = [
     "DecodeError",
     "ErrorCode",
     "Gathered",
+    "Gauges",
     "Guard",
     "HandlerError",
+    "Handling",
     "HubError",
     "InvalidRequest",
     "JsonCodec",
     "LostParts",
     "MessageInfo",
     "NeverSent",
+    "NoTelemetry",
     "OutcomeUnknown",
     "Part",
     "PermissionDenied",
@@ -67,6 +71,7 @@ __all__ = [
     "Stream",
     "Subscription",
     "TLSConfig",
+    "Telemetry",
     "Token",
     "TokenFile",
     "TokenSource",

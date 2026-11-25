@@ -333,7 +333,13 @@ class JwtCredentials(HubCredentials):
         return "JwtCredentials(***)"
 
 
-def build(credential: Credential | None, *, service: str, timings: Timings) -> HubCredentials | None:
+def build(
+    credential: Credential | None,
+    *,
+    service: str,
+    timings: Timings,
+    on_token_fetched: Callable[[str], None] | None = None,
+) -> HubCredentials | None:
     """The credential of an app's connections, its files checked now (:class:`ConfigurationError`)."""
     if credential is None:
         return None
@@ -342,7 +348,9 @@ def build(credential: Credential | None, *, service: str, timings: Timings) -> H
     if isinstance(credential, TokenFile):
         return TokenFileCredentials(credential.path)
     if isinstance(credential, ClientCredentials):
-        source: TokenSource = ClientCredentialsSource(credential, timeout=timings.token_fetch_timeout)
+        source: TokenSource = ClientCredentialsSource(
+            credential, timeout=timings.token_fetch_timeout, on_token_fetched=on_token_fetched
+        )
     else:
         source = credential
     return JwtCredentials(TokenProvider(source, timings))
@@ -537,12 +545,26 @@ class TokenProvider:
 # The OAuth2 client-credentials grant.
 
 
+class _FetchFailed(Exception):
+    def __init__(self, result: str, message: str) -> None:
+        super().__init__(message)
+        self.result = result
+        self.message = message
+
+
 class ClientCredentialsSource:
     """The :class:`TokenSource` of a :class:`ClientCredentials` grant (RFC 6749, 4.4): one fetch per call."""
 
-    def __init__(self, grant: ClientCredentials, *, timeout: float) -> None:
+    def __init__(
+        self,
+        grant: ClientCredentials,
+        *,
+        timeout: float,
+        on_token_fetched: Callable[[str], None] | None = None,
+    ) -> None:
         self._grant = grant
         self._timeout = timeout
+        self._on_token_fetched = on_token_fetched
         self._host = urllib.parse.urlsplit(grant.token_url).hostname or grant.token_url
         if grant.client_secret_file is not None:
             self._read_secret()  # now, for the startup error
@@ -576,6 +598,8 @@ class ClientCredentialsSource:
             try:
                 secret = await asyncio.to_thread(self._read_secret)
             except ConfigurationError as e:
+                if self._on_token_fetched is not None:
+                    self._on_token_fetched("io_error")
                 raise TokenError(str(e)) from None
         else:
             secret = grant.client_secret or ""
@@ -583,8 +607,9 @@ class ClientCredentialsSource:
         basic = base64.b64encode(user.encode()).decode("ascii")
         hidden = [basic, user, _form(secret), secret]  # what an endpoint might echo back in a text
         fields = {"grant_type": "client_credentials"} | ({} if grant.scope is None else {"scope": grant.scope})
+        result = "ok"
         try:
-            return await _http.exchange(
+            tok = await _http.exchange(
                 grant.token_url,
                 method="POST",
                 data=urllib.parse.urlencode(fields).encode("ascii"),
@@ -599,18 +624,28 @@ class ClientCredentialsSource:
                 ca_file=grant.ca_file,
                 read=functools.partial(self._read, hidden),
             )
+            return tok
+        except _FetchFailed as e:
+            result = e.result
+            raise TokenError(e.message) from None
         except TokenError:
             raise
         except _http.TooLarge:
+            result = "bad_response"
             raise TokenError(
                 f"the token endpoint {self._host} answered with more than {MAX_TOKEN_RESPONSE} bytes"
             ) from None
         except TimeoutError:
+            result = "io_error"
             raise TokenError(f"no answer from the token endpoint {self._host} within {self._timeout:g} s") from None
         except Exception as e:
+            result = "io_error"
             raise TokenError(
                 _masked(f"the token endpoint {self._host} cannot be reached: {_describe(e)}", hidden)
             ) from None
+        finally:
+            if self._on_token_fetched is not None:
+                self._on_token_fetched(result)
 
     def _read(self, hidden: list[str], response: _http.Response) -> AccessToken:
         """The token of the endpoint's answer (in the exchange's thread); :class:`TokenError` for any other answer."""
@@ -621,28 +656,37 @@ class ClientCredentialsSource:
         if response.status != 200:
             error = doc.get("error") if isinstance(doc, dict) else None
             if not isinstance(error, str) or not error:
-                raise TokenError(f"the token endpoint {self._host} answered HTTP {response.status}")
+                raise _FetchFailed("http_error", f"the token endpoint {self._host} answered HTTP {response.status}")
             description = doc.get("error_description") if isinstance(doc, dict) else None
             text = error if not isinstance(description, str) else f"{error}: {description}"
-            raise TokenError(
-                _masked(f"the token endpoint {self._host} refused (HTTP {response.status}): {text}", hidden)
+            raise _FetchFailed(
+                "oauth_error",
+                _masked(f"the token endpoint {self._host} refused (HTTP {response.status}): {text}", hidden),
             )
         if not isinstance(doc, dict):
-            raise TokenError(f"the token endpoint {self._host} answered something that is not a JSON object")
+            raise _FetchFailed(
+                "bad_response", f"the token endpoint {self._host} answered something that is not a JSON object"
+            )
         value = doc.get("access_token")
         if not isinstance(value, str) or not value.strip():
-            raise TokenError(f"the token endpoint {self._host} answered without an access_token")
+            raise _FetchFailed("bad_response", f"the token endpoint {self._host} answered without an access_token")
         kind = doc.get("token_type")
         if kind is not None and not (isinstance(kind, str) and kind.lower() == "bearer"):
-            raise TokenError(f"the token endpoint {self._host} answered a token_type that is not Bearer")
+            raise _FetchFailed(
+                "bad_response", f"the token endpoint {self._host} answered a token_type that is not Bearer"
+            )
         expires_in = doc.get("expires_in")
         if expires_in is None:
             return AccessToken(value, None)
         if isinstance(expires_in, bool) or not isinstance(expires_in, int | float) or not math.isfinite(expires_in):
-            raise TokenError(f"the token endpoint {self._host} answered an expires_in that is not a positive number")
+            raise _FetchFailed(
+                "bad_response", f"the token endpoint {self._host} answered an expires_in that is not a positive number"
+            )
         seconds = min(int(expires_in), int(MAX_LIFETIME))
         if seconds <= 0:
-            raise TokenError(f"the token endpoint {self._host} answered an expires_in that is not a positive number")
+            raise _FetchFailed(
+                "bad_response", f"the token endpoint {self._host} answered an expires_in that is not a positive number"
+            )
         return AccessToken(value, time.time() + seconds)
 
 

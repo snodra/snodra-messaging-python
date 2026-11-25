@@ -17,7 +17,7 @@ import random
 import time
 from collections.abc import Callable, Collection, Coroutine
 from dataclasses import dataclass
-from typing import Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import grpc
 import grpc.aio
@@ -29,6 +29,9 @@ from snodra._hubpb import hub_pb2, hub_pb2_grpc
 from snodra._permits import PermitLedger
 from snodra._targets import hub_id_of
 from snodra._timings import DEFAULT_TIMINGS, Timings
+
+if TYPE_CHECKING:
+    from snodra._telemetry import Telemetry
 
 log = logging.getLogger(__name__)
 
@@ -375,11 +378,15 @@ class HubConnection:
         certificates: _tls.Certificates | None = None,
         permits: Callable[[HubConnection], int] | None = None,
         server_name: str | None = None,
+        telemetry: Telemetry | None = None,
+        on_cert_presented: Callable[[str], None] | None = None,
     ) -> None:
         self.address = address
         self._register = register
         self._permits = permits
         self._server_name = server_name
+        self._telemetry = telemetry
+        self._on_cert_presented = on_cert_presented
         """The name a TLS hub certificate is checked against when the configuration names none (a resolved address's
         DNS name)."""
         self._withdrawn = False
@@ -533,6 +540,8 @@ class HubConnection:
             return
         if s.put(hub_pb2.ClientMessage(credentials=wanted)):
             s.presented = wanted
+            if self._telemetry is not None:
+                self._telemetry.credentials_refresh_sent()
             log.debug("Credentials refreshed on the hub stream of %s to %s", self._register.service_name, self.address)
 
     async def roll_over(self, idle: Callable[[_Stream], bool]) -> bool:
@@ -868,6 +877,8 @@ class HubConnection:
                                 self._register.instance_id,
                                 round(stream.interval * 1000),
                             )
+                            if stream.certificate is not None and self._on_cert_presented is not None:
+                                self._on_cert_presented(stream.certificate[1].fingerprint)
                             if self._credentials is not None:  # one renewed between the Register and the ack
                                 self._follow(stream, self._credentials.latest())
                         # Every ack: a hub may answer another id (its target now reaches another hub), and the hub it

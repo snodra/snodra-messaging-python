@@ -11,7 +11,7 @@ import asyncio
 import logging
 import socket
 from collections.abc import Awaitable, Callable, Collection, Sequence
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from snodra._connection import _TYPE_LISTS, HubConnection, Rejection, _Stream, settle
 from snodra._credentials import HubCredentials
@@ -23,6 +23,9 @@ from snodra._settings import Settings
 from snodra._targets import one_family, parse_targets, share_of
 from snodra._timings import Timings
 from snodra._tls import Certificates
+
+if TYPE_CHECKING:
+    from snodra._telemetry import Telemetry
 
 log = logging.getLogger(__name__)
 
@@ -58,11 +61,15 @@ class Pool:
         on_answer: Callable[[_Stream, hub_pb2.ServerMessage], None] | None = None,
         credentials: HubCredentials | None = None,
         certificates: Certificates | None = None,
+        telemetry: Telemetry | None = None,
+        on_cert_presented: Callable[[str], None] | None = None,
     ) -> None:
         self._timings = timings
         self._dispatcher = dispatcher
         self._credentials = credentials
         self._certificates = certificates
+        self._telemetry = telemetry
+        self._on_cert_presented = on_cert_presented
         self._on_answer = on_answer
         self._backoff = settings.reconnect_backoff
         self._tls = settings.tls
@@ -169,6 +176,8 @@ class Pool:
             certificates=self._certificates,
             permits=self._share_for,
             server_name=name,
+            telemetry=self._telemetry,
+            on_cert_presented=self._on_cert_presented,
         )
 
     def _changed(self) -> None:
