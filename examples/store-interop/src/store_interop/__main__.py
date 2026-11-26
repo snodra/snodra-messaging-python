@@ -11,9 +11,6 @@ import sys
 from store_interop.service import Probe
 from store_interop.settings import FAMILIES, Settings
 
-SHUTDOWN_BUDGET = 10.0
-"""Seconds each app may take to shut down (the harness stops every container with SIGTERM)."""
-
 log = logging.getLogger("store_interop")
 
 

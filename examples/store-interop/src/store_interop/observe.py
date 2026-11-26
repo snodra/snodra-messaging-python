@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
+from contextvars import Token
+from types import TracebackType
 
 from snodra import (
     DeadLetterStore,
@@ -25,7 +27,7 @@ from snodra import (
     Tx,
 )
 
-from store_interop.ledger import Ledger
+from store_interop.ledger import Ledger, TxRecord, bind_record, reset_record
 from store_interop.settings import processor_name
 
 
@@ -65,7 +67,10 @@ class ObservedStore:
         return self._inner.name
 
     def transaction(self) -> AbstractAsyncContextManager[Tx]:
-        return self._inner.transaction()
+        # The library's consumer runs the stage-1 marker and the handlers in this context
+        # manager; the wrapper binds a record and commits it to the ledger only after the inner
+        # transaction committed.
+        return _ObservedTransaction(self._inner.transaction(), self._ledger)
 
     async def begin(self) -> Tx:
         return await self._inner.begin()
@@ -120,6 +125,38 @@ class ObservedStore:
     @property
     def sagas(self) -> SagaStores:
         return self._inner.sagas
+
+
+class _ObservedTransaction:
+    """The add-on's transaction, with the ledger record committed only after the add-on commits."""
+
+    def __init__(self, inner: AbstractAsyncContextManager[Tx], ledger: Ledger) -> None:
+        self._inner = inner
+        self._ledger = ledger
+        self._record = TxRecord()
+        self._token: Token[TxRecord | None] | None = None
+
+    async def __aenter__(self) -> Tx:
+        tx = await self._inner.__aenter__()
+        self._record = TxRecord()
+        self._token = bind_record(self._record)
+        return tx
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        token = self._token
+        try:
+            result = await self._inner.__aexit__(exc_type, exc, traceback)
+        finally:
+            if token is not None:
+                reset_record(token)
+        if exc_type is None:
+            self._ledger.commit(self._record)
+        return result
 
 
 __all__ = ["ObservedProcessed", "ObservedStore", "processor_name"]

@@ -1710,6 +1710,7 @@ name = "store-interop"
 version = "0.0.0"
 source = { editable = "examples/store-interop" }
 dependencies = [
+    { name = "rstream" },
     { name = "snodra-messaging" },
     { name = "snodra-messaging-kafka" },
     { name = "snodra-messaging-mongo" },
@@ -1719,6 +1720,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "rstream", specifier = "==1.1.1" },
     { name = "snodra-messaging", editable = "packages/snodra-messaging" },
     { name = "snodra-messaging-kafka", editable = "packages/snodra-messaging-kafka" },
     { name = "snodra-messaging-mongo", editable = "packages/snodra-messaging-mongo" },

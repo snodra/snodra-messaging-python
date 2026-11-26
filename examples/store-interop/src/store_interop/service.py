@@ -44,6 +44,9 @@ from store_interop.settings import (
 
 log = logging.getLogger("store_interop")
 
+SHUTDOWN_BUDGET = 10.0
+"""Seconds one App may take to shut down; five sequential apps fit the compose stop_grace_period (60 s)."""
+
 
 class Probe:
     """One family's app in this process, its stores and the ledger of what its consumer did."""
@@ -203,7 +206,7 @@ class Probe:
 
     async def stop(self) -> None:
         try:
-            await self.app.shutdown(timeout=10.0)
+            await self.app.shutdown(timeout=SHUTDOWN_BUDGET)
         finally:
             await self.close()
 
