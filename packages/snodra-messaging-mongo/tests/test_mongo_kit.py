@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import snodra
 from snodra.testing import MESSAGE_STORE_CHECKS, run_store_conformance
 from snodra_mongo import MongoStore
 
@@ -15,6 +16,7 @@ async def test_the_mongo_message_store_passes_the_kit(store: MongoStore) -> None
 
 async def test_the_store_reports_its_name_and_has_the_six_ports(store: MongoStore) -> None:
     assert store.name == "mongo"
+    assert isinstance(store, snodra.StoreLifecycle), "the store implements the public lifecycle"
     assert store.outbox is store.outbox
     assert store.processed is store.processed
     assert store.dead_letters is store.dead_letters

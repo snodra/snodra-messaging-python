@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Awaitable
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -22,6 +23,8 @@ from snodra import (
     ReplayRange,
     SagaFailureDocument,
     Tx,
+    bind_transaction,
+    unbind_transaction,
 )
 from snodra_mongo import MongoConfig, MongoStore
 
@@ -417,6 +420,32 @@ def test_a_foreign_tx_is_not_bound(store: MongoStore) -> None:
         store.session(Tx.none())
 
 
+async def test_a_foreign_bound_transaction_is_refused_by_the_context(store: MongoStore) -> None:
+    """A transaction another store bound is refused when this store's context manager starts, not joined."""
+    token = bind_transaction(Tx(object()))
+    try:
+        with pytest.raises(MessageStoreFailed, match="another message store"):
+            async with store.transaction():
+                pass
+    finally:
+        unbind_transaction(token)
+
+
+async def test_an_empty_claim_owner_is_refused(store: MongoStore) -> None:
+    """SG-31: an empty owner matches ``owner: null``, so it cannot be told apart from nobody."""
+    with pytest.raises(InvalidMessage, match="non-empty claim owner"):
+        await store.outbox.claim("", 60.0, 1)
+
+
+async def test_attempts_must_fit_an_int32(store: MongoStore) -> None:
+    """The layout's attempts is an int; a value outside the signed 32-bit range is refused before any write."""
+    for attempts in (2**31, -(2**31) - 1):
+        entry = replace(_entry("conformance.Attempts", 1_762_250_000_000, 1), attempts=attempts)
+        with pytest.raises(InvalidMessage, match="signed 32-bit"):
+            await store.outbox.append_now(entry)
+    assert await store.outbox.pending() == 0, "a refused attempts wrote a document"
+
+
 async def test_on_append_registers_nothing(store: MongoStore) -> None:
     """The MongoDB store has no notification the relay could wait on, so on_append registers nothing."""
     called = False
@@ -440,7 +469,7 @@ async def test_background_has_nothing_to_run(store: MongoStore) -> None:
 async def test_close_is_idempotent_and_leaves_a_service_client_open(store: MongoStore) -> None:
     """A client the service owns is left open by close(); close() twice does nothing the second time."""
     service_client: AsyncMongoClient[Any] = AsyncMongoClient(store.config.url)
-    owned = MongoStore(store.config, client=service_client)
+    owned = MongoStore(MongoConfig(url="", database=store.database.name), client=service_client)
     try:
         await owned.close()
         await owned.close()
