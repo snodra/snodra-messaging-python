@@ -4,10 +4,10 @@
 #   scripts/bump-version.sh 0.1.0
 #
 # - packages/snodra-messaging/pyproject.toml: the distribution's version.
-# - packages/snodra-messaging-observability/pyproject.toml: its version, and its requirement on
-#   snodra-messaging becomes ==X.Y.Z. A consumer resolves the core through that line, so it must
-#   name a release.
-# - uv.lock: rewritten by `uv lock`, which records both versions.
+# - packages/snodra-messaging-{observability,kafka,sql,mongo}/pyproject.toml: each version, and
+#   each requirement on snodra-messaging becomes ==X.Y.Z. A consumer resolves the core through
+#   that line, so it must name a release.
+# - uv.lock: rewritten by `uv lock`, which records all five versions.
 #
 # Every line is found before anything is written, and a failure puts the files back: a release
 # commit is the whole bump or none of it.
@@ -20,10 +20,20 @@ EOF
 
 core=packages/snodra-messaging/pyproject.toml
 observability=packages/snodra-messaging-observability/pyproject.toml
-files="$core $observability"
+kafka=packages/snodra-messaging-kafka/pyproject.toml
+sql=packages/snodra-messaging-sql/pyproject.toml
+mongo=packages/snodra-messaging-mongo/pyproject.toml
+addons="$observability $kafka $sql $mongo"
+files="$core $addons"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# A failed rewrite leaves the files it already prepared as .tmp: they go too, so a failed run writes
+# nothing at all.
+cleanup() {
+  rm -rf "$work"
+  for f in $files; do rm -f "$f.tmp"; done
+}
+trap cleanup EXIT
 
 # rewrite FILE COUNT AWK: FILE.tmp carries the program's changes; the program adds one to done for
 # each replacement it made, and must have made COUNT of them.
@@ -41,14 +51,17 @@ rewrite "$core" 1 '
   /^version = "/ { $0 = "version = \"" v "\""; done = done + 1 }
   { print }'
 
-# shellcheck disable=SC2016 # the quotes are awk's, not the shell's
-rewrite "$observability" 2 '
-  /^version = "/ { $0 = "version = \"" v "\""; done = done + 1 }
-  /^[[:space:]]*"snodra-messaging==/ { sub(/snodra-messaging==[^"]*/, "snodra-messaging==" v); done = done + 1 }
-  { print }'
+# Every add-on carries its own version and its exact requirement on the core.
+for addon in $addons; do
+  # shellcheck disable=SC2016 # the quotes are awk's, not the shell's
+  rewrite "$addon" 2 '
+    /^version = "/ { $0 = "version = \"" v "\""; done = done + 1 }
+    /^[[:space:]]*"snodra-messaging==/ { sub(/snodra-messaging==[^"]*/, "snodra-messaging==" v); done = done + 1 }
+    { print }'
+done
 
-# The two files are rewritten together: a failure above leaves both as they were. `uv lock` then
-# records the versions; if it fails, the files go back.
+# The five files are rewritten together: a failure above leaves all of them as they were. `uv lock`
+# then records the versions; if it fails, the files go back.
 for f in $files; do cp "$f" "$work/$(basename "$f").before"; done
 for f in $files; do mv "$f.tmp" "$f"; done
 if ! uv lock; then

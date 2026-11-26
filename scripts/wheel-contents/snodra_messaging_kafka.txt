@@ -1,0 +1,8 @@
+snodra_kafka/__init__.py
+snodra_kafka/kafka.py
+snodra_kafka/offsets.py
+snodra_kafka/py.typed
+snodra_messaging_kafka-X.Y.Z.dist-info/METADATA
+snodra_messaging_kafka-X.Y.Z.dist-info/RECORD
+snodra_messaging_kafka-X.Y.Z.dist-info/WHEEL
+snodra_messaging_kafka-X.Y.Z.dist-info/licenses/LICENSE

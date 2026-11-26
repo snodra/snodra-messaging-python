@@ -75,11 +75,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # The distributions this repository publishes, one per line; the examples are never built
-      # here, and the level-2 add-ons wait for their PyPI pending trusted publishers. The release
-      # check (scripts/release-check.sh) builds exactly this list.
+      # here. snodra-messaging-rabbitmq is not listed: it publishes once its PyPI pending trusted
+      # publisher exists, and until then it has no PUBLISHED entry, no publish job and no
+      # wheel-contents list. The release check (scripts/release-check.sh) builds exactly this list.
       PUBLISHED: |
         snodra-messaging
         snodra-messaging-observability
+        snodra-messaging-kafka
+        snodra-messaging-sql
+        snodra-messaging-mongo
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -178,7 +182,7 @@ jobs:
   # Versions are cut here, from the Conventional Commit subjects since the last tag
   # (scripts/next-version.sh): feat -> minor, fix/perf -> patch, anything else -> no release.
   # Below 1.0.0 nothing computes a major; 1.0.0 is declared by hand. A release is one commit and one
-  # tag, vX.Y.Z, for both distributions.
+  # tag, vX.Y.Z, for all five distributions.
   #
   # Three jobs, so that no code that builds or tests ever holds a token that can push:
   # - version (read-only) computes the version, makes the release commit and its tag, records their
@@ -257,7 +261,7 @@ jobs:
           overwrite: true
           if-no-files-found: error
 
-  # The packaging check: the release commit must build the four files, install them and pass the
+  # The packaging check: the release commit must build the ten files, install them and pass the
   # tests before anything is pushed, because PyPI keeps a published version forever
   # (scripts/release-check.sh).
   package:
@@ -379,7 +383,7 @@ jobs:
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
   # PyPI keeps a version forever, and each distribution has its own trusted publisher: one job per
-  # distribution, each with the environment the publisher names. Neither checks out the repository.
+  # distribution, each with the environment the publisher names. None checks out the repository.
   publish-core:
     needs: [package, push]
     if: needs.push.outputs.tag != ''
@@ -453,10 +457,121 @@ jobs:
           packages-dir: dist/observability/
           skip-existing: true
 
-  # A tag pushed with GITHUB_TOKEN starts no workflow, so the release runs here, once PyPI has both
-  # distributions.
+  publish-kafka:
+    needs: [package, push]
+    if: needs.push.outputs.tag != ''
+    runs-on: ubuntu-latest
+    environment: pypi-kafka
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      - name: the files are the ones tested
+        env:
+          TAG: ${{ needs.push.outputs.tag }}
+          SUMS: ${{ needs.package.outputs.sums }}
+        run: |
+          version=${TAG#v}
+          cd dist
+          if [ "$(sha256sum SHA256SUMS | cut -d' ' -f1)" != "$SUMS" ]; then
+            echo "::error::dist/SHA256SUMS is not the one the package job recorded"
+            exit 1
+          fi
+          sha256sum --check SHA256SUMS
+          for f in "snodra_messaging_kafka-$version.tar.gz" "snodra_messaging_kafka-$version-py3-none-any.whl"; do
+            [ -f "$f" ] || { echo "::error::dist/$f is missing"; exit 1; }
+          done
+          mkdir kafka
+          mv "snodra_messaging_kafka-$version.tar.gz" \
+            "snodra_messaging_kafka-$version-py3-none-any.whl" kafka/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/kafka/
+          skip-existing: true
+
+  publish-sql:
+    needs: [package, push]
+    if: needs.push.outputs.tag != ''
+    runs-on: ubuntu-latest
+    environment: pypi-sql
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      - name: the files are the ones tested
+        env:
+          TAG: ${{ needs.push.outputs.tag }}
+          SUMS: ${{ needs.package.outputs.sums }}
+        run: |
+          version=${TAG#v}
+          cd dist
+          if [ "$(sha256sum SHA256SUMS | cut -d' ' -f1)" != "$SUMS" ]; then
+            echo "::error::dist/SHA256SUMS is not the one the package job recorded"
+            exit 1
+          fi
+          sha256sum --check SHA256SUMS
+          for f in "snodra_messaging_sql-$version.tar.gz" "snodra_messaging_sql-$version-py3-none-any.whl"; do
+            [ -f "$f" ] || { echo "::error::dist/$f is missing"; exit 1; }
+          done
+          mkdir sql
+          mv "snodra_messaging_sql-$version.tar.gz" \
+            "snodra_messaging_sql-$version-py3-none-any.whl" sql/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/sql/
+          skip-existing: true
+
+  publish-mongo:
+    needs: [package, push]
+    if: needs.push.outputs.tag != ''
+    runs-on: ubuntu-latest
+    environment: pypi-mongo
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      - name: the files are the ones tested
+        env:
+          TAG: ${{ needs.push.outputs.tag }}
+          SUMS: ${{ needs.package.outputs.sums }}
+        run: |
+          version=${TAG#v}
+          cd dist
+          if [ "$(sha256sum SHA256SUMS | cut -d' ' -f1)" != "$SUMS" ]; then
+            echo "::error::dist/SHA256SUMS is not the one the package job recorded"
+            exit 1
+          fi
+          sha256sum --check SHA256SUMS
+          for f in "snodra_messaging_mongo-$version.tar.gz" "snodra_messaging_mongo-$version-py3-none-any.whl"; do
+            [ -f "$f" ] || { echo "::error::dist/$f is missing"; exit 1; }
+          done
+          mkdir mongo
+          mv "snodra_messaging_mongo-$version.tar.gz" \
+            "snodra_messaging_mongo-$version-py3-none-any.whl" mongo/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/mongo/
+          skip-existing: true
+
+  # A tag pushed with GITHUB_TOKEN starts no workflow, so the release runs here, once PyPI has all
+  # five distributions.
   release:
-    needs: [push, publish-core, publish-observability]
+    needs: [push, publish-core, publish-observability, publish-kafka, publish-sql, publish-mongo]
     if: needs.push.outputs.tag != ''
     permissions:
       contents: write

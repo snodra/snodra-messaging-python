@@ -78,13 +78,15 @@ minor, a `fix` or a `perf` the next patch, and `docs`, `test`, `chore`, `ci`, `r
 nothing. Below 1.0.0 a `!` or a `BREAKING CHANGE:` footer counts as a minor; 1.0.0 is declared by hand. Nobody pushes a
 tag: only the workflow makes tags.
 
-Both distributions carry one version and one tag, `vX.Y.Z`. The release commit, `release: X.Y.Z`, writes that version
-into both `pyproject.toml` files, makes the observability package require `snodra-messaging==X.Y.Z`, and records them in
-`uv.lock` (`scripts/bump-version.sh`).
+All five published distributions carry one version and one tag, `vX.Y.Z`. The release commit, `release: X.Y.Z`, writes
+that version into all five `pyproject.toml` files, makes each add-on require `snodra-messaging==X.Y.Z`, and records
+them in `uv.lock` (`scripts/bump-version.sh`). `snodra-messaging-rabbitmq` joins them once its PyPI pending trusted
+publisher exists.
 
-That commit is pushed only after `scripts/release-check.sh X.Y.Z` has built the two sdists and the two wheels, run
-`twine check --strict` on them, installed both wheels on Python 3.12 and 3.14 and run the tests there. It is the check
-to run by hand when a release commit is in doubt, and it refuses a version PyPI already has.
+That commit is pushed only after `scripts/release-check.sh X.Y.Z` has built the five sdists and the five wheels, run
+`twine check --strict` on them, installed all five wheels on Python 3.12 and 3.14, imported every distribution and run
+the tests there. It is the check to run by hand when a release commit is in doubt, and it refuses a version PyPI
+already has.
 
 Pull before you push: `git pull --rebase` first, because a release leaves a commit by the workflow's bot on `main`.
 

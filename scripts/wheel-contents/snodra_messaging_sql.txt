@@ -1,0 +1,9 @@
+snodra_messaging_sql-X.Y.Z.dist-info/METADATA
+snodra_messaging_sql-X.Y.Z.dist-info/RECORD
+snodra_messaging_sql-X.Y.Z.dist-info/WHEEL
+snodra_messaging_sql-X.Y.Z.dist-info/licenses/LICENSE
+snodra_sql/__init__.py
+snodra_sql/py.typed
+snodra_sql/schema/mysql/V1__snodra.sql
+snodra_sql/schema/postgresql/V1__snodra.sql
+snodra_sql/sql.py

@@ -1,0 +1,7 @@
+snodra_messaging_mongo-X.Y.Z.dist-info/METADATA
+snodra_messaging_mongo-X.Y.Z.dist-info/RECORD
+snodra_messaging_mongo-X.Y.Z.dist-info/WHEEL
+snodra_messaging_mongo-X.Y.Z.dist-info/licenses/LICENSE
+snodra_mongo/__init__.py
+snodra_mongo/mongo.py
+snodra_mongo/py.typed
