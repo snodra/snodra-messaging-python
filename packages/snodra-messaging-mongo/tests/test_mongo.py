@@ -451,8 +451,9 @@ async def test_close_is_idempotent_and_leaves_a_service_client_open(store: Mongo
 
 async def test_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     """The config validates its URL, database and retentions, and from_env reads the two settings."""
+    with pytest.raises(ValueError, match="connection string"):
+        MongoStore(MongoConfig(url="", database="db"))
     refused = (
-        ({"url": "", "database": "db"}, "connection string"),
         ({"url": "mongodb://127.0.0.1:1/", "database": ""}, "database"),
         ({"url": "mongodb://127.0.0.1:1/", "database": "db", "outbox_retention": -1.0}, "outbox_retention"),
         ({"url": "mongodb://127.0.0.1:1/", "database": "db", "outbox_retention": float("nan")}, "outbox_retention"),
@@ -469,9 +470,10 @@ async def test_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.outbox_retention == 7 * 86_400
 
 
-def test_the_config_has_no_default_database_or_url() -> None:
-    """Both the connection string and the database are required, as the layout's rule says."""
+def test_the_config_needs_a_database_and_a_store_needs_a_url_without_a_client() -> None:
+    """The database is always required; an empty URL is allowed only when the store is given a client."""
     with pytest.raises(ValueError, match="database"):
         MongoConfig(url="mongodb://localhost:27017/", database=" ")
+    assert MongoConfig(url=" ", database="orders").url == ""
     with pytest.raises(ValueError, match="connection string"):
-        MongoConfig(url=" ", database="orders")
+        MongoStore(MongoConfig(url=" ", database="orders"))

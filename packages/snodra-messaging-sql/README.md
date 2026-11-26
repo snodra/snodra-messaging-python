@@ -25,8 +25,6 @@ from snodra_sql import SqlConfig, SqlStore
 async def main() -> None:
     store = SqlStore(SqlConfig.from_env())
     try:
-        await store.open()
-        await store.init_schema()
         settings = snodra.Settings.from_env(service="orders-service")
         # The event store reads what the relay publishes; the message store holds the outbox and markers.
         app = snodra.App(settings, store=store, event_store=...)
@@ -81,14 +79,18 @@ service's transaction takes a second one.
 
 ### Lifecycle
 
-`SqlStore` also offers the lifecycle a service may drive itself:
+`App.start()` drives the store's lifecycle when it is the app's store: it hands the store the application's
+clock, calls `init_schema()` (or `check_schema()` when `Settings.store_init_schema` is false) and starts
+`background()` in a `snodra:store-background` task until shutdown. A failing schema step fails `start()`, naming
+the store; an error from `background()` is logged and the app keeps running.
 
 - `use_clock(clock)` sets the application's clock (epoch milliseconds), which stamps every time the store
   sets itself: an entry's sending, a claim's lease, a purge bound.
-- `init_schema()` prepares the schema; `check_schema()` fails unless it is there.
+- `init_schema()` prepares the schema; `check_schema()` fails unless it is there. They are public for a store
+  constructed after `app.start()`, or used outside an `App`.
 - `background()` runs the retention purge every `purge_interval` seconds until it is cancelled. A negative
   interval turns it off and it waits for cancellation.
-- `close()` closes the pool and the PostgreSQL listener.
+- `open()` opens the pool on demand; `close()` closes the pool and the PostgreSQL listener.
 
 On PostgreSQL an append's transaction sends `pg_notify('snodra_outbox', '')` and `outbox.on_append(wake)`
 listens on a connection of its own, so a relay claims as soon as an append commits; a rollback notifies

@@ -41,7 +41,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
-from typing import Any, Final, Protocol
+from typing import Any, Final
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import asyncmy
@@ -74,6 +74,7 @@ from snodra import (
     SagaDocument,
     SagaFailureDocument,
     SagaStores,
+    StoreLifecycle,
     Tx,
     bind_transaction,
     check_outbox_payload,
@@ -127,33 +128,6 @@ DEFAULT_SAGA_ENDED_RETENTION: Final = 30 * 24 * 3600.0
 DEFAULT_SAGA_DISPATCH_RETENTION: Final = 7 * 24 * 3600.0
 DEFAULT_DEADLINE_RETENTION: Final = 7 * 24 * 3600.0
 DEFAULT_FAILED_RETENTION: Final = 30 * 24 * 3600.0
-
-
-class StoreLifecycle(Protocol):
-    # TODO(spec-gap): SG-30
-    """What a message store may implement besides :class:`snodra.MessageStore`: the clock, the schema
-    and the background work. A service drives it around the store's life; the six stores stay as they
-    are, so a third-party add-on compiles against ``MessageStore`` alone.
-
-    The Python core has no application binding for it yet, so a service calls the methods itself
-    (``await store.init_schema()`` before ``app.start()``, and ``store.background()`` in a task).
-    """
-
-    def use_clock(self, clock: Callable[[], int]) -> None:
-        """The application's clock, epoch milliseconds: what the store stamps its own times with."""
-        ...
-
-    async def init_schema(self) -> None:
-        """Prepares what the store needs in its database, idempotently."""
-        ...
-
-    async def check_schema(self) -> None:
-        """Fails unless the database has what the store needs, for a service that applies its own schema."""
-        ...
-
-    async def background(self) -> None:
-        """Runs what the store does on its own (the retention purge) until it is cancelled."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,11 +394,12 @@ class SqlStore:
 
     async def close(self) -> None:
         """Closes the pool and the PostgreSQL listener; the store is not usable afterwards. Idempotent."""
-        if self._closed:
-            return
-        self._closed = True
-        await self._stop_listener()
-        pool, self._pool = self._pool, None
+        async with self._open_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await self._stop_listener()
+            pool, self._pool = self._pool, None
         if pool is not None:
             with contextlib.suppress(Exception):
                 if self._driver == DRIVER_POSTGRES:
@@ -647,9 +622,14 @@ class SqlStore:
 
     # ---- lifecycle ----------------------------------------------------------------------------
 
+    # TODO(spec-gap): SG-30
     async def init_schema(self) -> None:
         """Checks the server and applies schema version 1 unless the database has it or later, under the shared
-        database lock so instances starting together apply it once."""
+        database lock so instances starting together apply it once.
+
+        :meth:`snodra.App.start` calls this (or :meth:`check_schema`) and then :meth:`background`; it is public for a
+        store constructed after the app started, or used outside an app.
+        """
         await self.open()
         await self._verify_server()
         if await self._schema_version() >= SCHEMA_VERSION:
@@ -734,43 +714,13 @@ class SqlStore:
                 )
             if row is None:
                 raise MessageStoreFailed("the SQL message store cannot check the database server")
-            if not str(row["product"]).startswith("PostgreSQL"):
-                raise MessageStoreFailed(
-                    "the SQL message store supports PostgreSQL 13 or later, MySQL 8.0.17 or later; this server is "
-                    f"{row['product']}"
-                )
-            try:
-                number = int(str(row["num"]).strip())
-            except ValueError as error:
-                raise MessageStoreFailed(
-                    f"the SQL message store cannot read the PostgreSQL version number: {row['num']!r}"
-                ) from error
-            if number < 130_000:
-                raise MessageStoreFailed(
-                    f"the SQL message store needs PostgreSQL 13.0 or later; this server is PostgreSQL {row['version']}"
-                )
+            _check_postgres_server(str(row["product"]), str(row["num"]), str(row["version"]))
             return
         async with self._read() as conn:
             row = await self._fetchone(conn, "SELECT VERSION() AS version, @@SESSION.sql_mode AS mode")
         if row is None:
             raise MessageStoreFailed("the SQL message store cannot check the database server")
-        version = str(row["version"])
-        mode = str(row["mode"] or "")
-        if "mariadb" in version.lower():
-            raise MessageStoreFailed(
-                f"the SQL message store does not support MariaDB yet (MySQL {version}): it supports PostgreSQL 13 or "
-                "later, MySQL 8.0.17 or later"
-            )
-        numbers = _version_numbers(version)
-        if numbers < (8, 0, 17):
-            raise MessageStoreFailed(
-                f"the SQL message store needs MySQL 8.0.17 or later; this server is MySQL {version}"
-            )
-        if "STRICT_TRANS_TABLES" not in mode and "STRICT_ALL_TABLES" not in mode:
-            raise MessageStoreFailed(
-                "the SQL message store needs a strict sql_mode on MySQL (STRICT_TRANS_TABLES or STRICT_ALL_TABLES), so "
-                f"a value too long is refused rather than truncated; this session's sql_mode is {mode!r}"
-            )
+        _check_mysql_server(str(row["version"]), str(row["mode"] or ""))
 
     async def _schema_version(self) -> int:
         async with self._read() as conn:
@@ -876,6 +826,11 @@ class SqlStore:
         """Registers ``wake`` for every append that commits. On PostgreSQL with notifications on the store listens
         on ``snodra_outbox``; on MySQL, and with notifications off, it registers nothing and the relay polls."""
         if wake is None or self._driver != DRIVER_POSTGRES or not self._config.notify or self._closed:
+            return AppendListener(lambda: None)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop: a listener cannot run, and the relay will poll.
             return AppendListener(lambda: None)
         self._next_listener += 1
         listener = self._next_listener
@@ -1394,7 +1349,7 @@ class _MySQLTarget:
     host: str
     port: int
     user: str
-    password: str
+    password: str = field(repr=False)
     database: str
     charset: str
     options: dict[str, Any]
@@ -1506,6 +1461,10 @@ def split_sql(script: str) -> list[str]:
 def _check_text(field_name: str, value: str, maximum: int) -> None:
     if not isinstance(value, str):
         raise InvalidMessage(f"the SQL message store needs {field_name} to be text, got {type(value).__name__}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise InvalidMessage(f"the SQL message store refuses text that is not UTF-8 in {field_name}") from error
     if "\x00" in value:
         raise InvalidMessage(f"the SQL message store refuses the character U+0000 in {field_name}")
     if maximum >= 0 and len(value) > maximum:
@@ -1684,6 +1643,38 @@ def _missing_table(error: BaseException) -> bool:
             return True
         current = current.__cause__
     return False
+
+
+def _check_postgres_server(product: str, num: str, version: str) -> None:
+    """Fails unless the server is PostgreSQL itself, 13 or later, naming what it is."""
+    if not product.startswith("PostgreSQL"):
+        raise MessageStoreFailed(
+            f"the SQL message store supports PostgreSQL 13 or later, MySQL 8.0.17 or later; this server is {product}"
+        )
+    try:
+        number = int(num.strip())
+    except ValueError as error:
+        raise MessageStoreFailed(f"the SQL message store cannot read the PostgreSQL version number: {num!r}") from error
+    if number < 130_000:
+        raise MessageStoreFailed(
+            f"the SQL message store needs PostgreSQL 13.0 or later; this server is PostgreSQL {version}"
+        )
+
+
+def _check_mysql_server(version: str, mode: str) -> None:
+    """Fails unless the server is MySQL 8.0.17 or later (not MariaDB) with a strict sql_mode."""
+    if "mariadb" in version.lower():
+        raise MessageStoreFailed(
+            f"the SQL message store does not support MariaDB yet (MySQL {version}): it supports PostgreSQL 13 or "
+            "later, MySQL 8.0.17 or later"
+        )
+    if _version_numbers(version) < (8, 0, 17):
+        raise MessageStoreFailed(f"the SQL message store needs MySQL 8.0.17 or later; this server is MySQL {version}")
+    if "STRICT_TRANS_TABLES" not in mode and "STRICT_ALL_TABLES" not in mode:
+        raise MessageStoreFailed(
+            "the SQL message store needs a strict sql_mode on MySQL (STRICT_TRANS_TABLES or STRICT_ALL_TABLES), so "
+            f"a value too long is refused rather than truncated; this session's sql_mode is {mode!r}"
+        )
 
 
 def _version_numbers(version: str) -> tuple[int, int, int]:

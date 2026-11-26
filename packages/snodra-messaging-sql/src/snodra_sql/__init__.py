@@ -11,6 +11,8 @@ behaviour the add-on relies on, and ``SPEC-GAPS.md`` for the choices the public 
 open.
 """
 
+from snodra import StoreLifecycle
+
 from snodra_sql.sql import (
     DRIVER_MYSQL,
     DRIVER_POSTGRES,
@@ -19,7 +21,6 @@ from snodra_sql.sql import (
     SCHEMA_VERSION,
     SqlConfig,
     SqlStore,
-    StoreLifecycle,
     split_sql,
 )
 

@@ -26,7 +26,6 @@ from snodra_mongo import MongoConfig, MongoStore
 async def main() -> None:
     store = MongoStore(MongoConfig.from_env())
     try:
-        await store.init_schema()
         settings = snodra.Settings.from_env(service="orders-service")
         # The event store reads what the relay publishes; the message store holds the outbox and markers.
         app = snodra.App(settings, store=store, event_store=...)
@@ -38,9 +37,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`MongoConfig.from_env()` reads `SNODRA_STORE_MONGO_URI` (required) and `SNODRA_STORE_MONGO_DATABASE` (required). A
-service that owns its PyMongo client passes it to `MongoStore(config, client=client)`: the store does not close a
-client it does not own.
+`MongoConfig.from_env()` reads `SNODRA_STORE_MONGO_URI` and `SNODRA_STORE_MONGO_DATABASE`; the URI is required unless
+the store is given a client. A service that owns its PyMongo client passes it to `MongoStore(config, client=client)`
+with an empty `url`: the store does not close a client it does not own.
 
 The store's transactions are MongoDB multi-document transactions on a client session, so the database must be a
 replica set (a single-node one is enough).
@@ -77,9 +76,12 @@ instance sharing a database must be given the same retentions. `check_schema()` 
 indexes, for a service that prepares its schema itself; a TTL that differs from the store's settings counts as a
 schema failure. TTLs are stored in whole seconds, floored as the published retentions are.
 
-`background()` runs nothing: MongoDB's TTL monitor removes expired documents on the server. `use_clock(clock)` sets the
-application's clock (epoch milliseconds), which stamps every time the store sets itself: an entry's sending and
-failure, a claim's lease.
+`App.start()` drives the store's lifecycle when it is the app's store: it hands the store the application's clock,
+calls `init_schema()` (or `check_schema()` when `Settings.store_init_schema` is false) and starts `background()` in a
+`snodra:store-background` task until shutdown. The methods are public for a store constructed after `app.start()`, or
+used outside an `App`. `background()` runs nothing: MongoDB's TTL monitor removes expired documents on the server.
+`use_clock(clock)` sets the application's clock (epoch milliseconds), which stamps every time the store sets itself:
+an entry's sending and failure, a claim's lease.
 
 Where the public specification leaves a choice, [SPEC-GAPS.md](../../SPEC-GAPS.md) records what this library does.
 

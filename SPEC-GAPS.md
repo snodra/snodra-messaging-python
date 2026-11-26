@@ -484,7 +484,7 @@ library does there. Where an entry is settled, its behaviour is this library's r
   a compensating commit if the broker's per-partition failures become observable enough to justify it.
 - **Wire change:** no.
 
-### SG-30: the Python core does not bind a message store's lifecycle
+### SG-30: a message store constructed after `App.start()` and its lifecycle
 
 - **Specification:** `message-store-add-ons.md` (The SQL layout) says the schema is applied at startup under the
   database lock, and the state page's `L2-STORE-KIT` row says every store's schema is ready before the kit runs. It
@@ -495,12 +495,16 @@ library does there. Where an entry is settled, its behaviour is this library's r
   builder calls with the application's clock, the schema steps and `Background`
   (`snodra-messaging-go@2d0aea9:store.go:63`). Kotlin applies the SQL schema through Spring/Flyway, outside the
   store interface.
-- **This library:** the Python core's `MessageStore` has no lifecycle methods and `App.start()` does not call any;
-  `snodra_sql.StoreLifecycle` and `SqlStore` offer `use_clock`, `init_schema`, `check_schema` and `background`, and
-  the service calls `await store.init_schema()` before `app.start()` and runs `store.background()` in a task.
-- **Question:** should the Python core gain a `StoreLifecycle` protocol and bind it in `App.start()`, as Go does?
-  Recommend yes in a level-2 follow-up: the SQL and MongoDB add-ons both need it, and a service that forgets
-  `init_schema` otherwise fails on the first append.
+- **This library:** the Python core exports `StoreLifecycle` (`snodra/_store.py:1107`) and `App.start()` hands the
+  store the application's clock, calls `init_schema()` or `check_schema()` according to
+  `Settings.store_init_schema`, and starts `background()` in a `snodra:store-background` task
+  (`snodra/_app.py:604`, `:620`, `:635`). `SqlStore` and `MongoStore` implement the public protocol and re-export it
+  from their packages; a failing schema step fails `start()`, and a background error is logged.
+- **Remaining deviation:** a store constructed after `App.start()` has already run is not prepared or backgrounded by
+  the app. SQL then needs `await store.init_schema()` itself (and `store.background()` if its purge is wanted); a
+  Mongo store needs `init_schema()`/`check_schema()` for its indexes. The READMEs say so.
+- **Question:** settled: the core binds the lifecycle; only a store swapped in after `start()` is the service's
+  responsibility. The specification should say that a late store is not prepared by the app.
 - **Wire change:** no.
 
 ### SG-31: an empty outbox claim owner

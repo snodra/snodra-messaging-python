@@ -41,7 +41,7 @@ from contextlib import AbstractAsyncContextManager, suppress
 from contextvars import Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Protocol
+from typing import Any, Final
 
 from bson import Int64
 from pymongo import AsyncMongoClient, IndexModel, ReturnDocument
@@ -76,6 +76,7 @@ from snodra import (
     SagaDocument,
     SagaFailureDocument,
     SagaStores,
+    StoreLifecycle,
     Tx,
     bind_transaction,
     check_outbox_payload,
@@ -133,40 +134,14 @@ TRANSIENT_TRANSACTION: Final = "TransientTransactionError"
 _EPOCH: Final = datetime(1970, 1, 1)
 
 
-class StoreLifecycle(Protocol):
-    # TODO(spec-gap): SG-30
-    """What a message store may implement besides :class:`snodra.MessageStore`: the clock, the schema and the
-    background work. A service drives it around the store's life; the six stores stay as they are, so a third-party
-    add-on compiles against ``MessageStore`` alone.
-
-    The Python core has no application binding for it yet, so a service calls the methods itself
-    (``await store.init_schema()`` before ``app.start()``, and ``store.background()`` in a task).
-    """
-
-    def use_clock(self, clock: Callable[[], int]) -> None:
-        """The application's clock, epoch milliseconds: what the store stamps its own times with."""
-        ...
-
-    async def init_schema(self) -> None:
-        """Prepares what the store needs in its database, idempotently."""
-        ...
-
-    async def check_schema(self) -> None:
-        """Fails unless the database has what the store needs, for a service that applies its own schema."""
-        ...
-
-    async def background(self) -> None:
-        """Runs what the store does on its own until it is cancelled."""
-        ...
-
-
 @dataclass(frozen=True, slots=True)
 class MongoConfig:
     """How the store reaches its database and how long it keeps what the retentions let go.
 
     ``url`` is the MongoDB connection string (``mongodb://...`` or ``mongodb+srv://...``) and ``database`` the
-    service's own database, which holds the shared collections; both are required. The retentions are in seconds; a
-    TTL index takes whole seconds, so a fraction of one is floored.
+    service's own database, which holds the shared collections. The URL is required unless the store is given a client
+    it already owns; the database is always required. The retentions are in seconds; a TTL index takes whole seconds,
+    so a fraction of one is floored.
     """
 
     url: str = field(repr=False)
@@ -182,10 +157,6 @@ class MongoConfig:
     def __post_init__(self) -> None:
         url = self.url.strip()
         database = self.database.strip()
-        if not url:
-            raise ValueError(
-                "the MongoDB message store needs a connection string (MongoConfig.url, SNODRA_STORE_MONGO_URI)"
-            )
         if not database:
             raise ValueError(
                 "the MongoDB message store needs a database (MongoConfig.database, SNODRA_STORE_MONGO_DATABASE)"
@@ -211,8 +182,9 @@ class MongoConfig:
 
     @classmethod
     def from_env(cls) -> MongoConfig:
-        """The config from the environment: ``SNODRA_STORE_MONGO_URI`` and ``SNODRA_STORE_MONGO_DATABASE``, both
-        required. The retentions keep their defaults; set them on the returned value."""
+        """The config from the environment: ``SNODRA_STORE_MONGO_URI`` (required unless the store is given a client)
+        and ``SNODRA_STORE_MONGO_DATABASE`` (required). The retentions keep their defaults; set them on the returned
+        value."""
         return cls(
             url=os.environ.get("SNODRA_STORE_MONGO_URI", "").strip(),
             database=os.environ.get("SNODRA_STORE_MONGO_DATABASE", "").strip(),
@@ -313,6 +285,11 @@ class MongoStore:
         clock: Callable[[], int] | None = None,
     ) -> None:
         self._config = MongoConfig.from_env() if config is None else config
+        if client is None and not self._config.url:
+            raise ValueError(
+                "the MongoDB message store needs a connection string (MongoConfig.url, SNODRA_STORE_MONGO_URI) "
+                "unless it is given a client"
+            )
         self._client: AsyncMongoClient[Any] = AsyncMongoClient(self._config.url) if client is None else client
         self._owns_client = client is None
         self._database: AsyncDatabase[Any] = self._client[self._config.database]
@@ -465,6 +442,7 @@ class MongoStore:
 
     # ---- lifecycle ----------------------------------------------------------------------------
 
+    # TODO(spec-gap): SG-30
     async def init_schema(self) -> None:
         """Creates every index and TTL index of the layout, idempotently.
 
@@ -479,11 +457,10 @@ class MongoStore:
             except Exception as error:
                 raise _failure(error) from error
 
+    # TODO(spec-gap): SG-34
     async def check_schema(self) -> None:
         """Fails unless the database has every collection and index of the layout, with the same keys, TTLs,
         uniqueness and partial filter; it creates nothing.
-
-        TODO(spec-gap): SG-34
         """
         for collection, indexes in self._layout():
             if collection not in await self._database.list_collection_names():
@@ -629,12 +606,10 @@ class _Index:
     partial: Mapping[str, object] | None = None
 
 
+# TODO(spec-gap): SG-35
 def _ttl_seconds(retention: float) -> int:
     """``retention`` in whole seconds, floored as the published retentions are stored: a positive sub-second retention
-    becomes zero, and MongoDB's TTL monitor may then expire the document at once.
-
-    TODO(spec-gap): SG-35
-    """
+    becomes zero, and MongoDB's TTL monitor may then expire the document at once."""
     if retention <= 0:
         return 0
     return min(math.floor(retention), MAX_TTL_SECONDS)
@@ -842,6 +817,9 @@ def _outbox_document(entry: OutboxEntry) -> dict[str, Any]:
     check_outbox_payload(entry.type_name, entry.payload)
     headers = _headers(entry.headers)
     payload = json.loads(entry.payload)
+    attempts = int(entry.attempts)
+    if not -(2**31) <= attempts <= 2**31 - 1:
+        raise InvalidMessage("an outbox entry's attempts must fit a signed 32-bit integer")
     return {
         "_id": entry.id,
         "type": entry.type_name,
@@ -850,7 +828,7 @@ def _outbox_document(entry: OutboxEntry) -> dict[str, Any]:
         "payload": payload,
         "createdAt": _datetime(entry.created_at_ms),
         "seq": Int64(entry.seq),
-        "attempts": int(entry.attempts),
+        "attempts": attempts,
         "sentAt": None,
         "failedAt": None,
     }

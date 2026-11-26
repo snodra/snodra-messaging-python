@@ -10,13 +10,17 @@ from typing import Any, cast
 
 import pytest
 from snodra import (
+    InvalidMessage,
     MessageStoreFailed,
     OutboxEntry,
     ProcessedMarker,
+    ReplayRange,
     Tx,
+    bind_transaction,
+    unbind_transaction,
 )
 from snodra_sql import SqlConfig, SqlStore
-from snodra_sql.sql import _ms_value
+from snodra_sql.sql import _ms_value, _MySQLTarget
 
 pytestmark = pytest.mark.timeout(300)
 
@@ -44,6 +48,18 @@ def _marker() -> ProcessedMarker:
         id=f"processor:conformance:{uuid.uuid4()}",
         type_name="conformance.Happened",
         processed_at_ms=1_800_000_000_000,
+    )
+
+
+def _stage_marker(processor: str, source: str, segment: str, position: str) -> ProcessedMarker:
+    return ProcessedMarker(
+        id=f"processor:{processor}:{uuid.uuid4()}",
+        type_name="conformance.Happened",
+        processed_at_ms=1_800_000_000_000,
+        processor=processor,
+        source=source,
+        segment=segment,
+        position=position,
     )
 
 
@@ -263,8 +279,6 @@ async def test_a_foreign_transaction_is_refused(store: SqlStore) -> None:
 
 
 async def test_a_foreign_bound_transaction_is_refused_by_the_context(store: SqlStore) -> None:
-    from snodra import bind_transaction, unbind_transaction
-
     token = bind_transaction(Tx(object()))
     try:
         with pytest.raises(MessageStoreFailed, match="another message store's transaction"):
@@ -272,3 +286,99 @@ async def test_a_foreign_bound_transaction_is_refused_by_the_context(store: SqlS
                 pass
     finally:
         unbind_transaction(token)
+
+
+def test_on_append_outside_a_running_loop_is_a_no_op() -> None:
+    """A relay may register outside a loop; without one the store has no listener and the relay polls."""
+    store = SqlStore(SqlConfig(url="postgres://u@h/db"))
+    listener = store.outbox.on_append(lambda: None)
+    listener.close()
+
+
+def test_the_mysql_password_is_not_in_the_array_repr() -> None:
+    target = _MySQLTarget.parse("mysql://user:secret@localhost:3306/db")
+    assert "secret" not in repr(target)
+    assert target.password == "secret"
+
+
+async def test_an_empty_claim_owner_is_refused(store: SqlStore) -> None:
+    """SG-31: an empty owner cannot be told apart from nobody in the owner column."""
+    with pytest.raises(InvalidMessage, match="non-empty claim owner"):
+        await store.outbox.claim("", 60.0, 1)
+
+
+async def test_a_lone_surrogate_in_an_entry_is_refused(store: SqlStore) -> None:
+    """A Python string can hold a lone surrogate, which is not UTF-8 and no database can keep."""
+    entry = _entry()
+    entry = OutboxEntry(
+        id=entry.id,
+        type_name=entry.type_name,
+        key=entry.key,
+        headers={"x": "\ud800"},
+        payload=entry.payload,
+        created_at_ms=entry.created_at_ms,
+        seq=entry.seq,
+    )
+    with pytest.raises(InvalidMessage, match="not UTF-8"):
+        await store.outbox.append_now(entry)
+    assert await store.outbox.pending() == 0
+
+
+async def test_delete_markers_removes_only_the_range(store: SqlStore) -> None:
+    """A reset deletes exactly its processor's stage-1 markers in its ranges: numeric positions by value, text
+    positions by bytes, never a marker without a position or another processor/source/segment."""
+    nine = _stage_marker("default", "s", "0", "9")
+    ten = _stage_marker("default", "s", "0", "10")
+    text = _stage_marker("default", "s", "0", "x7")
+    none = _stage_marker("default", "s", "0", "")
+    other_processor = _stage_marker("mail", "s", "0", "10")
+    other_source = _stage_marker("default", "other", "0", "10")
+    other_segment = _stage_marker("default", "s", "1", "10")
+    for marker in (nine, ten, text, none, other_processor, other_source, other_segment):
+        assert await store.processed.record(marker), marker.id
+    deleted = await store.processed.delete_markers(
+        "default",
+        [
+            ReplayRange(source="s", segment="0", start="10", until="20"),
+            ReplayRange(source="s", segment="0", start="x0", until="y"),
+        ],
+    )
+    assert deleted == 2, "ten and x7"
+    for marker, exists in {
+        nine: True,
+        ten: False,
+        text: False,
+        none: True,
+        other_processor: True,
+        other_source: True,
+        other_segment: True,
+    }.items():
+        assert await store.processed.exists(marker.id) == exists, marker.id
+
+
+async def test_notify_false_on_postgres_registers_no_listener(store: SqlStore) -> None:
+    if store.name != "postgres":
+        pytest.skip("MySQL has no notification at all")
+    from dataclasses import replace
+
+    quiet = SqlStore(replace(store.config, notify=False))
+    wakes: list[None] = []
+    listener = quiet.outbox.on_append(lambda: wakes.append(None))
+    try:
+        await quiet.outbox.append_now(_entry())
+        await asyncio.sleep(0.2)
+        assert quiet.listens == 0
+        assert not wakes
+    finally:
+        listener.close()
+        await quiet.close()
+
+
+async def test_a_negative_purge_interval_waits_for_cancellation(store: SqlStore) -> None:
+    assert store.config.purge_interval == -1.0
+    task = asyncio.create_task(store.background(), name="snodra:sql:test-negative-background")
+    await asyncio.sleep(0.1)
+    assert not task.done(), "a negative interval returns instead of waiting"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

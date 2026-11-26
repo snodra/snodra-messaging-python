@@ -24,6 +24,8 @@ from snodra_sql.sql import (
     SCHEMA_LOCK_POSTGRES,
     SCHEMA_MYSQL_PATH,
     SCHEMA_POSTGRES_PATH,
+    _check_mysql_server,
+    _check_postgres_server,
 )
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "snodra_sql"
@@ -190,4 +192,54 @@ async def test_a_startup_waits_for_the_schema_lock(server: Any, database: str, m
         await store.check_schema()
     finally:
         await server.close(holder)
+        await store.close()
+
+
+def test_the_server_checks_refuse_unsupported_servers() -> None:
+    """PostgreSQL 13 or later, MySQL 8.0.17 or later (not MariaDB) with a strict sql_mode."""
+    _check_postgres_server("PostgreSQL 17.7 (Debian 17.7-3)", "170007", "17.7")
+    _check_postgres_server("PostgreSQL 13.0 on x86_64", "130000", "13.0")
+    with pytest.raises(MessageStoreFailed, match=r"needs PostgreSQL 13\.0"):
+        _check_postgres_server("PostgreSQL 12.18 on x86_64", "120018", "12.18")
+    with pytest.raises(MessageStoreFailed, match="this server is CockroachDB"):
+        _check_postgres_server("CockroachDB CCL v24.1.0", "130000", "13.0")
+    with pytest.raises(MessageStoreFailed, match="cannot read the PostgreSQL version"):
+        _check_postgres_server("PostgreSQL 17.7", "not-a-number", "17.7")
+
+    strict = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"
+    _check_mysql_server("8.4.7", strict)
+    _check_mysql_server("8.0.17", "STRICT_ALL_TABLES")
+    _check_mysql_server("9.1.0-commercial", strict)
+    with pytest.raises(MessageStoreFailed, match=r"needs MySQL 8\.0\.17"):
+        _check_mysql_server("8.0.16", strict)
+    with pytest.raises(MessageStoreFailed, match=r"needs MySQL 8\.0\.17"):
+        _check_mysql_server("5.7.44-log", strict)
+    with pytest.raises(MessageStoreFailed, match="does not support MariaDB"):
+        _check_mysql_server("10.11.6-MariaDB", strict)
+    with pytest.raises(MessageStoreFailed, match="strict sql_mode"):
+        _check_mysql_server("8.4.7", "NO_ENGINE_SUBSTITUTION")
+
+
+@pytest.mark.timeout(300)
+async def test_a_partial_mysql_schema_is_completed_by_a_retry(
+    server: Any, database: str, make_config: MakeConfig
+) -> None:
+    """SG-33: MySQL commits DDL statement by statement; a retry of init_schema() finishes the idempotent file."""
+    store = SqlStore(make_config())
+    if store.name != "mysql":
+        await store.close()
+        pytest.skip("SG-33 is MySQL's statement-by-statement DDL")
+    try:
+        await store.open()
+        statements = split_sql((SOURCE / SCHEMA_MYSQL_PATH).read_text(encoding="utf-8"))
+        async with store._read() as conn:
+            for statement in statements[:2]:
+                await store._exec(conn, statement)
+        async with store._read() as conn:
+            assert await store._fetchval(conn, "SELECT COUNT(*) AS n FROM snodra_schema") == 0
+        await store.init_schema()
+        await store.check_schema()
+        async with store._read() as conn:
+            assert await store._fetchval(conn, "SELECT COUNT(*) AS n FROM snodra_schema") == 1
+    finally:
         await store.close()

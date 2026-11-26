@@ -1,5 +1,7 @@
 """The MongoDB message-store add-on: the core's message-store ports on a replica set."""
 
+from snodra import StoreLifecycle
+
 from snodra_mongo.mongo import (
     COLLECTIONS,
     DEFAULT_DEADLINE_RETENTION,
@@ -12,7 +14,6 @@ from snodra_mongo.mongo import (
     NAME,
     MongoConfig,
     MongoStore,
-    StoreLifecycle,
 )
 
 __all__ = [
