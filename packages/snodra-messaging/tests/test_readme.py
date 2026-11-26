@@ -27,10 +27,15 @@ def test_readme_follows_the_library_pattern() -> None:
 
     # Section headings: exactly the required sections
     sections = re.findall(r"^## (.+)$", readme, re.MULTILINE)
-    assert sections in (
-        ["What it is", "Install", "A handler", "Documentation", "Contributing", "License"],
-        ["What it is", "Install", "A handler", "Documentation", "Contributing", "Releases", "License"],
-    )
+    assert sections == [
+        "What it is",
+        "Install",
+        "A handler",
+        "Documentation",
+        "Contributing",
+        "Releases",
+        "License",
+    ]
 
 
 @pytest.mark.repo

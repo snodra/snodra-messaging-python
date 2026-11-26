@@ -71,6 +71,28 @@ Counterparts: <https://snodra.damoreira.com/>.
 
 Branches off `main`, conventional commits, a pull request with a green workflow.
 
+## Releases
+
+Versions are cut by CI from the commit subjects since the last tag, in Conventional Commits: a `feat` cuts the next
+minor, a `fix` or a `perf` the next patch, and `docs`, `test`, `chore`, `ci`, `refactor`, `build` and `style` cut
+nothing. Below 1.0.0 a `!` or a `BREAKING CHANGE:` footer counts as a minor; 1.0.0 is declared by hand. Nobody pushes a
+tag: only the workflow makes tags.
+
+Both distributions carry one version and one tag, `vX.Y.Z`. The release commit, `release: X.Y.Z`, writes that version
+into both `pyproject.toml` files, makes the observability package require `snodra-messaging==X.Y.Z`, and records them in
+`uv.lock` (`scripts/bump-version.sh`).
+
+That commit is pushed only after `scripts/release-check.sh X.Y.Z` has built the two sdists and the two wheels, run
+`twine check --strict` on them, installed both wheels on Python 3.12 and 3.14 and run the tests there. It is the check
+to run by hand when a release commit is in doubt, and it refuses a version PyPI already has.
+
+Pull before you push: `git pull --rebase` first, because a release leaves a commit by the workflow's bot on `main`.
+
+A failed release is finished, never repeated. **Re-run failed jobs** on the run: the version, the commit and the tag
+are already recorded, and the later jobs continue from them; the GitHub release on its own is recreated with the
+`release` workflow and the tag. PyPI keeps a version forever, so a wrong release is fixed by the next one, never by
+publishing the same version again.
+
 ## License
 
 [Apache-2.0](LICENSE) © 2026 Guilherme D'Amoreira.
