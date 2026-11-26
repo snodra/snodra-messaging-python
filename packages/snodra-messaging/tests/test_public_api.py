@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
+from contextvars import Token
+from types import TracebackType
 
 import snodra
 
@@ -86,9 +88,12 @@ PUBLIC_NAMES = (
     "TransactionScope",
     "Transactions",
     "Tx",
+    "bind_transaction",
     "check_outbox_payload",
+    "current_transaction",
     "letter_id",
     "now_ms",
+    "unbind_transaction",
 )
 
 
@@ -238,6 +243,67 @@ class _StubMessageStore:
         raise NotImplementedError
 
 
+class _StubTransactions:
+    """A typed ``Transactions`` port, checked by mypy."""
+
+    def __init__(self) -> None:
+        self.commits: list[snodra.Tx] = []
+        self.rollbacks: list[snodra.Tx] = []
+
+    async def begin(self) -> snodra.Tx:
+        return snodra.Tx(object())
+
+    def plain(self) -> snodra.Tx:
+        return snodra.Tx.none()
+
+    async def commit(self, tx: snodra.Tx) -> None:
+        self.commits.append(tx)
+
+    async def rollback(self, tx: snodra.Tx) -> None:
+        self.rollbacks.append(tx)
+
+
+class _StubTransactionManager:
+    """An add-on's own transaction context manager: it binds on entry and unbinds in a ``finally``, and joins a
+    transaction already bound (as ``MessageStore.transaction`` requires)."""
+
+    def __init__(self, store: _StubTransactions) -> None:
+        self._store = store
+        self._tx: snodra.Tx | None = None
+        self._token: Token[snodra.Tx | None] | None = None
+        self._joined = False
+
+    async def __aenter__(self) -> snodra.Tx:
+        bound = snodra.current_transaction()
+        if bound is not None:
+            self._joined = True
+            return bound
+        tx = await self._store.begin()
+        self._tx = tx
+        self._token = snodra.bind_transaction(tx)
+        return tx
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if self._joined:
+            return
+        tx, self._tx = self._tx, None
+        token, self._token = self._token, None
+        try:
+            if tx is not None:
+                if exc_type is None:
+                    await self._store.commit(tx)
+                else:
+                    await self._store.rollback(tx)
+        finally:
+            if token is not None:
+                snodra.unbind_transaction(token)
+
+
 def _accept_event_store(store: snodra.EventStore) -> None:
     pass
 
@@ -254,3 +320,16 @@ def test_a_typed_stub_add_on_implements_the_ports() -> None:
     admin: snodra.EventStoreAdmin = _StubEventAdmin()
     assert subscription is not None
     assert admin is not None
+
+
+async def test_the_public_transaction_helpers_bind_and_unbind() -> None:
+    store = _StubTransactions()
+    manager: AbstractAsyncContextManager[snodra.Tx] = _StubTransactionManager(store)
+    assert snodra.current_transaction() is None
+    async with manager as tx:
+        assert snodra.current_transaction() is tx
+        async with _StubTransactionManager(store) as nested:
+            assert nested is tx  # the nested manager joined, as store.transaction() must
+        assert snodra.current_transaction() is tx
+    assert snodra.current_transaction() is None
+    assert store.commits == [tx]

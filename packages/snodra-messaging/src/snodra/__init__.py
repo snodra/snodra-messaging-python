@@ -6,6 +6,8 @@ implements :class:`EventStore` and the types of its subscription and admin side,
 would collide with the event store's names, so they are exported as :class:`MessageStoreError`,
 :class:`MessageStoreFailed` and :class:`MessageStoreUnsupported`. ``Tx`` is the message store's opaque transaction
 handle (the type of its ``tx=`` parameters), and ``TransactionScope`` is what ``store.transaction()`` returns.
+``bind_transaction``, ``current_transaction`` and ``unbind_transaction`` are what an add-on's own transaction context
+manager uses to bind the transaction the core sees.
 
 :class:`Subscription` is the level-1 subscription query (a caller's side); the event store's subscription is
 :class:`EventStoreSubscription`.
@@ -116,9 +118,12 @@ from snodra._store import (
     Transactions,
     TransactionScope,
     Tx,
+    bind_transaction,
     check_outbox_payload,
+    current_transaction,
     letter_id,
     now_ms,
+    unbind_transaction,
 )
 from snodra._store import Failed as MessageStoreFailed
 from snodra._store import StoreError as MessageStoreError
@@ -251,14 +256,17 @@ __all__ = [
     "Updates",
     "__version__",
     "authenticated",
+    "bind_transaction",
     "caller_matches",
     "check_outbox_payload",
     "current_caller",
     "current_message",
+    "current_transaction",
     "dead_letter_source",
     "letter_id",
     "message_type",
     "now_ms",
     "role",
     "segment_order",
+    "unbind_transaction",
 ]

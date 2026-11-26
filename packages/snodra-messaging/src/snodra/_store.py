@@ -149,13 +149,14 @@ def bind_transaction(tx: Tx | None) -> Token[Tx | None]:
     """Binds ``tx`` (or no transaction) to the current context; returns the token :func:`unbind_transaction` takes.
 
     The store binds its transaction while a handler runs; a store operation called without ``tx=`` joins what is bound.
-    A wake-up callback runs with no transaction bound, so a task it starts does not inherit the appending transaction.
+    An add-on's own transaction context manager calls it on entry, so the core's operations join its transaction; a
+    wake-up callback runs with no transaction bound, so a task it starts does not inherit the appending transaction.
     """
     return _CURRENT_TX.set(tx)
 
 
 def unbind_transaction(token: Token[Tx | None]) -> None:
-    """Restores the binding :func:`bind_transaction` replaced."""
+    """Restores the binding :func:`bind_transaction` replaced; an add-on's context manager calls it in a ``finally``."""
     _CURRENT_TX.reset(token)
 
 
@@ -1068,9 +1069,12 @@ class MessageStore(Transactions, Protocol):
     def transaction(self) -> AbstractAsyncContextManager[Tx]:
         """A transaction bound to the current context (joining one already bound), or a new one when none is.
 
-        :class:`TransactionScope` is the core's implementation: an add-on's own context manager must bind the
-        transaction the core sees (:func:`current_transaction`), so a low-level operation called without ``tx=`` joins
-        it.
+        :class:`TransactionScope` is the core's implementation. An add-on's own context manager must do the same: begin
+        a transaction on entry and bind it with :func:`bind_transaction`, so a low-level operation called without
+        ``tx=`` joins it; commit on a clean exit or roll back on an exception; and reset the binding with
+        :func:`unbind_transaction` in a ``finally``, so the caller's transaction is restored.
+        :func:`current_transaction` reads the binding, and a context manager that finds one (for example a nested
+        ``async with store.transaction()``) joins it instead of beginning another.
         """
         ...
 
