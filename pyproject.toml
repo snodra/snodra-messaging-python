@@ -17,6 +17,7 @@ snodra-conformance-service = { workspace = true }
 snodra-messaging-observability = { workspace = true }
 snodra-messaging-kafka = { workspace = true }
 snodra-messaging-mongo = { workspace = true }
+snodra-messaging-rabbitmq = { workspace = true }
 snodra-messaging-sql = { workspace = true }
 orders-quickstart = { workspace = true }
 events-service = { workspace = true }
@@ -36,6 +37,7 @@ dev = [
     "snodra-messaging-observability",
     "snodra-messaging-kafka",
     "snodra-messaging-mongo",
+    "snodra-messaging-rabbitmq",
     "snodra-messaging-sql",
     "orders-quickstart",
     "events-service",
@@ -60,6 +62,7 @@ select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF", "SIM", "PT"]
 strict = true
 files = ["packages", "examples"]
 exclude = [
+    "^packages/snodra-messaging-rabbitmq/tests/conftest\\.py$",
     "^packages/snodra-messaging-mongo/tests/conftest\\.py$",
     "^packages/snodra-messaging-sql/tests/conftest\\.py$",
 ]
@@ -76,16 +79,24 @@ ignore_missing_imports = true
 module = ["asyncmy", "asyncmy.*", "asyncpg", "asyncpg.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["rstream", "rstream.*"]
+ignore_errors = true
+
 [tool.pytest.ini_options]
 testpaths = [
     "packages/snodra-messaging/tests",
     "packages/snodra-messaging-observability/tests",
     "packages/snodra-messaging-kafka/tests",
+    "packages/snodra-messaging-rabbitmq/tests",
     "packages/snodra-messaging-mongo/tests",
     "packages/snodra-messaging-sql/tests",
     "examples",
 ]
-pythonpath = ["packages/snodra-messaging/tests"]
+pythonpath = [
+    "packages/snodra-messaging/tests",
+    "packages/snodra-messaging-rabbitmq/tests",
+]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 timeout = 120

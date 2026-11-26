@@ -586,3 +586,128 @@ library does there. Where an entry is settled, its behaviour is this library's r
   fraction? Recommend the floor: a fraction is a configuration mistake, but refusing it would make a database shared
   with another instance whose retention is whole seconds fail for a value MongoDB never sees.
 - **Wire change:** no.
+
+### SG-36: the Python stream client's high-level classes cannot carry the wire rules
+
+- **Specification:** [RabbitMQ Streams wire rules](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#rabbitmq-streams-wire-rules)
+  says a subscription's consumer carries `snodra-member=<a random id per subscription instance>`, that a subscription
+  answers the broker's consumer update with the stored offset (the next one to read), that reads which decide go to
+  each stream's leader, and that the official add-ons "use each client's low-level client class: the high-level APIs
+  can neither set `snodra-member` nor answer a consumer update with a stored offset". It names no Python client.
+- **Other Snodra libraries:** Kotlin pins `com.rabbitmq:stream-client` 1.13.1
+  (`snodra-messaging@64dde1e:snodra-messaging-rabbitmq/src/main/kotlin/com/damoreira/snodra/messaging/rabbitmq/RabbitConnector.kt:25`)
+  and Rust pins `rabbitmq-stream-client` 0.11.0; both use the client's low-level consumer. The Go client exports no
+  low-level class, so the Go add-on speaks the protocol's commands itself.
+- **This library:** `snodra_rabbitmq/rabbitmq.py` pins `rstream==1.1.1` and uses its low-level
+  `rstream.client.Client` with the `rstream.schema` frames and `rstream.amqp.amqp_decoder`; it does not use
+  `rstream.SuperStreamProducer` or `rstream.SuperStreamConsumer`. The spike (`CLIENT-SPIKE.md`) found that the
+  high-level producer hashes a routing key as UTF-16 (`rstream/superstream.py:88`), not the wire rule's UTF-8; that
+  the high-level consumer's update listener passes `ConsumerOffsetSpecification` to the frame encoder
+  (`rstream/consumer.py:559`) where only `rstream.schema.OffsetSpecification` encodes; and that its consumer connects
+  to a random replica (`rstream/consumer.py:201`), not the leader. The low-level client sets all four subscribe
+  properties, answers updates with a stored offset, publishes one confirmed message per event and reads offsets on the
+  leader. `test_a_second_instance_shares_the_processor_and_the_member_is_visible` and
+  `test_the_stored_offset_is_the_next_one_and_a_new_subscription_resumes` pin those on a real broker.
+- **Question:** should the specification name the low-level capabilities a Python client must expose (so another
+  client can replace `rstream`), or require the client's high-level API to add custom subscribe properties, a leader
+  connection and the stored-offset reply?
+
+### SG-37: a management-API consumer without `snodra-member`
+
+- **Specification:** [RabbitMQ Streams wire rules](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#rabbitmq-streams-wire-rules)
+  says a subscription's members are "the distinct `snodra-member` values of the consumers of that name on the
+  source's partitions". A consumer written with another client reads the same stream without the property.
+- **Other Snodra libraries:** Kotlin falls back to the consumer's connection name and subscription id
+  (`snodra-messaging@64dde1e:snodra-messaging-rabbitmq/src/main/kotlin/com/damoreira/snodra/messaging/rabbitmq/RabbitManagement.kt:185`),
+  Rust does the same (`snodra-messaging-rs@4d63802:crates/snodra-messaging-rabbitmq/src/management.rs:197`), and the
+  Go add-on does too.
+- **This library:** `snodra_rabbitmq/rabbitmq.py` (`parse_consumers`, `RabbitMQAdmin.members`) falls back to
+  `<connection name>:<subscription id>` and counts the consumer as a member, so a reset refuses while it reads. A
+  consumer without `properties.name` is an unnamed reader (a browser's) and is not a member.
+- **Question:** is a consumer without the property a member (a reset must refuse while it reads), or is it invisible
+  to the members list?
+
+### SG-38: reading a stream's first offset and head
+
+- **Specification:** [event-store-add-ons.md, Segments and positions](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#segments-and-positions)
+  makes positions opaque and the RabbitMQ wire rules say a position is the offset, but no page says how an add-on
+  learns a stream's first offset and head. The stream protocol's statistics name chunk ids, not offsets, and
+  offset-tracking entries take offsets of their own.
+- **Other Snodra libraries:** Kotlin reads the first and last chunk of events on the leader, with a quiet period
+  (`snodra-messaging@64dde1e:snodra-messaging-rabbitmq/src/main/kotlin/com/damoreira/snodra/messaging/rabbitmq/RabbitReads.kt:100`,
+  `:175`); Rust does the same (`snodra-messaging-rs@4d63802:crates/snodra-messaging-rabbitmq/src/read.rs:134`), and the
+  Go add-on follows them.
+- **This library:** `snodra_rabbitmq/rabbitmq.py` (`RabbitMQEventStore._bounds`, `_read_chunk`) subscribes once with
+  `first` and once with `last` on the partition's leader; the first chunk's first offset is the first position, and
+  the last chunk's first offset plus its record count is the head. A stream is empty only when both reads are silent
+  within 1.5 s; one silent read beside one that answered is a failure, never a shortened or empty stream. The
+  subscription's head refresher and the admin's plan use it.
+- **Question:** should the specification define how a stream's bounds are read (or a minimum bound), or leave it to
+  each add-on?
+
+### SG-39: `browse` on a library without an event browser
+
+- **Specification:** [RabbitMQ Streams wire rules](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#rabbitmq-streams-wire-rules)
+  says the RabbitMQ Streams add-on declares `browse`, `lag` and `native-dead-letter`, and `replay` with its
+  management API; the same page says a library without an event browser may still declare `browse` for a store another
+  program can read. The Python core has no event-browser interface.
+- **Other Snodra libraries:** Rust has a browser and declares `browse`; Kotlin has no browser interface and the Go
+  core has none either, so the Go add-on declares no `browse`.
+- **This library:** `snodra_rabbitmq/rabbitmq.py` (`RabbitMQEventStore.capabilities`) declares `lag`,
+  `native-dead-letter` and (with the management API) `replay`, never `browse`; there is no `browser()` to return. A
+  browser program with its own add-on can still read the streams.
+- **Question:** should the Python and Go add-on pages say `browse` is not declared when the library has no browser, or
+  should the add-on declare it for a separate browser program?
+
+### SG-40: when the management API's metrics are off
+
+- **Specification:** [event-store-add-ons.md, Capabilities](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#capabilities)
+  says the RabbitMQ add-on declares `replay` only when its management API is configured, because only that API lists
+  the instances reading a subscription. No page says what a store does when the API is configured but its metrics
+  collection is off (`management.disable_stats` or `management_agent.disable_metrics_collector`): its consumer list
+  then answers nothing.
+- **Other Snodra libraries:** Kotlin's `RabbitEventStore.open` asks the overview once and builds the store without
+  `replay` when the metrics are off (`snodra-messaging@64dde1e:snodra-messaging-rabbitmq/src/main/kotlin/com/damoreira/snodra/messaging/rabbitmq/RabbitEventStore.kt:144`);
+  Rust's `RabbitEventStore::open` does the same
+  (`snodra-messaging-rs@4d63802:crates/snodra-messaging-rabbitmq/src/lib.rs:228`), and the Go add-on's `Open`
+  follows them.
+- **This library:** the core's event-store port has no `open` step, so `RabbitMQEventStore` declares `replay` from
+  the configured management URL when it is constructed; `RabbitMQAdmin.members` asks `/api/overview` and fails with
+  `Failed` when `disable_stats` is true, so every reset asks the consumer list and never reads "nobody reads" from
+  untrustworthy statistics. A management API that is down fails `members`, `plan` and `apply`, not the constructor.
+- **Question:** should disabled metrics be a startup failure or a store without `replay`, and should the event-store
+  port have an explicit open/verify step rather than the constructor's configuration?
+
+### SG-41: a reset is all or nothing over independently stored offsets
+
+- **Specification:** [event-store-add-ons.md, The admin](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#the-admin)
+  says `apply(ranges)` "moves each range's segment's committed position to its `from`, all or nothing". RabbitMQ
+  Streams has no command that stores several partitions' offsets together: each is its own asynchronous command on its
+  partition's leader, and a failure after some were stored leaves them moved.
+- **Other Snodra libraries:** Kotlin stores each range in turn
+  (`snodra-messaging@64dde1e:snodra-messaging-rabbitmq/src/main/kotlin/com/damoreira/snodra/messaging/rabbitmq/RabbitSubscriptionAdmin.kt:54`),
+  Rust does the same (`snodra-messaging-rs@4d63802:crates/snodra-messaging-rabbitmq/src/admin.rs:235`), and the Go
+  add-on follows them.
+- **This library:** `snodra_rabbitmq/rabbitmq.py` (`RabbitMQAdmin.apply`) validates every range and every head first,
+  refuses while a member reads, stores each `from` in turn, then reads every one back. A store or read-back failure is
+  reported; the offsets already stored are not restored. A range read back at another offset is
+  `SubscribersActive`.
+- **Question:** should a reset roll back (best effort) when a later partition's store fails, or should the
+  specification say a failed apply may leave some partitions moved and the planner re-runs it?
+
+### SG-42: a subscription to a source that does not exist
+
+- **Specification:** [event-store-add-ons.md, The operations](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#the-operations)
+  says subscribe joins the subscription's name on its source as one more instance, and that a new subscription's first
+  event is an assignment, "an empty one when it holds no segment, within a bound of its joining (10 s in both
+  libraries, `FIRST_ASSIGNMENT_WITHIN`)". The RabbitMQ wire rules also say the library creates no stream ("the
+  infrastructure does"). No page says what subscribe does while the source does not exist.
+- **Other Snodra libraries:** Kafka's Go add-on waits for the topic to appear and the consumer group joins then; the
+  Go RabbitMQ add-on reads the source's layout and fails when neither a super stream nor a plain stream exists, so the
+  core resubscribes after its backoff. The Kotlin and Rust RabbitMQ add-ons read the layout when joining too.
+- **This library:** `snodra_rabbitmq/rabbitmq.py` (`RabbitMQEventStore.subscribe` and `_layout`) raises `Failed` when
+  neither a super stream nor a plain stream named the source exists. The core closes the subscription and retries
+  after its backoff, so a stream created later is picked up; a source that never appears never yields an empty first
+  assignment. A publish to a missing source is `Failed` too, never `Rejected`: the relay retries it.
+- **Question:** should subscribe wait for the source (making the 10 s first-assignment promise unprovable for a source
+  that never appears), or refuse it as this library does?
