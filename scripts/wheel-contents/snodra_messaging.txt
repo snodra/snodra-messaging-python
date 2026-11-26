@@ -25,6 +25,8 @@ snodra/_rendezvous.py
 snodra/_retry.py
 snodra/_send.py
 snodra/_settings.py
+snodra/_store.py
+snodra/_store_memory.py
 snodra/_stream_client.py
 snodra/_stream_handler.py
 snodra/_subscribe.py
@@ -39,6 +41,8 @@ snodra/testing/__init__.py
 snodra/testing/checks.py
 snodra/testing/checks.txt
 snodra/testing/eventstore.py
+snodra/testing/store.py
+snodra/testing/store_checks.txt
 snodra/_hubpb/__init__.py
 snodra/_hubpb/hub_pb2.py
 snodra/_hubpb/hub_pb2.pyi

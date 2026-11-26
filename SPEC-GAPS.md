@@ -237,3 +237,34 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** open: should the specification require nondecreasing append times, or define a time-targeted reset
   without relying on them?
 - **Wire change:** no.
+
+### SG-16: a second outbox append of an entry id that exists
+
+- **Specification:** `message-store-add-ons.md` (Outbox) says an entry is pending until it is sent or failed and what a
+  claim returns; it does not say what an append does with an id the outbox already holds (a retry of a transaction whose
+  commit is unknown, a publisher that reuses an event id).
+- **Other Snodra libraries:** another official library's in-memory store throws its duplicate-key failure at once
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/store/memory/MemoryStores.kt:108`);
+  the SQL add-ons' primary key on the entry id does the same.
+- **This library:** `snodra/_store_memory.py` (`MemoryStore.open_outbox`) raises `Conflict` and appends nothing, on its
+  own or in a transaction; a database add-on answers the same through its schema. Pinned by
+  `test_a_second_append_of_one_entry_id_conflicts`.
+- **Question:** open: should a duplicate append be a conflict (as here) or an idempotent no-op? Recommend the conflict:
+  the id names one event, and a silent no-op would let two different events share it.
+- **Wire change:** no.
+
+### SG-17: when a second live writer of one record is refused
+
+- **Specification:** `message-store-add-ons.md` (Transactions) says two live transactions writing one record conflict
+  and that the library retries the attempt; it does not say whether the second writer is refused at its write or at its
+  commit. The reference kit accepts either for a database store.
+- **Other Snodra libraries:** another official library's in-memory store refuses the second write at once with its
+  concurrency failure (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/store/memory/MemoryTables.kt:79`),
+  and its counterpart in the other official library does the same; a database may report it at the write or at the
+  commit.
+- **This library:** `snodra/_store_memory.py` (`MemoryStore._reserve`) refuses the second live writer's write with
+  `Conflict` and marks that transaction unusable, so its commit is a `Conflict` too; a transaction whose record changed
+  after it wrote it conflicts at its commit. Pinned by `test_two_live_writers_of_one_record_conflict`.
+- **Question:** open: should the specification settle that the second write is refused at once, or leave the moment to
+  the store as the kit does?
+- **Wire change:** no.

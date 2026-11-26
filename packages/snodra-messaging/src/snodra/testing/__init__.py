@@ -1,9 +1,10 @@
 """The conformance kits of the Snodra libraries.
 
-Every store add-on runs the kit of its port, a third party's included: the kit needs only its prepared source and a
-way to make the add-on, and uses only the standard library. ``snodra.testing`` imports no test framework.
+Every store add-on runs the kit of its port, a third party's included: the kit needs only its prepared source (or store)
+and a way to make the add-on, and uses only the standard library. ``snodra.testing`` imports no test framework.
 
-See https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#the-conformance-kit.
+See https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#the-conformance-kit and
+https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/#the-conformance-kit.
 """
 
 from snodra.testing.checks import (
@@ -32,28 +33,72 @@ from snodra.testing.eventstore import (
     bounded,
     run_event_store_conformance,
 )
+from snodra.testing.store import (
+    BARRIER_WAIT,
+    BATCH,
+    ENTRIES,
+    LEASE,
+    LEASE_MARGIN,
+    LONG_LEASE,
+    MARKER_TYPE,
+    MESSAGE_STORE_CHECKS,
+    SENT_GAP,
+    TOPIC,
+    StoreCheck,
+    appended_entry_is_claimed_in_created_seq_order,
+    concurrent_relays_publish_each_entry_once,
+    expired_lease_is_reclaimed,
+    outbox_rejects_a_payload_that_is_not_a_json_object,
+    pending_counts_entries_neither_sent_nor_failed,
+    processed_marker_records_once,
+    purge_removes_only_sent_before,
+    rolled_back_handler_leaves_no_processed_marker,
+    rolled_back_transaction_leaves_no_outbox_entry,
+    run_store_conformance,
+)
 
 __all__ = [
+    "BARRIER_WAIT",
+    "BATCH",
+    "ENTRIES",
     "EVENT_STORE_CHECKS",
     "EVENT_TYPE",
     "JOIN_WINDOW",
+    "LEASE",
+    "LEASE_MARGIN",
+    "LONG_LEASE",
+    "MARKER_TYPE",
+    "MESSAGE_STORE_CHECKS",
     "QUIET",
+    "SENT_GAP",
     "SLICE",
+    "TOPIC",
     "WAIT",
     "Check",
     "EventStoreKit",
     "MarkerStore",
     "ProcessedEvents",
     "Reader",
+    "StoreCheck",
     "a_joining_instance_announces_its_first_assignment",
     "an_instance_left_without_segments_closes_its_change",
+    "appended_entry_is_claimed_in_created_seq_order",
     "bounded",
+    "concurrent_relays_publish_each_entry_once",
     "every_processor_gets_every_event",
+    "expired_lease_is_reclaimed",
     "headers_round_trip",
     "instances_share_a_processor",
+    "outbox_rejects_a_payload_that_is_not_a_json_object",
     "paused_subscription_receives_nothing_and_resumes_in_place",
+    "pending_counts_entries_neither_sent_nor_failed",
+    "processed_marker_records_once",
+    "purge_removes_only_sent_before",
     "redelivered_after_commit_is_skipped",
+    "rolled_back_handler_leaves_no_processed_marker",
+    "rolled_back_transaction_leaves_no_outbox_entry",
     "run_event_store_conformance",
+    "run_store_conformance",
     "same_key_arrives_in_publish_order",
     "unacked_delivery_is_redelivered",
 ]
