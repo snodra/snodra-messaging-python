@@ -16,6 +16,7 @@ snodra-messaging = { workspace = true }
 snodra-conformance-service = { workspace = true }
 snodra-messaging-observability = { workspace = true }
 snodra-messaging-kafka = { workspace = true }
+snodra-messaging-mongo = { workspace = true }
 snodra-messaging-sql = { workspace = true }
 orders-quickstart = { workspace = true }
 events-service = { workspace = true }
@@ -34,6 +35,7 @@ dev = [
     "snodra-conformance-service",
     "snodra-messaging-observability",
     "snodra-messaging-kafka",
+    "snodra-messaging-mongo",
     "snodra-messaging-sql",
     "orders-quickstart",
     "events-service",
@@ -57,7 +59,10 @@ select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF", "SIM", "PT"]
 [tool.mypy]
 strict = true
 files = ["packages", "examples"]
-exclude = ["^packages/snodra-messaging-sql/tests/conftest\\.py$"]
+exclude = [
+    "^packages/snodra-messaging-mongo/tests/conftest\\.py$",
+    "^packages/snodra-messaging-sql/tests/conftest\\.py$",
+]
 
 [[tool.mypy.overrides]]
 module = "snodra._hubpb.*"
@@ -76,6 +81,7 @@ testpaths = [
     "packages/snodra-messaging/tests",
     "packages/snodra-messaging-observability/tests",
     "packages/snodra-messaging-kafka/tests",
+    "packages/snodra-messaging-mongo/tests",
     "packages/snodra-messaging-sql/tests",
     "examples",
 ]

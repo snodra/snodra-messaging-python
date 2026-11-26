@@ -513,7 +513,8 @@ library does there. Where an entry is settled, its behaviour is this library's r
   (`snodra-messaging@64dde1e:snodra-messaging-jdbc/src/main/kotlin/com/damoreira/snodra/messaging/jdbc/JdbcOutboxStore.kt:40`).
 - **This library:** `snodra_sql/sql.py` (`_SqlOutbox.claim`) refuses an empty owner with `InvalidMessage`: an empty
   owner is indistinguishable from "nobody" in the SQL rows, so a second empty-owner relay would be given the first
-  one's entries.
+  one's entries. `snodra_mongo/mongo.py` (`_MongoOutbox.claim`) does the same: `{owner: null}` also matches an entry
+  that no relay holds, so an empty owner would claim another empty-owner relay's entries.
 - **Question:** is an empty owner invalid on every store? Recommend yes, and the specification should say so; the
   other add-ons would then refuse it too.
 - **Wire change:** no.
@@ -552,4 +553,32 @@ library does there. Where an entry is settled, its behaviour is this library's r
   schema lock is released in either case.
 - **Question:** settled: applying the file is idempotent and retryable, not atomic on MySQL; the specification should
   say so, since "applied once" can otherwise be read as all-or-nothing.
+- **Wire change:** no.
+
+### SG-34: a schema check and a retention that changed
+
+- **Specification:** `message-store-add-ons.md` says every store's schema is ready before the kit runs and that the
+  schema is prepared at startup; the MongoDB layout says every instance sharing a database must be given the same
+  retentions, because MongoDB refuses an index under an existing name with other options. Neither says what a schema
+  check does when an index exists with a different TTL, that is, when a database was prepared with another retention.
+- **This library:** `snodra_mongo/mongo.py` (`MongoStore.check_schema`). It reads every collection's indexes and
+  compares each layout index's keys, TTL (whole seconds), uniqueness and partial filter; a TTL that differs from the
+  store's settings is a `MessageStoreFailed` naming the index and saying that every instance sharing a database needs
+  the same retentions. It creates nothing.
+- **Question:** should a changed retention be a schema failure (as here) or should a check ignore TTLs? Recommend the
+  former: two instances with different retentions would otherwise let either one's TTL monitor delete documents the
+  other still needs.
+- **Wire change:** no.
+
+### SG-35: a retention with a fraction of a second, and a TTL index
+
+- **Specification:** the MongoDB layout says a retention index carries the configured retention, and lists the
+  defaults as whole days; MongoDB's `expireAfterSeconds` is a 32-bit integer number of seconds. Neither page says
+  what a sub-second or oversized retention becomes, nor whether a store refuses one.
+- **This library:** `snodra_mongo/mongo.py` (`_ttl_seconds`). A positive retention is floored to whole seconds, so
+  90.9 s becomes 90 and 0.5 s becomes 0 (the TTL monitor may then expire the document at once); a zero or negative
+  retention is 0; a retention beyond `2**31 - 1` seconds is refused when the config is built.
+- **Question:** open: should the specification define the floor, or require whole-second retentions and refuse a
+  fraction? Recommend the floor: a fraction is a configuration mistake, but refusing it would make a database shared
+  with another instance whose retention is whole seconds fail for a value MongoDB never sees.
 - **Wire change:** no.

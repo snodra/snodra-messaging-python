@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.33,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snodra-messaging-mongo"
+version = "0.3.0"
+description = "The MongoDB message store for the Snodra messaging suite."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "snodra-messaging==0.3.0",
+    "pymongo==4.20.2",
+]
+
+[project.urls]
+Homepage = "https://snodra.damoreira.com/"
+Repository = "https://github.com/snodra/snodra-messaging-python"
+
+[tool.uv.sources]
+snodra-messaging = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snodra_mongo"]
