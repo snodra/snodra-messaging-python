@@ -162,3 +162,303 @@ jobs:
           path: conformance-reports/
           if-no-files-found: warn
 
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      # release.test.sh builds the wheels, installs them and runs the tests on both.
+      - run: uv python install 3.12 3.14
+      - run: for t in scripts/*.test.sh; do sh "$t" || exit 1; done
+
+  # Versions are cut here, from the Conventional Commit subjects since the last tag
+  # (scripts/next-version.sh): feat -> minor, fix/perf -> patch, anything else -> no release.
+  # Below 1.0.0 nothing computes a major; 1.0.0 is declared by hand. A release is one commit and one
+  # tag, vX.Y.Z, for both distributions.
+  #
+  # Three jobs, so that no code that builds or tests ever holds a token that can push:
+  # - version (read-only) computes the version, makes the release commit and its tag, records their
+  #   ids and hands them over as a git bundle;
+  # - package (read-only) builds and checks exactly that commit, as a consumer gets it;
+  # - push (contents: write) checks out nothing and runs no file of the repository: it checks that
+  #   the bundle holds the recorded and tested objects, one commit on top of the tested main head,
+  #   and pushes those ids.
+  #
+  # Then publish (one job per distribution, PyPI's trusted publisher, no write token) uploads the
+  # files the package job tested, and release creates the GitHub release.
+  version:
+    needs: [lint, test, proto-sync, generated, build, conformance, scripts]
+    # Pushes to main of this repository only: never a fork or a pull request, and never the
+    # release commit itself (a GITHUB_TOKEN push starts no workflow anyway).
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && github.repository_owner == 'snodra'
+      && !startsWith(github.event.head_commit.message, 'release:')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      commit: ${{ steps.commit.outputs.commit }}
+      tag_id: ${{ steps.commit.outputs.tag_id }}
+    steps:
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: next version
+        id: next
+        run: |
+          main=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+          if [ "$main" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at $main, not $GITHUB_SHA: a newer push releases it, or this is a re-run of a run that released. Nothing to do. To finish a failed release, re-run its failed jobs or run the release workflow with the tag."
+            exit 0
+          fi
+          last=$(git tag --merged HEAD --list 'v*' | scripts/last-tag.sh)
+          range=${last:+$last..}HEAD
+          version=$(
+            { git log --format=%s "$range"
+              git log -E --grep='^BREAKING[ -]CHANGE:' --format='BREAKING CHANGE: %h' "$range"
+            } | scripts/next-version.sh "$last"
+          )
+          echo "last tag: ${last:-none}; next version: ${version:-none, no release}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: commit and tag
+        id: commit
+        if: steps.next.outputs.version != ''
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          scripts/bump-version.sh "$VERSION"
+          git add -u
+          git commit -m "release: $VERSION"
+          git tag -a "v$VERSION" -m "${GITHUB_REPOSITORY#*/} v$VERSION"
+          v="refs/tags/v$VERSION"
+          { echo "commit=$(git rev-parse HEAD)"
+            echo "tag_id=$(git rev-parse "$v")"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/release"
+          git bundle create "$RUNNER_TEMP/release/release.bundle" "$v"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.next.outputs.version != ''
+        with:
+          name: release
+          path: ${{ runner.temp }}/release/release.bundle
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
+
+  # The packaging check: the release commit must build the four files, install them and pass the
+  # tests before anything is pushed, because PyPI keeps a published version forever
+  # (scripts/release-check.sh).
+  package:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.check.outputs.commit }}
+      sums: ${{ steps.check.outputs.sums }}
+    steps:
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      - name: the release commit, as recorded
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          COMMIT: ${{ needs.version.outputs.commit }}
+          TAG_ID: ${{ needs.version.outputs.tag_id }}
+        run: |
+          v="refs/tags/v$VERSION"
+          git fetch -q "$RUNNER_TEMP/release/release.bundle" "$v:$v"
+          if [ "$(git rev-parse "$v")" != "$TAG_ID" ] || [ "$(git rev-parse "$v^{commit}")" != "$COMMIT" ]; then
+            echo "::error::the bundle does not hold the release the version job recorded"
+            exit 1
+          fi
+          git checkout -q --detach "$COMMIT"
+
+      - name: the release commit packages
+        id: check
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          scripts/release-check.sh "$VERSION"
+          { echo "commit=$(git rev-parse HEAD)"
+            echo "sums=$(sha256sum dist/SHA256SUMS | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
+
+  push:
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.push.outputs.tag }}
+    steps:
+      # No checkout: nothing of the repository is built or run with this job's token.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      - name: push
+        id: push
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          COMMIT: ${{ needs.version.outputs.commit }}
+          TAG_ID: ${{ needs.version.outputs.tag_id }}
+          TESTED: ${{ needs.package.outputs.commit }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # git settings go through the environment: hooks off, and later the token, which so
+          # never appears on a command line.
+          config() {
+            n=${GIT_CONFIG_COUNT:-0}
+            export GIT_CONFIG_COUNT=$((n + 1)) "GIT_CONFIG_KEY_$n=$1" "GIT_CONFIG_VALUE_$n=$2"
+          }
+          config core.hooksPath /dev/null
+          git init -q --bare "$RUNNER_TEMP/release.git"
+          cd "$RUNNER_TEMP/release.git"
+          v="refs/tags/v$VERSION"
+          git fetch -q "$RUNNER_TEMP/release/release.bundle" "$v:$v"
+          # Object ids are content hashes: these are the objects recorded, and the commit tested.
+          if [ "$(git rev-parse "$v")" != "$TAG_ID" ] \
+             || [ "$(git rev-parse "$v^{commit}")" != "$COMMIT" ] || [ "$COMMIT" != "$TESTED" ]; then
+            echo "::error::the release objects are not the ones recorded and tested"
+            exit 1
+          fi
+          if [ "$(git rev-list --parents -n 1 "$COMMIT")" != "$COMMIT $GITHUB_SHA" ]; then
+            echo "::error::the release commit is not one commit on top of the tested main head"
+            exit 1
+          fi
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          config http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          remote="https://github.com/$GITHUB_REPOSITORY.git"
+          # The commit and the tag, or none of them, and only as a fast-forward of the tested main
+          # head.
+          if ! git push --atomic "$remote" "$COMMIT:refs/heads/main" "$TAG_ID:$v"; then
+            main=$(git ls-remote --exit-code "$remote" refs/heads/main | cut -f1)
+            if [ "$main" = "$COMMIT" ]; then
+              # The push landed and only the client saw an error: release it.
+              git ls-remote --exit-code "$remote" "$v" >/dev/null \
+                || { echo "::error::main has the release commit but not v$VERSION"; exit 1; }
+              echo "::warning::git reported an error, but the release commit and v$VERSION are on the remote"
+            elif [ "$main" != "$GITHUB_SHA" ]; then
+              echo "::notice::main moved during the release; the run for the newer commit releases"
+              exit 0
+            else
+              echo "::error::the push to main was refused: check that github-actions may push to main and create tags"
+              exit 1
+            fi
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  # PyPI keeps a version forever, and each distribution has its own trusted publisher: one job per
+  # distribution, each with the environment the publisher names. Neither checks out the repository.
+  publish-core:
+    needs: [package, push]
+    if: needs.push.outputs.tag != ''
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      - name: the files are the ones tested
+        env:
+          TAG: ${{ needs.push.outputs.tag }}
+          SUMS: ${{ needs.package.outputs.sums }}
+        run: |
+          version=${TAG#v}
+          cd dist
+          if [ "$(sha256sum SHA256SUMS | cut -d' ' -f1)" != "$SUMS" ]; then
+            echo "::error::dist/SHA256SUMS is not the one the package job recorded"
+            exit 1
+          fi
+          sha256sum --check SHA256SUMS
+          for f in "snodra_messaging-$version.tar.gz" "snodra_messaging-$version-py3-none-any.whl"; do
+            [ -f "$f" ] || { echo "::error::dist/$f is missing"; exit 1; }
+          done
+          mkdir core
+          mv "snodra_messaging-$version.tar.gz" "snodra_messaging-$version-py3-none-any.whl" core/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/core/
+          skip-existing: true
+
+  publish-observability:
+    needs: [package, push]
+    if: needs.push.outputs.tag != ''
+    runs-on: ubuntu-latest
+    environment: pypi-observability
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      - name: the files are the ones tested
+        env:
+          TAG: ${{ needs.push.outputs.tag }}
+          SUMS: ${{ needs.package.outputs.sums }}
+        run: |
+          version=${TAG#v}
+          cd dist
+          if [ "$(sha256sum SHA256SUMS | cut -d' ' -f1)" != "$SUMS" ]; then
+            echo "::error::dist/SHA256SUMS is not the one the package job recorded"
+            exit 1
+          fi
+          sha256sum --check SHA256SUMS
+          for f in "snodra_messaging_observability-$version.tar.gz" "snodra_messaging_observability-$version-py3-none-any.whl"; do
+            [ -f "$f" ] || { echo "::error::dist/$f is missing"; exit 1; }
+          done
+          mkdir observability
+          mv "snodra_messaging_observability-$version.tar.gz" \
+            "snodra_messaging_observability-$version-py3-none-any.whl" observability/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/observability/
+          skip-existing: true
+
+  # A tag pushed with GITHUB_TOKEN starts no workflow, so the release runs here, once PyPI has both
+  # distributions.
+  release:
+    needs: [push, publish-core, publish-observability]
+    if: needs.push.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.push.outputs.tag }}
+

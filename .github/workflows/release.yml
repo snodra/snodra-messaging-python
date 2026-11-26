@@ -1,0 +1,148 @@
+name: release
+
+# CI calls this after PyPI has both distributions of a release (ci.yml, job `release`): a tag
+# pushed with GITHUB_TOKEN starts no workflow by itself. Run it by hand only to finish an existing
+# release again; nobody pushes tags.
+#
+# check (read-only): the tag, its commit, and the version both pyproject.toml files of that commit
+# carry.
+# github-release (write, no build): the four files as PyPI serves them, each checked against the
+# sha256 PyPI recorded, then the GitHub release.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag to release, for example v0.1.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing tag to release again, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# The input reaches the shells only through this variable, and is printed only once it is checked.
+env:
+  TAG: ${{ inputs.tag }}
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Every other job needs this one: the tag must be a release that already exists and the tagged
+  # tree must carry its version, so a mistyped tag attaches nothing and creates no release.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      latest: ${{ steps.tag.outputs.latest }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - name: the tag is vN.N.N
+        run: |
+          if ! [[ $TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::the tag input is not a release tag vN.N.N"
+            exit 1
+          fi
+      # The current scripts and every tag (the tag's own tree may predate scripts/).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: the tag exists, and the tagged tree carries its version
+        id: tag
+        run: |
+          if ! commit=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}"); then
+            echo "::error::the release tag does not exist"
+            exit 1
+          fi
+          version=${TAG#v}
+          # Through files, not pipes: awk stops early, and pipefail would count git's SIGPIPE.
+          for f in packages/snodra-messaging packages/snodra-messaging-observability; do
+            git show "$commit:$f/pyproject.toml" >"$RUNNER_TEMP/f.toml"
+            got=$(awk '/^\[/ { p = ($0 == "[project]") } p && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }' \
+              "$RUNNER_TEMP/f.toml")
+            echo "$f: version = \"$got\""
+            if [ "$got" != "$version" ]; then
+              echo "::error::the tagged $f/pyproject.toml does not carry the version $version"
+              exit 1
+            fi
+          done
+          # The observability distribution requires the core at this release, exactly.
+          git show "$commit:packages/snodra-messaging-observability/pyproject.toml" >"$RUNNER_TEMP/f.toml"
+          pin=$(awk '/^\[/ { p = ($0 == "[project]") } p && /^[[:space:]]*"snodra-messaging==/ {
+              gsub(/^[[:space:]]*"|",$/, ""); print; exit }' "$RUNNER_TEMP/f.toml")
+          echo "the observability requirement: $pin"
+          if [ "$pin" != "snodra-messaging==$version" ]; then
+            echo "::error::the tagged observability distribution does not require snodra-messaging==$version"
+            exit 1
+          fi
+          highest=$(git tag --list 'v*' | scripts/last-tag.sh)
+          # `latest` moves only to the highest version: publishing an older tag again leaves it.
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "latest=$([ "$TAG" = "$highest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "$TAG at $commit; highest release tag: $highest"
+
+  # Last, once PyPI has the version: it downloads what PyPI serves, checks it against the sha256
+  # PyPI recorded, and attaches it. Safe to repeat: an existing release is edited and the files
+  # replaced.
+  github-release:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: the four files of the release, as PyPI serves them
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          mkdir "$RUNNER_TEMP/files"
+          cd "$RUNNER_TEMP/files"
+          : >"$RUNNER_TEMP/sums"
+          for project in snodra-messaging snodra-messaging-observability; do
+            json="$RUNNER_TEMP/$project.json"
+            curl -fsS -o "$json" "https://pypi.org/pypi/$project/$VERSION/json"
+            jq -r '.urls[].url' "$json" >"$RUNNER_TEMP/urls"
+            jq -r '.urls[] | "\(.digests.sha256)  \(.filename)"' "$json" >>"$RUNNER_TEMP/sums"
+            n=$(jq '.urls | length' "$json")
+            if [ "$n" -ne 2 ]; then
+              echo "::error::PyPI has $n files for $project $VERSION, not an sdist and a wheel"
+              exit 1
+            fi
+            while read -r url; do curl -fsS -O "$url"; done <"$RUNNER_TEMP/urls"
+          done
+          if [ "$(wc -l <"$RUNNER_TEMP/sums" | tr -d ' ')" -ne 4 ]; then
+            echo "::error::not the four files of $VERSION"
+            exit 1
+          fi
+          sha256sum --check "$RUNNER_TEMP/sums"
+          ls -l
+
+      - name: create the release, or edit it and replace the files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ needs.check.outputs.latest }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          NOTES="PyPI: \`pip install snodra-messaging==$VERSION\` and
+          \`pip install snodra-messaging-observability==$VERSION\`.
+          The sdist and the wheel of both distributions are attached below."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REPOSITORY#*/} $TAG" --notes "$NOTES"
+          else
+            # --verify-tag: never create a tag here.
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --latest="$LATEST" \
+              --title "${GITHUB_REPOSITORY#*/} $TAG" --generate-notes --notes "$NOTES"
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP"/files/*
