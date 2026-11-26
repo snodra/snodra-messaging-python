@@ -1117,7 +1117,7 @@ requires-dist = [{ name = "snodra-messaging", editable = "packages/snodra-messag
 
 [[package]]
 name = "snodra-messaging"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/snodra-messaging" }
 dependencies = [
     { name = "cryptography" },
@@ -1134,7 +1134,7 @@ requires-dist = [
 
 [[package]]
 name = "snodra-messaging-observability"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/snodra-messaging-observability" }
 dependencies = [
     { name = "opentelemetry-api" },
