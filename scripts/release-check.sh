@@ -7,9 +7,11 @@
 #
 # - vX.Y.Z names HEAD, and the tree is clean.
 # - uv.lock is the lock uv resolves now.
-# - PyPI has neither distribution at X.Y.Z.
-# - Every workspace member builds (uv build --all-packages); dist/ then holds exactly the two
-#   distributions of this release, the sdist and the wheel of each.
+# - PyPI has neither published distribution at X.Y.Z.
+# - Only the distributions the build job lists in PUBLISHED are built. A workspace member that list
+#   does not name -- an example, or a level-2 add-on without a PyPI pending trusted publisher -- is
+#   never built and never reaches dist/, which then holds exactly the two published distributions,
+#   the sdist and the wheel of each.
 # - twine check --strict passes on them.
 # - Each wheel holds exactly the files scripts/wheel-contents/<distribution>.txt names (X.Y.Z
 #   substituted), its METADATA carries "Version: X.Y.Z", and the observability wheel requires
@@ -18,6 +20,12 @@
 #   read no repository file pass there over a copy of the tests outside the source tree: what runs
 #   is the wheel, not the checkout.
 # - dist/SHA256SUMS records the four files, for the publish job.
+#
+# The level-2 add-ons (snodra-messaging-{kafka,mongo,rabbitmq,sql}) are workspace members but are
+# not published: PyPI has pending trusted publishers only for the two distributions above. An add-on
+# joins PUBLISHED, bump-version.sh and the publish jobs only after the owner has created its PyPI
+# pending trusted publisher (one environment per add-on, for example pypi-kafka); until then,
+# building it here would produce an artifact no publisher accepts.
 #
 # Needs git, uv, unzip and curl. SNODRA_PYPI_PROBE names a program standing in for the PyPI probe
 # (PROJECT VERSION, printing an HTTP status), which scripts/release.test.sh uses.
@@ -54,6 +62,26 @@ head=$(git rev-parse HEAD)
 
 uv lock --check || die "uv.lock is not the lock uv resolves now"
 
+# The distributions this repository publishes: the build job's PUBLISHED list, one per line. The
+# check builds that list and nothing else, so the workspace's unpublished members (the examples and
+# the level-2 add-ons) never produce a release artifact.
+published=$(
+  awk '
+    /^[[:space:]]*PUBLISHED:[[:space:]]*[|][[:space:]]*$/ {
+      match($0, /^[[:space:]]*/)
+      key = RLENGTH
+      found = 1
+      next
+    }
+    found {
+      match($0, /^[[:space:]]*/)
+      if (RLENGTH <= key) exit
+      print substr($0, RLENGTH + 1)
+    }
+  ' .github/workflows/ci.yml
+)
+[ -n "$published" ] || die "the build job of .github/workflows/ci.yml has no PUBLISHED list"
+
 # A version PyPI has is never published again, so nothing is built until both projects answer 404.
 pypi_status() {
   if [ -n "${SNODRA_PYPI_PROBE:-}" ]; then
@@ -69,18 +97,14 @@ for project in $core_project $observability_project; do
 done
 
 rm -rf dist
-uv build --all-packages --out-dir dist >/dev/null || die "uv build failed"
+# --package, never --all-packages: only the distributions that are published build. Each contributes
+# its sdist and its wheel, and anything else in dist/ fails the count below.
+for project in $published; do
+  uv build --package "$project" --out-dir dist >/dev/null || die "uv build failed for $project"
+done
 # uv writes dist/.gitignore (`*`) so a build's output is never committed: the release's dist/ holds
 # its four files and nothing else.
 rm -f dist/.gitignore
-# The examples are workspace members and `--all-packages` builds them: only the four files of this
-# release stay, and anything else in dist/ fails the count below.
-for f in dist/*; do
-  case ${f#dist/} in
-    "$core-$version.tar.gz" | "$core_wheel" | "$observability-$version.tar.gz" | "$observability_wheel") ;;
-    *) rm -f "$f" ;;
-  esac
-done
 count=$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
 [ "$count" -eq 4 ] \
   || die "dist/ does not hold exactly the four files of $version: $(cd dist && ls | tr '\n' ' ')"

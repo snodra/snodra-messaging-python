@@ -1,10 +1,12 @@
 #!/bin/sh
 # Tests for release-check.sh on a scratch copy of the workspace: sh scripts/release.test.sh
 #
-# Slow on purpose: the case that passes builds the four files, installs both wheels into a fresh
-# 3.12 and a fresh 3.14 environment and runs the tests there. Needs uv, git and unzip. The PyPI
-# probe is stubbed through SNODRA_PYPI_PROBE, so the case where a version is already on PyPI needs
-# no network, and the test never talks to PyPI.
+# The scratch workspace carries the four level-2 add-ons: they are members, but no release publishes
+# them until PyPI has their pending trusted publishers, so the check must build only the
+# distributions ci.yml's PUBLISHED names. Slow on purpose: the case that passes builds the four
+# files, installs both wheels into a fresh 3.12 and a fresh 3.14 environment and runs the tests
+# there. Needs uv, git and unzip. The PyPI probe is stubbed through SNODRA_PYPI_PROBE, so the case
+# where a version is already on PyPI needs no network, and the test never talks to PyPI.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
@@ -56,6 +58,33 @@ EOF
 chmod +x "$probe"
 export SNODRA_PYPI_PROBE=$probe SNODRA_TEST_TAKEN=$work/taken
 
+# The build log: a uv standing in front of the real one records every call, so the test can see
+# which distributions the check builds. The add-ons are workspace members; only PUBLISHED is built.
+# A pyenv or asdf shim would resolve uv through PATH and find the wrapper again: the real one is the
+# first uv on PATH that is a binary, not a script.
+real_uv=
+old_ifs=$IFS
+IFS=:
+for dir in $PATH; do
+  if [ ! -f "$dir/uv" ] || [ ! -x "$dir/uv" ]; then continue; fi
+  if head -c 2 "$dir/uv" | grep -q '^#!'; then continue; fi
+  real_uv=$dir/uv
+  break
+done
+IFS=$old_ifs
+[ -n "$real_uv" ] || { echo "FAIL no uv binary on PATH" >&2; exit 1; }
+uv_log=$work/uv.log
+mkdir -p "$work/bin"
+cat >"$work/bin/uv" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SNODRA_TEST_UV_LOG"
+exec "$SNODRA_TEST_REAL_UV" "$@"
+EOF
+chmod +x "$work/bin/uv"
+export SNODRA_TEST_UV_LOG="$uv_log" SNODRA_TEST_REAL_UV="$real_uv"
+PATH="$work/bin:$PATH"
+export PATH
+
 # sums: dist/SHA256SUMS verifies, as the publish job checks it.
 sums() {
   (
@@ -97,6 +126,14 @@ if out=$(sh scripts/release-check.sh "$version" 2>&1); then
 else
   fail "the check: $(printf '%s' "$out" | tail -5)"
 fi
+
+# The four add-ons are workspace members, but none is published: the check builds only the two
+# distributions PUBLISHED names, never --all-packages.
+builds=$(grep '^build ' "$uv_log" || true)
+want_builds='build --package snodra-messaging --out-dir dist
+build --package snodra-messaging-observability --out-dir dist'
+[ "$builds" = "$want_builds" ] && ok "only the published distributions are built" \
+  || fail "uv build calls: $(printf '%s' "$builds" | tr '\n' ';')"
 
 # What the publish job checks: the four names, in that order, and the files as they are now.
 [ "$(awk '{ print $2 }' dist/SHA256SUMS)" = "$four" ] && ok "SHA256SUMS names the four files" \

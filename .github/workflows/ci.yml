@@ -74,7 +74,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # The distributions this repository publishes, one per line; the examples are never built here.
+      # The distributions this repository publishes, one per line; the examples are never built
+      # here, and the level-2 add-ons wait for their PyPI pending trusted publishers. The release
+      # check (scripts/release-check.sh) builds exactly this list.
       PUBLISHED: |
         snodra-messaging
         snodra-messaging-observability

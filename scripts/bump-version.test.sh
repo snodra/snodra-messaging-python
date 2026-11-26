@@ -17,11 +17,19 @@ ok() {
   echo "ok   $*"
 }
 
-# The three files the bump writes, and the whole workspace `uv lock` reads.
+# The three files the bump writes, and the whole workspace `uv lock` reads: every member's manifest,
+# including the level-2 add-ons, which are members even though no release publishes them.
 core=packages/snodra-messaging/pyproject.toml
 observability=packages/snodra-messaging-observability/pyproject.toml
 versioned="$core $observability uv.lock"
-files="$versioned pyproject.toml examples/quickstart/pyproject.toml examples/conformance-service/pyproject.toml"
+files="$versioned pyproject.toml"
+for f in "$root"/packages/*/pyproject.toml "$root"/examples/*/pyproject.toml; do
+  f=${f#"$root/"}
+  case $f in
+    "$core" | "$observability") ;;
+    *) files="$files $f" ;;
+  esac
+done
 
 for f in $files; do
   mkdir -p "$work/$(dirname "$f")"
