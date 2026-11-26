@@ -48,6 +48,10 @@ KINDS: Final = frozenset(f.name for f in hub_pb2.ClientMessage.DESCRIPTOR.oneofs
 """The kinds of frame a library writes: the names of ``ClientMessage``'s oneof."""
 
 _QUIET: Final = frozenset({"heartbeat", "status"})
+_CONTROL: Final = frozenset({"permits", "flow", "cancel"})
+"""Frames about one call rather than the stream: a top-up's or a batching timer's ``Permits``, a refill's ``Flow``,
+a caller leaving's ``Cancel``. A step waiting for another kind skips them: the call they belong to is another step's,
+and any of them may arrive at any moment."""
 _EOF_GRACE: Final = 0.05
 """How long after the end of the client's frames its cancellation may still follow (see the module docstring)."""
 _ECHO_BACKLOG: Final = 64
@@ -314,13 +318,14 @@ class FakeStream:
 
     async def _recv_kind(self, kind: str, within: float) -> hub_pb2.ClientMessage:
         """The next frame that is not a heartbeat or a status, which must be of kind; the bound covers the whole
-        wait, the skipped frames included. A ``Permits`` frame is skipped too unless it is the kind awaited: with
-        several hubs a top-up may arrive at any moment, as a batching timer's permits already may."""
+        wait, the skipped frames included. A control frame of another call is skipped unless it is the kind awaited
+        (see ``_CONTROL``): a ``Permits`` from a top-up or a batching timer, a ``Flow`` from a refill, a ``Cancel``
+        from a caller that left — any of them may arrive at any moment, for a call another step made."""
         deadline = asyncio.get_running_loop().time() + within
         while True:
             m = await self._take(deadline, f"no {kind} frame within {within} s")
             got = _kind(m)
-            if got in _QUIET or (got == "permits" and kind != "permits"):
+            if got in _QUIET or (got in _CONTROL and got != kind):
                 continue
             if got != kind:
                 raise AssertionError(f"expected a {kind} frame, got {got}: {_show(m)}")

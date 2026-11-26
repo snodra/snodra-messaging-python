@@ -250,6 +250,23 @@ async def test_every_recv_helper_returns_its_kind(hub: FakeHub, dial: Dial) -> N
     assert (await s.recv_cancel()).request_id == "e"
 
 
+async def test_recv_request_skips_another_calls_flow_and_cancel(hub: FakeHub, dial: Dial) -> None:
+    c = await dial(hub.address)
+    await c.write(register("orders-service", "i-1"))
+    await c.write(hub_pb2.ClientMessage(flow=hub_pb2.Flow(request_id="other#1", credits=1)))
+    await c.write(hub_pb2.ClientMessage(cancel=hub_pb2.Cancel(request_id="other#2", reason="left")))
+    await c.write(hub_pb2.ClientMessage(request=hub_pb2.Request(id="mine#1")))
+    s = await hub.next_stream()
+    await s.recv_register()
+    # A refill and a cancellation of other calls arrive between two steps of a script; each is still what its own
+    # helper returns.
+    assert (await s.recv_request()).id == "mine#1"
+    await c.write(hub_pb2.ClientMessage(flow=hub_pb2.Flow(request_id="mine#1", credits=2)))
+    await c.write(hub_pb2.ClientMessage(cancel=hub_pb2.Cancel(request_id="mine#1", reason="done")))
+    assert (await s.recv_flow()).credits == 2
+    assert (await s.recv_cancel()).reason == "done"
+
+
 async def test_a_recv_helper_fails_on_another_kind(hub: FakeHub, dial: Dial) -> None:
     c = await dial(hub.address)
     await c.write(register("orders-service", "i-1"))
