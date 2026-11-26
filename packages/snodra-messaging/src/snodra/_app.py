@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -12,17 +13,27 @@ from typing import Any, Literal, TypeVar, overload
 from snodra import _credentials, _tls
 from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
+from snodra._consumer import EventConsumer
 from snodra._dispatch import Dispatcher
 from snodra._errors import ConfigurationError
+from snodra._events import (
+    PUBLISH_NEEDS_EVENT_STORE,
+    PUBLISH_NEEDS_STORE,
+    EventRegistry,
+    outbox_entry,
+)
+from snodra._eventstore import EventStore
 from snodra._gather import Gathered, gather
 from snodra._identity import Guard, IdentityResolver
 from snodra._jwt import JwksVerifier
 from snodra._local import LocalCalls
+from snodra._outbox import OutboxRelay, OutboxSettings
 from snodra._pool import Pool
 from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
 from snodra._send import Sender
 from snodra._settings import Settings, hub_targets
+from snodra._store import MessageStore, now_ms
 from snodra._stream_client import Stream, stream
 from snodra._subscribe import Subscription, subscribe
 from snodra._subscription_handler import Updates
@@ -56,11 +67,18 @@ class App:
         self,
         settings: Settings,
         *,
+        store: MessageStore | None = None,
+        event_store: EventStore | None = None,
         codec: Codec | None = None,
         telemetry: Telemetry | None = None,
         _timings: Timings | None = None,
     ) -> None:
         self._settings = settings
+        self._store = store
+        self._event_store = event_store
+        self._events = EventRegistry()
+        self._outbox_seq = itertools.count((now_ms() << 20) + 1)
+        self._event_tasks: list[asyncio.Task[None]] = []
         self._telemetry: Telemetry = NoTelemetry() if telemetry is None else _GuardedTelemetry(telemetry)
         # The status period is the app's own setting: the shipped timings as given, with it applied.
         self._timings = (
@@ -266,6 +284,77 @@ class App:
             return Updates(self._dispatcher.subscriptions, self._codec, handler.type, handler.message, update)
 
         return register
+
+    @overload
+    def event_handler(self, fn: H, /) -> H: ...
+    @overload
+    def event_handler(
+        self, fn: None = None, /, *, processor: str = "default", replay: bool = True
+    ) -> Callable[[H], H]: ...
+    def event_handler(
+        self, fn: H | None = None, /, *, processor: str = "default", replay: bool = True
+    ) -> H | Callable[[H], H]:
+        """Registers an event handler, bare (``@app.event_handler``) or called (``@app.event_handler()``): an
+        ``async def`` whose first parameter is annotated with a ``@message_type`` class, the event type it handles.
+
+        The handler runs in the ``default`` processor unless ``processor`` names another: its own subscription
+        ``<service>.<processor>``, its own stage-1 markers ``processor:<processor>:<eventId>`` and its own read of the
+        events, so one event type handled in two processors reaches both and a failure in one does not affect the other.
+        A name matches ``[a-z0-9][a-z0-9-]{0,47}`` (at most 48 characters); ``default`` is where handlers without one
+        run. ``replay=False`` marks a handler that a replay after a reset does not run again.
+
+        A handler of a delivered event runs in the processor's transaction with the event's stage-1 marker: its writes
+        (and the events it publishes) commit with the marker, and an event whose marker is recorded already (a
+        duplicate) runs no handler. An event of a type no handler of the processor handles is acknowledged and runs
+        nothing. The handler reads :func:`current_message` (the event's id, type, correlation id and headers) and
+        :func:`current_caller` is ``None``: an event carries a ``userId``, never a token.
+
+        An event handler needs the message store (``store=``) and the event store (``event_store=``): :meth:`start`
+        fails without them, naming the missing add-on. Commands, queries and subscription queries need neither.
+        Raises ``TypeError`` for a function that cannot be an event handler and :class:`RegistrationClosed` after
+        ``start``. Returns the function unchanged.
+        """
+
+        def register(f: H) -> H:
+            self._events.add(f, processor=processor, replay=replay)
+            return f
+
+        return register if fn is None else register(fn)
+
+    async def publish(self, event: object, *, key: str | None = None) -> None:
+        """Builds the event and appends it to the service's outbox, in the caller's transaction.
+
+        The type is the event class's ``@message_type`` name, the id a fresh UUID, the key ``key``, the timestamp its
+        creation time, and the seven headers of
+        https://snodra.damoreira.com/docs/library-authors/messages/ (Event headers): ``type``, ``id``,
+        ``correlationId``, ``timestamp``, ``source``, ``userId`` and, when the work that publishes carries one,
+        ``traceparent``. The append joins the transaction bound to the current context
+        (``async with store.transaction():`` or an add-on's own transaction helper), so the event commits with the
+        service's writes or not at all; the relay in every instance publishes it to the event store afterwards, at
+        least once.
+
+        ``userId`` is the verified caller's subject for a command or a query, and the ``userId`` of the event being
+        handled inside an event handler; a token itself never crosses into an event. An event published while handling
+        another message carries that message's correlation id and trace context. Outside any handling the correlation
+        id is a fresh UUID, the ``userId`` is empty and there is no ``traceparent``.
+
+        Publishing needs the message store (``store=``) and the event store (``event_store=``): the first publish
+        fails naming the missing add-on, since a service that only handles commands cannot be told apart from one that
+        publishes at startup. Raises :class:`ConfigurationError` in that case, ``TypeError`` for an event that is not a
+        ``@message_type`` class and :class:`~snodra._store.InvalidMessage` for a payload no store may hold.
+        """
+        if self._store is None:
+            raise ConfigurationError(PUBLISH_NEEDS_STORE)
+        if self._event_store is None:
+            raise ConfigurationError(PUBLISH_NEEDS_EVENT_STORE)
+        entry = outbox_entry(
+            event,
+            key=key,
+            seq=next(self._outbox_seq),
+            codec=self._codec,
+            telemetry=self._telemetry,
+        )
+        await self._store.outbox.append(entry)
 
     @overload
     async def send(
@@ -507,6 +596,8 @@ class App:
         if self._started:
             raise RuntimeError("the app is already started")
         self._registry.close()
+        self._events.close()
+        self._check_event_startup()
         self._dispatcher.subscriptions.bind(asyncio.get_running_loop())
         registry = self._registry
         self._pool.declare(
@@ -519,6 +610,75 @@ class App:
         if not self._shutting_down:
             self._telemetry.observe_gauges(self._read_gauges)
         self._pool.start()
+        self._start_events()
+
+    def _check_event_startup(self) -> None:
+        """Refuses event handlers without the stores they need, naming the missing add-on.
+
+        A service that only publishes is not visible here (the app cannot know that it publishes): its first
+        :meth:`publish` fails naming the missing add-on. Commands, queries and subscription queries need neither store.
+        """
+        processors = self._events.processors()
+        if not processors:
+            return
+        first = min(type_ for processor in processors for type_ in self._events.types(processor))
+        if self._store is None:
+            raise ConfigurationError(
+                f"the event handler for {first} needs a message store: pass store= to App "
+                "(snodra.MemoryStore runs the in-memory one, not durable: tests and local runs)"
+            )
+        if self._event_store is None:
+            raise ConfigurationError(
+                f"the event handler for {first} needs an event store: pass event_store= to App "
+                "(snodra.MemoryEventStore runs the in-memory one, not durable: tests and local runs)"
+            )
+
+    def _start_events(self) -> None:
+        """Starts the outbox relay and one consumer per processor, when their stores are there."""
+        if self._store is None or self._event_store is None:
+            return
+        if self._settings.outbox_enabled:
+            relay = OutboxRelay(
+                self._store.outbox,
+                self._event_store,
+                OutboxSettings(
+                    source=self._settings.events_source,
+                    service=self._settings.service,
+                    poll_interval=self._settings.outbox_poll_interval,
+                    batch_size=self._settings.outbox_batch_size,
+                    max_attempts=self._settings.outbox_max_attempts,
+                    lease=self._settings.outbox_lease,
+                ),
+            )
+            self._event_tasks.append(relay.start())
+        if self._settings.consumer_enabled:
+            for processor in self._events.processors():
+                consumer = EventConsumer(
+                    service=self._settings.service,
+                    processor=processor,
+                    store=self._store,
+                    events=self._event_store,
+                    registry=self._events,
+                    source=self._settings.events_source,
+                    codec=self._codec,
+                    max_attempts=self._settings.consumer_max_attempts,
+                    backoff=self._timings.event_handler_backoff,
+                    resubscribe_min=self._timings.event_resubscribe_min,
+                    resubscribe_max=self._timings.event_resubscribe_max,
+                )
+                self._event_tasks.append(consumer.start())
+
+    async def _stop_events(self) -> None:
+        """Cancels the outbox relay and the consumers, and waits for them to end."""
+        tasks, self._event_tasks = self._event_tasks, []
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, Exception):
+                log.error("an event task ended with an error: %s", outcome)
 
     async def ready(self, timeout: float | None = None) -> None:  # noqa: ASYNC109 (the API takes a timeout)
         """Returns once a hub has acknowledged this instance's registration; ``TimeoutError`` after ``timeout``."""
@@ -579,6 +739,7 @@ class App:
         self._stop.set()
         propagating = False
         try:
+            await self._stop_events()
             if self._started:
                 try:
                     async with asyncio.timeout(budget):

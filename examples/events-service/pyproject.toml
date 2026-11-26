@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.33,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "events-service"
+version = "0.0.0"
+description = "An orders service that publishes and handles events; not published."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+classifiers = ["Private :: Do Not Upload"]
+dependencies = ["snodra-messaging"]
+
+[tool.uv.sources]
+snodra-messaging = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/events_service"]

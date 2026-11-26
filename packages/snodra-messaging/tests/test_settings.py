@@ -274,6 +274,55 @@ def test_the_sending_settings_from_env_refuse_bad_values(variable: str, value: s
         Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service", variable: value})
 
 
+def test_the_event_settings() -> None:
+    s = Settings(service="orders-service")
+    assert (s.events_source, s.outbox_enabled, s.consumer_enabled) == ("snodra.events", True, True)
+    assert (s.outbox_poll_interval, s.outbox_batch_size) == (0.2, 100)
+    assert (s.outbox_max_attempts, s.outbox_lease, s.consumer_max_attempts) == (10, 120.0, 5)
+    s = Settings.from_env(
+        {
+            "SNODRA_SERVICE_NAME": "orders-service",
+            "SNODRA_EVENTS_SOURCE": "orders.events",
+            "SNODRA_OUTBOX_ENABLED": "false",
+            "SNODRA_OUTBOX_POLL_INTERVAL_MS": "50",
+            "SNODRA_OUTBOX_BATCH_SIZE": "7",
+            "SNODRA_OUTBOX_MAX_ATTEMPTS": "2",
+            "SNODRA_OUTBOX_LEASE_MS": "90000",
+            "SNODRA_CONSUMER_ENABLED": "false",
+            "SNODRA_CONSUMER_MAX_ATTEMPTS": "3",
+        }
+    )
+    assert (s.events_source, s.outbox_enabled, s.consumer_enabled) == ("orders.events", False, False)
+    assert (s.outbox_poll_interval, s.outbox_batch_size) == (0.05, 7)
+    assert (s.outbox_max_attempts, s.outbox_lease, s.consumer_max_attempts) == (2, 90.0, 3)
+    assert Settings(service="orders-service", events_source="  orders.events  ").events_source == "orders.events"
+
+
+def test_the_event_settings_refuse_bad_values() -> None:
+    _refused("SNODRA_EVENTS_SOURCE", events_source="")
+    _refused("SNODRA_EVENTS_SOURCE", events_source="  ")
+    _refused("SNODRA_OUTBOX_ENABLED", outbox_enabled=1)
+    _refused("SNODRA_CONSUMER_ENABLED", consumer_enabled="yes")
+    _refused("SNODRA_OUTBOX_BATCH_SIZE", outbox_batch_size=0)
+    _refused("SNODRA_OUTBOX_MAX_ATTEMPTS", outbox_max_attempts=0)
+    _refused("SNODRA_CONSUMER_MAX_ATTEMPTS", consumer_max_attempts=0)
+    _refused("SNODRA_OUTBOX_POLL_INTERVAL_MS", outbox_poll_interval=0)
+    _refused("SNODRA_OUTBOX_POLL_INTERVAL_MS", outbox_poll_interval=float("inf"))
+    _refused("SNODRA_OUTBOX_LEASE_MS", outbox_lease=0)
+    _refused("SNODRA_OUTBOX_LEASE_MS", outbox_lease=40.0)
+    for variable, value in (
+        ("SNODRA_OUTBOX_ENABLED", "maybe"),
+        ("SNODRA_OUTBOX_POLL_INTERVAL_MS", "0"),
+        ("SNODRA_OUTBOX_BATCH_SIZE", "0"),
+        ("SNODRA_OUTBOX_MAX_ATTEMPTS", "x"),
+        ("SNODRA_OUTBOX_LEASE_MS", "40000"),
+        ("SNODRA_CONSUMER_ENABLED", "on off"),
+        ("SNODRA_CONSUMER_MAX_ATTEMPTS", "-1"),
+    ):
+        with pytest.raises(ConfigurationError, match=variable):
+            Settings.from_env({"SNODRA_SERVICE_NAME": "orders-service", variable: value})
+
+
 def test_the_identity_and_routing_settings() -> None:
     s = Settings(service="orders-service")
     assert (s.jwks_url, s.issuer, s.roles_claim, s.forward_jwt, s.always_route_through_hub) == (

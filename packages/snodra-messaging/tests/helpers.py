@@ -47,6 +47,8 @@ def new_app(
     hubs: FakeHub | Sequence[FakeHub],
     /,
     *,
+    store: Any = None,
+    event_store: Any = None,
     codec: Codec | None = None,
     telemetry: Telemetry | None = None,
     _timings: Timings | None = None,
@@ -64,6 +66,8 @@ def new_app(
     }
     app = App(
         Settings(**(values | settings)),
+        store=store,
+        event_store=event_store,
         codec=codec,
         telemetry=telemetry,
         _timings=SCALED if _timings is None else _timings,
@@ -76,12 +80,14 @@ async def start_app(
     hubs: FakeHub | Sequence[FakeHub],
     /,
     *,
+    store: Any = None,
+    event_store: Any = None,
     telemetry: Telemetry | None = None,
     _timings: Timings | None = None,
     **settings: Any,
 ) -> App:
     """:func:`new_app`, started."""
-    app = new_app(hubs, telemetry=telemetry, _timings=_timings, **settings)
+    app = new_app(hubs, store=store, event_store=event_store, telemetry=telemetry, _timings=_timings, **settings)
     await app.start()
     return app
 

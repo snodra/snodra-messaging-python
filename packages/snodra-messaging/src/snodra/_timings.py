@@ -74,6 +74,12 @@ class Timings:
     """A hub being rolled over: the longest wait for its new stream's ``RegisterAck`` before the roll stops."""
     status_interval: float
     """How often every hub stream gets an ``InstanceStatus`` (also once on every change of the acknowledged hubs)."""
+    event_handler_backoff: float
+    """The wait between two invocations of an event handler on one record."""
+    event_resubscribe_min: float
+    """After a failed event subscription, the first wait before subscribing again."""
+    event_resubscribe_max: float
+    """The cap of that wait (the wait doubles until it, and starts over once a subscription delivers)."""
     dns_refresh: float
     """How often a ``dns:///`` target is resolved again."""
     dns_drain_limit: float
@@ -112,6 +118,9 @@ DEFAULT_TIMINGS: Final = Timings(
     roll_idle_limit=10.0,
     roll_reconnect_limit=30.0,
     status_interval=5.0,
+    event_handler_backoff=1.0,
+    event_resubscribe_min=1.0,
+    event_resubscribe_max=30.0,
     dns_refresh=30.0,
     dns_drain_limit=65.0,
 )

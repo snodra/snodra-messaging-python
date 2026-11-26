@@ -286,3 +286,90 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** open: should the specification refuse empty sources and names everywhere, or leave the empty string a
   valid name?
 - **Wire change:** no.
+
+### SG-19: the longest outbox send, and the lease margin around it
+
+- **Specification:** `writing-a-library.md` (Level 2, Relay) says the relay claims entries under a lease, hands each to
+  the event store and marks it sent once accepted; `message-store-add-ons.md` (Outbox) says a lease holds a batch and
+  that a failed attempt keeps the entry pending. Neither says how long one publish may take, how much of the lease a
+  batch must leave free for a send, nor what happens to a publish that never answers.
+- **Other Snodra libraries:** they differ. The Kotlin outbox publisher waits 45 s for one publish and refuses a lease
+  no longer than that (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/OutboxPublisher.kt:197`,
+  the check at line 65, the batch deadline at line 85); the Rust relay waits 40 s (`OUTBOX_SEND_TIMEOUT`).
+- **This library:** `snodra/_outbox.py` (`OUTBOX_SEND_TIMEOUT`, `OutboxRelay.relay_once`). One publish that has not
+  answered within 40 s counts as a failed attempt; a batch stops starting a send once its lease has less than a send
+  left (the next poll claims again and renews the lease); a `Settings.outbox_lease` of 40 s or less is refused when the
+  settings are built, naming `SNODRA_OUTBOX_LEASE_MS`. The relay follows the Rust reference's 40 s.
+- **Question:** open: should the specification name the send timeout and the lease margin, or leave them to each
+  library? Recommend naming both once, so an add-on's event store can size its own timeout below the library's.
+- **Wire change:** no.
+
+### SG-20: the attempts and the wait of a failing event handler at level 2
+
+- **Specification:** `writing-a-library.md` (Level 2, Consume) says a failing handler is "retried with backoff, then the
+  record becomes a dead letter (level 3) or, at level 2, is logged and skipped". It names neither the attempts nor the
+  wait, nor whether the stage-1 marker of a record whose attempts are exhausted stays out of the store.
+- **Other Snodra libraries:** the Kotlin consumer invokes a handler five times in all, one second apart, and gives the
+  record up after the fifth (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/EventConsumer.kt:97`,
+  line 98, lines 455-472; the default five is `SnodraMessagingProperties.kt:314`); the Rust consumer does the same with
+  its own constant.
+- **This library:** `snodra/_consumer.py` (`EventConsumer._handle`) and `snodra/_settings.py`
+  (`consumer_max_attempts`, `SNODRA_CONSUMER_MAX_ATTEMPTS`, five by default; `Timings.event_handler_backoff`, 1 s).
+  Each attempt runs the stage-1 marker and the handlers in one transaction, so a failed attempt commits nothing (no
+  marker, no published event). After the last attempt the record is logged at error, without its payload, and
+  acknowledged as the level-2 rule says; level 3 replaces this with a dead letter.
+- **Question:** open: should the specification name the level-2 attempts and wait, or leave them to each library?
+  Recommend naming both, since the wait is what a service sees when its handler is down.
+- **Wire change:** no.
+
+### SG-21: the wait before subscribing again after a failed event subscription
+
+- **Specification:** `event-store-add-ons.md` says a failing `next` ends a subscription and the caller subscribes
+  again after a backoff; it names neither the first wait, nor its cap, nor when it starts over.
+- **Other Snodra libraries:** they differ in the reset rule. The Kotlin reader waits 1 s doubling to 30 s while
+  subscriptions keep failing before they delivered anything, and starts over from 1 s after a subscription that
+  delivered an event or lived 30 s (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/Resubscribe.kt:65`);
+  the Rust consumer has its own constants.
+- **This library:** `snodra/_consumer.py` (`EventConsumer.run`) with `Timings.event_resubscribe_min` (1 s) and
+  `event_resubscribe_max` (30 s): the wait doubles per failed subscription up to the cap, and starts over at the first
+  wait once a subscription delivered a record. A close that fails is logged and does not stop the resubscribe.
+- **Question:** open: should a long-lived subscription without a delivery also reset the wait, as the Kotlin reader
+  does with its 30 s stability window? Recommend no: a delivery is the signal that the subscription works.
+- **Wire change:** no.
+
+### SG-22: what a level-2 library does with a record it can never handle
+
+- **Specification:** `writing-a-library.md` (Level 3, Dead letters) says a record without a type or with a payload that
+  is not a JSON object is an `INVALID` letter (discard only) and that a record whose handler cannot read its payload is
+  not retried. At level 2 the specification says only that a record failing its attempts is "logged and skipped"; it
+  does not say what a malformed record does, nor whether it gets a stage-1 marker.
+- **Other Snodra libraries:** the Kotlin consumer's `log` sink logs the record (never its payload) and acknowledges it
+  without a marker; an `InvalidMessageException` from a handler's decode breaks its attempt loop at once
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/EventConsumer.kt:463`,
+  the invalid path at line 521).
+- **This library:** `snodra/_consumer.py` (`EventConsumer._handle`). A record without a type header (or with a blank
+  one) and a record whose payload is not a JSON object are logged at warning, without the payload, and acknowledged
+  with no handler run and no marker. A payload of a handled type that the codec cannot read as the handler's message is
+  a handler failure: it is retried with the other handler failures and skipped after its attempts. This library records
+  one marker only after a handler ran to a clean commit.
+- **Question:** open: should the level-2 rule name the malformed record explicitly, and should a decode failure be
+  tried once (as Kotlin breaks at once) or with the other attempts? Recommend naming both as this library does.
+- **Wire change:** no.
+
+### SG-23: the seven event headers when nothing being handled carries a trace context
+
+- **Specification:** `messages.md` (Event headers) says every event carries seven headers, `traceparent` being "the
+  W3C trace context of the work that published it", and that a library must set them all on every event it publishes.
+  An event published outside any handling (a scheduler, a tool, a startup task) has no trace context to carry, and the
+  page does not say whether the header is then absent or empty.
+- **Other Snodra libraries:** they write `traceparent` only when a valid one exists: the Kotlin bus injects the trace
+  headers from the current context and writes none when there is none
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/OutboxEventBus.kt:58`);
+  the Rust relay adds it only when the publishing context carries a valid one.
+- **This library:** `snodra/_events.py` (`event_headers`). The other six headers are always written; `traceparent` is
+  written when the message being handled carries a valid one (and telemetry may supply a child), and omitted when there
+  is none. An empty `traceparent` is never written: it is not a W3C trace context.
+- **Question:** open: should the specification allow the six headers when no trace context exists, as every official
+  library does, or require an empty `traceparent`? Recommend the former; a fabricated or empty trace id is worse than
+  its absence.
+- **Wire change:** no.

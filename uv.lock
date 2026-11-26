@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -8,6 +8,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "events-service",
     "orders-quickstart",
     "snodra-conformance-service",
     "snodra-messaging",
@@ -384,6 +385,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/39/a4/5180d9afc57e8fca0
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/91/30151a39f7570f448ed84529390628a651d7f27c87d73c9b887f8189695e/docutils-0.23-py3-none-any.whl", hash = "sha256:25d013af9bf23bc1c7b2b093dff4208166c53a94786c9e447808335ef1185fea", size = 634701, upload-time = "2026-05-27T17:40:58.442Z" },
 ]
+
+[[package]]
+name = "events-service"
+version = "0.0.0"
+source = { editable = "examples/events-service" }
+dependencies = [
+    { name = "snodra-messaging" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "snodra-messaging", editable = "packages/snodra-messaging" }]
 
 [[package]]
 name = "grpcio"
@@ -1154,6 +1166,7 @@ source = { virtual = "." }
 
 [package.dev-dependencies]
 dev = [
+    { name = "events-service" },
     { name = "mypy" },
     { name = "opentelemetry-sdk" },
     { name = "orders-quickstart" },
@@ -1176,6 +1189,7 @@ gen = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "events-service", editable = "examples/events-service" },
     { name = "mypy", specifier = "==2.4.1" },
     { name = "opentelemetry-sdk", specifier = "==1.45.2" },
     { name = "orders-quickstart", editable = "examples/quickstart" },

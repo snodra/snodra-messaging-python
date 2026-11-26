@@ -34,3 +34,8 @@ def test_default_timings_of_several_hubs() -> None:
     t = DEFAULT_TIMINGS
     assert (t.status_interval, t.dns_refresh) == (5.0, 30.0)
     assert (t.dns_drain_limit, t.max_unwritten_moves) == (65.0, 8)
+
+
+def test_the_event_timings() -> None:
+    t = DEFAULT_TIMINGS
+    assert (t.event_handler_backoff, t.event_resubscribe_min, t.event_resubscribe_max) == (1.0, 1.0, 30.0)

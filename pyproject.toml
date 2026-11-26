@@ -16,6 +16,7 @@ snodra-messaging = { workspace = true }
 snodra-conformance-service = { workspace = true }
 snodra-messaging-observability = { workspace = true }
 orders-quickstart = { workspace = true }
+events-service = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -31,6 +32,7 @@ dev = [
     "snodra-conformance-service",
     "snodra-messaging-observability",
     "orders-quickstart",
+    "events-service",
     "opentelemetry-sdk==1.45.2",
 ]
 gen = ["grpcio-tools==1.85.4"]

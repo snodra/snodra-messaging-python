@@ -23,11 +23,14 @@ from snodra._errors import (
     SnodraError,
     Unauthenticated,
 )
+from snodra._eventstore import EventHeaders
+from snodra._eventstore_memory import MemoryEventStore
 from snodra._gather import Gathered, Part
 from snodra._identity import Caller, Guard, authenticated, caller_matches, role
 from snodra._messages import message_type
 from snodra._retry import RetryPolicy
 from snodra._settings import Settings
+from snodra._store_memory import MemoryStore
 from snodra._stream_client import Stream
 from snodra._subscribe import Subscription
 from snodra._subscription_handler import Updates
@@ -46,6 +49,7 @@ __all__ = [
     "ConfigurationError",
     "DecodeError",
     "ErrorCode",
+    "EventHeaders",
     "Gathered",
     "Gauges",
     "Guard",
@@ -55,6 +59,8 @@ __all__ = [
     "InvalidRequest",
     "JsonCodec",
     "LostParts",
+    "MemoryEventStore",
+    "MemoryStore",
     "MessageInfo",
     "NeverSent",
     "NoTelemetry",

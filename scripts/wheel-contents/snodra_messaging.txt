@@ -3,10 +3,12 @@ snodra/_app.py
 snodra/_backoff.py
 snodra/_codec.py
 snodra/_connection.py
+snodra/_consumer.py
 snodra/_context.py
 snodra/_credentials.py
 snodra/_dispatch.py
 snodra/_errors.py
+snodra/_events.py
 snodra/_eventstore.py
 snodra/_eventstore_memory.py
 snodra/_gather.py
@@ -17,6 +19,7 @@ snodra/_jwt.py
 snodra/_local.py
 snodra/_messages.py
 snodra/_meta.py
+snodra/_outbox.py
 snodra/_permits.py
 snodra/_pool.py
 snodra/_propagation.py

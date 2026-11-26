@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from snodra._credentials import ClientCredentials, Credential, Token, TokenFile, is_token_source
 from snodra._errors import ConfigurationError
 from snodra._ids import new_id
+from snodra._outbox import OUTBOX_SEND_TIMEOUT
 from snodra._retry import RetryPolicy
 from snodra._targets import parse_targets
 from snodra._tls import ClientCertificate, TLSConfig
@@ -81,6 +82,24 @@ class Settings:
     status_interval: float = 5.0
     """How often every hub stream gets an ``InstanceStatus`` (``SNODRA_SERVER_STATUS_INTERVAL_MS``, at least 1 ms); an
     extra report goes out on every stream whenever the acknowledged hubs change."""
+    events_source: str = "snodra.events"
+    """The event store's source the service publishes its events to and its processors read
+    (``SNODRA_EVENTS_SOURCE``)."""
+    outbox_enabled: bool = True
+    """Every instance runs the outbox relay (``SNODRA_OUTBOX_ENABLED``). Turning it off on all but one keeps the order
+    per key of what one instance publishes."""
+    outbox_poll_interval: float = 0.2
+    """The longest wait between two claims of the outbox (``SNODRA_OUTBOX_POLL_INTERVAL_MS``)."""
+    outbox_batch_size: int = 100
+    """The most outbox entries one claim returns (``SNODRA_OUTBOX_BATCH_SIZE``)."""
+    outbox_max_attempts: int = 10
+    """Sends of one outbox entry in all before it is given up (``SNODRA_OUTBOX_MAX_ATTEMPTS``)."""
+    outbox_lease: float = 120.0
+    """How long a claimed outbox batch stays one relay's (``SNODRA_OUTBOX_LEASE_MS``); longer than a send (40 s)."""
+    consumer_enabled: bool = True
+    """Every instance reads its event processors' subscriptions (``SNODRA_CONSUMER_ENABLED``)."""
+    consumer_max_attempts: int = 5
+    """Event handler invocations per delivered record in all (``SNODRA_CONSUMER_MAX_ATTEMPTS``)."""
     credentials: Credential | None = None
     """The instance's credential towards the hubs, for a hub whose access control asks for one: a :class:`Token`
     (``SNODRA_SERVER_TOKEN``), a :class:`TokenFile` (``SNODRA_SERVER_TOKEN_FILE``, which wins over the token), a JWT
@@ -154,6 +173,7 @@ class Settings:
                 "status_interval (SNODRA_SERVER_STATUS_INTERVAL_MS) must be a positive number of seconds, "
                 f"got {status!r}"
             )
+        self._check_events()
         self._check_identity()
         self._check_credentials()
         for name, variable in (
@@ -162,6 +182,38 @@ class Settings:
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigurationError(f"{name} ({variable}) must be True or False, got {getattr(self, name)!r}")
+
+    def _check_events(self) -> None:
+        source = self.events_source
+        if not isinstance(source, str) or not source.strip():
+            raise ConfigurationError("events_source (SNODRA_EVENTS_SOURCE) must not be empty")
+        object.__setattr__(self, "events_source", source.strip())
+        for name, variable in (
+            ("outbox_enabled", "SNODRA_OUTBOX_ENABLED"),
+            ("consumer_enabled", "SNODRA_CONSUMER_ENABLED"),
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ConfigurationError(f"{name} ({variable}) must be True or False, got {getattr(self, name)!r}")
+        for name, variable in (
+            ("outbox_batch_size", "SNODRA_OUTBOX_BATCH_SIZE"),
+            ("outbox_max_attempts", "SNODRA_OUTBOX_MAX_ATTEMPTS"),
+            ("consumer_max_attempts", "SNODRA_CONSUMER_MAX_ATTEMPTS"),
+        ):
+            value = getattr(self, name)
+            if not _is_int(value) or value < 1:
+                raise ConfigurationError(f"{name} ({variable}) must be a positive integer, got {value!r}")
+        for name, variable in (
+            ("outbox_poll_interval", "SNODRA_OUTBOX_POLL_INTERVAL_MS"),
+            ("outbox_lease", "SNODRA_OUTBOX_LEASE_MS"),
+        ):
+            value = getattr(self, name)
+            if not _is_number(value) or not math.isfinite(value) or value <= 0:
+                raise ConfigurationError(f"{name} ({variable}) must be a positive number of seconds, got {value!r}")
+        if self.outbox_lease <= OUTBOX_SEND_TIMEOUT:
+            raise ConfigurationError(
+                f"outbox_lease (SNODRA_OUTBOX_LEASE_MS) must be longer than a send ({OUTBOX_SEND_TIMEOUT:g} s), "
+                f"got {self.outbox_lease:g} s"
+            )
 
     def _check_identity(self) -> None:
         url, issuer = self.jwks_url, self.issuer
@@ -299,6 +351,22 @@ class Settings:
             values["stream_credit_timeout"] = _env_positive_int("SNODRA_SERVER_STREAM_CREDIT_TIMEOUT_MS", v) / 1000
         if (v := get("SNODRA_SERVER_STATUS_INTERVAL_MS")) is not None:
             values["status_interval"] = _env_positive_int("SNODRA_SERVER_STATUS_INTERVAL_MS", v) / 1000
+        if (v := get("SNODRA_EVENTS_SOURCE")) is not None:
+            values["events_source"] = v
+        if (v := get("SNODRA_OUTBOX_ENABLED")) is not None:
+            values["outbox_enabled"] = _env_bool("SNODRA_OUTBOX_ENABLED", v)
+        if (v := get("SNODRA_OUTBOX_POLL_INTERVAL_MS")) is not None:
+            values["outbox_poll_interval"] = _env_positive_int("SNODRA_OUTBOX_POLL_INTERVAL_MS", v) / 1000
+        if (v := get("SNODRA_OUTBOX_BATCH_SIZE")) is not None:
+            values["outbox_batch_size"] = _env_positive_int("SNODRA_OUTBOX_BATCH_SIZE", v)
+        if (v := get("SNODRA_OUTBOX_MAX_ATTEMPTS")) is not None:
+            values["outbox_max_attempts"] = _env_positive_int("SNODRA_OUTBOX_MAX_ATTEMPTS", v)
+        if (v := get("SNODRA_OUTBOX_LEASE_MS")) is not None:
+            values["outbox_lease"] = _env_positive_int("SNODRA_OUTBOX_LEASE_MS", v) / 1000
+        if (v := get("SNODRA_CONSUMER_ENABLED")) is not None:
+            values["consumer_enabled"] = _env_bool("SNODRA_CONSUMER_ENABLED", v)
+        if (v := get("SNODRA_CONSUMER_MAX_ATTEMPTS")) is not None:
+            values["consumer_max_attempts"] = _env_positive_int("SNODRA_CONSUMER_MAX_ATTEMPTS", v)
         grant = _env_credentials(get, values)
         _env_tls(get, values)
         values |= overrides
