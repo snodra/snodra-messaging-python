@@ -52,6 +52,7 @@ def new_app(
     codec: Codec | None = None,
     telemetry: Telemetry | None = None,
     _timings: Timings | None = None,
+    _clock: Callable[[], int] | None = None,
     **settings: Any,
 ) -> App:
     """An app on hubs, not started, with the test defaults (``orders-service``, instance ``i-1``, reconnect backoff
@@ -71,6 +72,7 @@ def new_app(
         codec=codec,
         telemetry=telemetry,
         _timings=SCALED if _timings is None else _timings,
+        _clock=_clock,
     )
     _apps.append(app)
     return app
@@ -84,10 +86,19 @@ async def start_app(
     event_store: Any = None,
     telemetry: Telemetry | None = None,
     _timings: Timings | None = None,
+    _clock: Callable[[], int] | None = None,
     **settings: Any,
 ) -> App:
     """:func:`new_app`, started."""
-    app = new_app(hubs, store=store, event_store=event_store, telemetry=telemetry, _timings=_timings, **settings)
+    app = new_app(
+        hubs,
+        store=store,
+        event_store=event_store,
+        telemetry=telemetry,
+        _timings=_timings,
+        _clock=_clock,
+        **settings,
+    )
     await app.start()
     return app
 

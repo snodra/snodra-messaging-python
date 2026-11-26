@@ -7,7 +7,8 @@ would collide with the event store's names, so they are exported as :class:`Mess
 :class:`MessageStoreFailed` and :class:`MessageStoreUnsupported`. ``Tx`` is the message store's opaque transaction
 handle (the type of its ``tx=`` parameters), and ``TransactionScope`` is what ``store.transaction()`` returns.
 ``bind_transaction``, ``current_transaction`` and ``unbind_transaction`` are what an add-on's own transaction context
-manager uses to bind the transaction the core sees.
+manager uses to bind the transaction the core sees. ``StoreLifecycle`` is the optional store side that
+:meth:`App.start` drives: the application clock, the schema and the store's background work.
 
 :class:`Subscription` is the level-1 subscription query (a caller's side); the event store's subscription is
 :class:`EventStoreSubscription`.
@@ -115,6 +116,7 @@ from snodra._store import (
     SagaMarkerStore,
     SagaRepository,
     SagaStores,
+    StoreLifecycle,
     Transactions,
     TransactionScope,
     Tx,
@@ -237,6 +239,7 @@ __all__ = [
     "Settings",
     "SnodraError",
     "StoreError",
+    "StoreLifecycle",
     "Stream",
     "SubscribersActive",
     "Subscription",

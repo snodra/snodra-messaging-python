@@ -231,11 +231,13 @@ def outbox_entry(
     seq: int,
     codec: Codec,
     telemetry: Telemetry | None = None,
+    created_at_ms: int | None = None,
 ) -> OutboxEntry:
     """The outbox entry of an event published now, with the headers of :func:`event_headers`.
 
     The payload is the event encoded by ``codec`` and checked by :func:`snodra._store.check_outbox_payload` before an
-    add-on sees it: what every store refuses is refused here, naming the event.
+    add-on sees it: what every store refuses is refused here, naming the event. ``created_at_ms`` is the application's
+    clock (the wall clock when none is given); it is the event's ``timestamp`` header.
     """
     if key is not None and not isinstance(key, str):
         raise TypeError(f"an event key is text or None, got {key!r}")
@@ -248,7 +250,7 @@ def outbox_entry(
         key=key,
         headers=event_headers(telemetry=telemetry),
         payload=payload,
-        created_at_ms=now_ms(),
+        created_at_ms=now_ms() if created_at_ms is None else created_at_ms,
         seq=seq,
     )
 

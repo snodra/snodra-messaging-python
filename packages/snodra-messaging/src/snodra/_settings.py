@@ -100,6 +100,9 @@ class Settings:
     """Every instance reads its event processors' subscriptions (``SNODRA_CONSUMER_ENABLED``)."""
     consumer_max_attempts: int = 5
     """Event handler invocations per delivered record in all (``SNODRA_CONSUMER_MAX_ATTEMPTS``)."""
+    store_init_schema: bool = True
+    """The app prepares the message store's schema at start (``SNODRA_STORE_INIT_SCHEMA``, true by default); when
+    false it checks the schema the service applies itself instead."""
     credentials: Credential | None = None
     """The instance's credential towards the hubs, for a hub whose access control asks for one: a :class:`Token`
     (``SNODRA_SERVER_TOKEN``), a :class:`TokenFile` (``SNODRA_SERVER_TOKEN_FILE``, which wins over the token), a JWT
@@ -191,6 +194,7 @@ class Settings:
         for name, variable in (
             ("outbox_enabled", "SNODRA_OUTBOX_ENABLED"),
             ("consumer_enabled", "SNODRA_CONSUMER_ENABLED"),
+            ("store_init_schema", "SNODRA_STORE_INIT_SCHEMA"),
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigurationError(f"{name} ({variable}) must be True or False, got {getattr(self, name)!r}")
@@ -367,6 +371,8 @@ class Settings:
             values["consumer_enabled"] = _env_bool("SNODRA_CONSUMER_ENABLED", v)
         if (v := get("SNODRA_CONSUMER_MAX_ATTEMPTS")) is not None:
             values["consumer_max_attempts"] = _env_positive_int("SNODRA_CONSUMER_MAX_ATTEMPTS", v)
+        if (v := get("SNODRA_STORE_INIT_SCHEMA")) is not None:
+            values["store_init_schema"] = _env_bool("SNODRA_STORE_INIT_SCHEMA", v)
         grant = _env_credentials(get, values)
         _env_tls(get, values)
         values |= overrides

@@ -15,7 +15,7 @@ from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
 from snodra._consumer import EventConsumer
 from snodra._dispatch import Dispatcher
-from snodra._errors import ConfigurationError
+from snodra._errors import ConfigurationError, SnodraError
 from snodra._events import (
     PUBLISH_NEEDS_EVENT_STORE,
     PUBLISH_NEEDS_STORE,
@@ -33,7 +33,7 @@ from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
 from snodra._send import Sender
 from snodra._settings import Settings, hub_targets
-from snodra._store import MessageStore, now_ms
+from snodra._store import MessageStore, StoreLifecycle, now_ms
 from snodra._stream_client import Stream, stream
 from snodra._subscribe import Subscription, subscribe
 from snodra._subscription_handler import Updates
@@ -72,12 +72,14 @@ class App:
         codec: Codec | None = None,
         telemetry: Telemetry | None = None,
         _timings: Timings | None = None,
+        _clock: Callable[[], int] | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
         self._event_store = event_store
         self._events = EventRegistry()
-        self._outbox_seq = itertools.count((now_ms() << 20) + 1)
+        self._clock: Callable[[], int] = now_ms if _clock is None else _clock
+        self._outbox_seq = itertools.count((self._clock() << 20) + 1)
         self._event_tasks: list[asyncio.Task[None]] = []
         self._telemetry: Telemetry = NoTelemetry() if telemetry is None else _GuardedTelemetry(telemetry)
         # The status period is the app's own setting: the shipped timings as given, with it applied.
@@ -353,6 +355,7 @@ class App:
             seq=next(self._outbox_seq),
             codec=self._codec,
             telemetry=self._telemetry,
+            created_at_ms=self._clock(),
         )
         await self._store.outbox.append(entry)
 
@@ -598,6 +601,7 @@ class App:
         self._registry.close()
         self._events.close()
         self._check_event_startup()
+        await self._prepare_store()
         self._dispatcher.subscriptions.bind(asyncio.get_running_loop())
         registry = self._registry
         self._pool.declare(
@@ -611,6 +615,39 @@ class App:
             self._telemetry.observe_gauges(self._read_gauges)
         self._pool.start()
         self._start_events()
+        self._start_store_background()
+
+    async def _prepare_store(self) -> None:
+        """Hands the message store its clock, then prepares or checks its schema when it implements the lifecycle."""
+        if self._store is None or not isinstance(self._store, StoreLifecycle):
+            return
+        self._store.use_clock(self._clock)
+        prepare = self._settings.store_init_schema
+        what = "prepare" if prepare else "check"
+        try:
+            if prepare:
+                await self._store.init_schema()
+            else:
+                await self._store.check_schema()
+        except Exception as error:
+            raise SnodraError(f"the message store {self._store.name} could not {what} its schema: {error}") from error
+
+    def _start_store_background(self) -> None:
+        """Starts the message store's own work, when the store implements the lifecycle."""
+        if self._store is None or not isinstance(self._store, StoreLifecycle):
+            return
+        self._event_tasks.append(
+            asyncio.create_task(self._run_store_background(self._store), name="snodra:store-background")
+        )
+
+    async def _run_store_background(self, lifecycle: StoreLifecycle) -> None:
+        """Runs the store's background work; its failure is logged while the app keeps running."""
+        try:
+            await lifecycle.background()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.error("the message store's background work failed", exc_info=True)
 
     def _check_event_startup(self) -> None:
         """Refuses event handlers without the stores they need, naming the missing add-on.
@@ -649,6 +686,7 @@ class App:
                     max_attempts=self._settings.outbox_max_attempts,
                     lease=self._settings.outbox_lease,
                 ),
+                clock=self._clock,
             )
             self._event_tasks.append(relay.start())
         if self._settings.consumer_enabled:
@@ -727,14 +765,15 @@ class App:
         every live stream (its ack awaited for at most 1 s), then a clean ``ReplyEnd`` on every subscription target this
         instance serves (so their subscribers hear them end before the stream is gone), then the handlers in flight
         drained (awaited for at most 5 s, then cancelled and never awaited again), then each stream half-closed and its
-        end awaited (at most 2 s). Before the hubs are left, the event phase cancels the outbox relay and the consumers
-        and awaits them for at most ``timeout``; a task that ignores its cancellation is left behind with a warning.
-        That bound is the event phase's own, in addition to the hub leave's, so the call can spend up to about twice
-        ``timeout`` before the connection close phases. A handler still running when ``timeout`` is reached is cancelled
-        and left behind: one warning names it. A second call returns at once. The handlers being drained can still send
-        commands and queries, and a stream lost meanwhile is opened again with no types (no new work arrives on it);
-        once the drain is over nothing is sent: a call fails as :class:`NeverSent`, and one still waiting for its answer
-        as :class:`OutcomeUnknown` ("hub connection stopped").
+        end awaited (at most 2 s). After that order — the empty ``Register``, the subscription ends, the handler drain
+        and the stream closes — the event phase cancels the outbox relay, the consumers and the message store's
+        background work and awaits them for at most ``timeout``; a task that ignores its cancellation is left behind
+        with a warning. That bound is the event phase's own, in addition to the hub leave's, so the call can spend up
+        to about twice ``timeout`` before the connection close phases. A handler still running when ``timeout`` is
+        reached is cancelled and left behind: one warning names it. A second call returns at once. The handlers being
+        drained can still send commands and queries, and a stream lost meanwhile is opened again with no types (no new
+        work arrives on it); once the drain is over nothing is sent: a call fails as :class:`NeverSent`, and one still
+        waiting for its answer as :class:`OutcomeUnknown` ("hub connection stopped").
 
         The unexpected error that crashed a connection (a library bug, logged at error level when it happened) is
         raised here once everything is stopped, unless another exception or a cancellation is already propagating
@@ -748,16 +787,21 @@ class App:
         self._stop.set()
         propagating = False
         try:
-            await self._stop_events(budget)
-            if self._started:
-                try:
-                    async with asyncio.timeout(budget):
-                        await self._pool.leave(
-                            drain=lambda: self._dispatcher.drain(self._timings.handler_drain),
-                            end_subscriptions=self._dispatcher.end_subscriptions,
-                        )
-                except TimeoutError:
-                    log.warning("Leaving the hubs took longer than %.2f s: the streams are cut", budget)
+            try:
+                if self._started:
+                    try:
+                        async with asyncio.timeout(budget):
+                            await self._pool.leave(
+                                drain=lambda: self._dispatcher.drain(self._timings.handler_drain),
+                                end_subscriptions=self._dispatcher.end_subscriptions,
+                            )
+                    except TimeoutError:
+                        log.warning("Leaving the hubs took longer than %.2f s: the streams are cut", budget)
+            finally:
+                # After the empty Register, the subscription ends, the handler drain and the stream closes: the event
+                # tasks and the store's background work run through the hub's own steps (a drained handler may still
+                # publish), and stop last within the shutdown budget.
+                await self._stop_events(budget)
         except BaseException:
             propagating = True
             raise

@@ -19,7 +19,8 @@ The ports and their values are re-exported from :mod:`snodra` for add-ons: impor
 private module. The message store's base ``StoreError``, ``Failed`` and ``Unsupported`` are exported there as
 ``MessageStoreError``, ``MessageStoreFailed`` and ``MessageStoreUnsupported``, since the event store owns the shorter
 names. ``Tx`` is the opaque transaction handle the port's ``tx=`` parameter takes; ``TransactionScope`` is the context
-manager behind :meth:`MessageStore.transaction`.
+manager behind :meth:`MessageStore.transaction`. :class:`StoreLifecycle` is the optional side of a store that
+:meth:`snodra.App.start` drives: the application's clock, its schema preparation or check, and its background work.
 
 See https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/.
 """
@@ -36,7 +37,7 @@ from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final, Never, Protocol
+from typing import Final, Never, Protocol, runtime_checkable
 
 from snodra._errors import SnodraError
 from snodra._eventstore import ProcessedMarker as ProcessedMarker
@@ -1100,3 +1101,38 @@ class MessageStore(Transactions, Protocol):
 
     @property
     def sagas(self) -> SagaStores: ...
+
+
+@runtime_checkable
+class StoreLifecycle(Protocol):
+    """What a message store may implement besides :class:`MessageStore`: the clock, its schema and its background work.
+
+    An add-on that implements it is driven by :meth:`snodra.App.start`, which hands it the application's clock
+    (:meth:`use_clock`), prepares its schema (:meth:`init_schema`) or checks a schema the service applies itself
+    (:meth:`check_schema`, when ``Settings.store_init_schema`` is false), and then starts :meth:`background` in a
+    ``snodra:store-background`` task until the shutdown. A store that does not implement it is used as it is; the six
+    store ports stay as they are, so a third-party add-on compiles against :class:`MessageStore` alone.
+
+    A failing :meth:`init_schema` or :meth:`check_schema` fails :meth:`snodra.App.start`, naming the store; an error
+    from :meth:`background` while the app runs is logged at error level and does not stop the app.
+    """
+
+    def use_clock(self, clock: Callable[[], int]) -> None:
+        """The application's clock, epoch milliseconds: what the store stamps the times it sets itself with (an outbox
+        entry's sending, a claim's lease). The clock must not call the store."""
+        ...
+
+    async def init_schema(self) -> None:
+        """Prepares what the store needs in its database, idempotently: indexes and their retentions, tables, or
+        nothing. It runs when the store is configured with schema initialization on (the default)."""
+        ...
+
+    async def check_schema(self) -> None:
+        """Fails unless the database has what the store needs, for a service that applies its own schema; it runs
+        instead of :meth:`init_schema` when ``Settings.store_init_schema`` is false."""
+        ...
+
+    async def background(self) -> None:
+        """Runs what the store does on its own while the app runs (the retention purge, for example), until the task
+        is cancelled at shutdown. A store with nothing to run may return at once or wait for the cancellation."""
+        ...

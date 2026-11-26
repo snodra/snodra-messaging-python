@@ -85,6 +85,7 @@ PUBLIC_NAMES = (
     "SagaMarkerStore",
     "SagaRepository",
     "SagaStores",
+    "StoreLifecycle",
     "TransactionScope",
     "Transactions",
     "Tx",
@@ -304,6 +305,22 @@ class _StubTransactionManager:
                 snodra.unbind_transaction(token)
 
 
+class _StubLifecycle:
+    """A typed ``StoreLifecycle``, checked by mypy."""
+
+    def use_clock(self, clock: Callable[[], int]) -> None:
+        raise NotImplementedError
+
+    async def init_schema(self) -> None:
+        raise NotImplementedError
+
+    async def check_schema(self) -> None:
+        raise NotImplementedError
+
+    async def background(self) -> None:
+        raise NotImplementedError
+
+
 def _accept_event_store(store: snodra.EventStore) -> None:
     pass
 
@@ -318,8 +335,10 @@ def test_a_typed_stub_add_on_implements_the_ports() -> None:
     _accept_message_store(_StubMessageStore())
     subscription: snodra.EventStoreSubscription = _StubEventSubscription()
     admin: snodra.EventStoreAdmin = _StubEventAdmin()
+    lifecycle: snodra.StoreLifecycle = _StubLifecycle()
     assert subscription is not None
     assert admin is not None
+    assert lifecycle is not None
 
 
 async def test_the_public_transaction_helpers_bind_and_unbind() -> None:
