@@ -1,0 +1,6 @@
+snodra_observability/__init__.py
+snodra_observability/py.typed
+snodra_messaging_observability-X.Y.Z.dist-info/METADATA
+snodra_messaging_observability-X.Y.Z.dist-info/WHEEL
+snodra_messaging_observability-X.Y.Z.dist-info/licenses/LICENSE
+snodra_messaging_observability-X.Y.Z.dist-info/RECORD
