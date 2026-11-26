@@ -44,6 +44,7 @@ from snodra._eventstore import (
     Latest,
     OutgoingEvent,
     Positions,
+    Rejected,
     ReplayRange,
     ResetTarget,
     Revoked,
@@ -228,6 +229,9 @@ class MemoryEventStore:
 
     async def publish(self, event: OutgoingEvent) -> None:
         """Appends at once: a keyed event to its key's segment, an unkeyed one to the next segment in turn."""
+        # TODO(spec-gap): SG-18
+        if not event.source:
+            raise Rejected("an event needs a source")
         shared = self._shared
         if event.key is None:
             index = shared.spread
@@ -244,6 +248,9 @@ class MemoryEventStore:
 
     async def subscribe(self, spec: SubscriptionSpec) -> EventStoreSubscription:
         """Joins at once as one more instance of ``spec.name``."""
+        # TODO(spec-gap): SG-18
+        if not spec.name or not spec.source:
+            raise Invalid("a subscription needs a name and a source")
         shared = self._shared
         shared.next_member += 1
         member = shared.next_member
@@ -351,6 +358,9 @@ class _MemorySubscription:
     async def ack(self, segment: str, position: str) -> None:
         index = self._shared.segment(segment)
         at = _position(position)
+        head = self._shared.head(self._spec.source, index)
+        if at >= head:
+            raise Invalid(f"segment {index} holds no event at {at} (head {head})")
         group = self._shared.groups.get(self._spec)
         if group is None or index not in self._cursors:
             return  # given up: its next holder starts from what was acknowledged before
@@ -361,6 +371,9 @@ class _MemorySubscription:
     async def redeliver(self, segment: str, position: str) -> None:
         index = self._shared.segment(segment)
         at = _position(position)
+        head = self._shared.head(self._spec.source, index)
+        if at >= head:
+            raise Invalid(f"segment {index} holds no event at {at} (head {head})")
         cursor = self._cursors.get(index)
         # TODO(spec-gap): SG-14
         if cursor is None or at >= cursor:

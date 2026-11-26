@@ -215,13 +215,17 @@ library does there. Where an entry is settled, its behaviour is this library's r
   segment's later ones out again without leaving the subscription". It does not say what a store does with a position
   that is not one the subscription has delivered from a segment it holds: a position ahead of its next one, or a
   delivery of a segment that was revoked since.
-- **Other Snodra libraries:** they ignore such a call: the segment's new holder puts its own unacknowledged events out
-  again from the committed position, and a live subscription keeps reading from where it was.
-- **This library:** `snodra/_eventstore_memory.py` (`_MemorySubscription.redeliver`). The segment and the position are
-  still validated (an unknown segment or a non-canonical position is `Invalid`), but the cursor moves only back: a
-  position at or after the next one, or a segment the subscription no longer holds, changes nothing.
-- **Question:** open: should a redelivery of a position the subscription does not hold be an error
-  (`Invalid`/`NotOwner`), or a no-op as here?
+- **Other Snodra libraries:** they differ. One validates the position against the segment's head: a position at or
+  past the head is `Invalid`, while a position still inside the segment moves the cursor to it even when it is ahead
+  of the next one, so the events between are skipped; a segment the subscription no longer holds is ignored. Another
+  checks no head and moves the cursor only back: a position at or after the next one, or a segment no longer held,
+  changes nothing.
+- **This library:** `snodra/_eventstore_memory.py` (`_MemorySubscription.redeliver`). The segment, the canonical
+  position and the head are validated (an unknown segment or a position at or past the head is `Invalid`), and then
+  the cursor moves only back: a position ahead of the next one, or a segment the subscription no longer holds, changes
+  nothing. An acknowledgement is validated the same way.
+- **Question:** open: when the segment is no longer held, should a redelivery be an error (`Invalid`/`NotOwner`) or a
+  no-op as here; and should a position ahead of the next one move the cursor forward or be a no-op?
 
 ### SG-15: the append times of the in-memory event store when the clock steps back
 
@@ -267,4 +271,18 @@ library does there. Where an entry is settled, its behaviour is this library's r
   after it wrote it conflicts at its commit. Pinned by `test_two_live_writers_of_one_record_conflict`.
 - **Question:** open: should the specification settle that the second write is refused at once, or leave the moment to
   the store as the kit does?
+- **Wire change:** no.
+
+### SG-18: an event or a subscription without a source or a name
+
+- **Specification:** `event-store-add-ons.md` says `publish(event)` appends an event to its source and `subscribe(name,
+  source)` joins a subscription on a source; it does not say whether an empty source, name or both are valid, nor what
+  a store does with them.
+- **Other Snodra libraries:** they differ: one accepts an empty source or name as any other; another refuses a publish
+  without a source and a subscription without a name and a source.
+- **This library:** `snodra/_eventstore_memory.py` (`MemoryEventStore.publish`, `subscribe`). The in-memory store
+  refuses a publish with an empty source with `Rejected("an event needs a source")` and a subscription with an empty
+  name or source with `Invalid("a subscription needs a name and a source")`; nothing is appended or joined.
+- **Question:** open: should the specification refuse empty sources and names everywhere, or leave the empty string a
+  valid name?
 - **Wire change:** no.

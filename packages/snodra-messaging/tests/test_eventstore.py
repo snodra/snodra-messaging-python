@@ -19,6 +19,7 @@ from snodra._eventstore import (
     Latest,
     OutgoingEvent,
     Positions,
+    Rejected,
     ReplayRange,
     Revoked,
     SegmentStatus,
@@ -257,6 +258,75 @@ async def test_redeliver_does_not_move_a_position_forward() -> None:
         assert (await next_delivery(subscription)).position == "1"
     finally:
         await subscription.close()
+
+
+async def test_an_acknowledgement_at_the_head_is_refused() -> None:
+    store = MemoryEventStore(segments=1)
+    for index in range(3):
+        await store.publish(outgoing(f"event-{index}"))
+
+    subscription = await store.subscribe(SPEC)
+    try:
+        assert await subscription.next() == Assigned(("0",))
+        with pytest.raises(Invalid, match=r"segment 0 holds no event at 3 \(head 3\)"):
+            await subscription.ack("0", "3")
+        assert (await next_delivery(subscription)).position == "0"
+    finally:
+        await subscription.close()
+
+
+async def test_a_redelivery_at_the_head_is_refused() -> None:
+    store = MemoryEventStore(segments=1)
+    for index in range(3):
+        await store.publish(outgoing(f"event-{index}"))
+
+    subscription = await store.subscribe(SPEC)
+    try:
+        assert await subscription.next() == Assigned(("0",))
+        with pytest.raises(Invalid, match=r"segment 0 holds no event at 3 \(head 3\)"):
+            await subscription.redeliver("0", "3")
+        assert (await next_delivery(subscription)).position == "0"
+    finally:
+        await subscription.close()
+
+
+async def test_a_position_at_the_head_of_a_revoked_segment_is_still_refused() -> None:
+    store = MemoryEventStore(segments=2)
+    await store.publish(outgoing("event", key="order-1"))  # segment 1
+    spec = SubscriptionSpec(name="conformance.revoked-head", source="orders.events")
+
+    first = await store.subscribe(spec)
+    second = None
+    try:
+        assert await first.next() == Assigned(("0", "1"))
+        second = await store.subscribe(spec)
+        while True:
+            event = await asyncio.wait_for(first.next(), 5.0)
+            if isinstance(event, Revoked) and "1" in event.segments:
+                break
+        for call in (first.ack, first.redeliver):
+            with pytest.raises(Invalid, match=r"segment 1 holds no event at 1 \(head 1\)"):
+                await call("1", "1")
+    finally:
+        await first.close()
+        if second is not None:
+            await second.close()
+
+
+async def test_a_publish_without_a_source_is_rejected() -> None:
+    store = MemoryEventStore(segments=1)
+    with pytest.raises(Rejected, match="an event needs a source"):
+        await store.publish(outgoing("event", source=""))
+    assert [(replay_range.segment, replay_range.start) for replay_range in await store.admin(SPEC).plan(Latest())] == [
+        ("0", "0")
+    ]
+
+
+async def test_a_subscription_without_a_name_or_source_is_invalid() -> None:
+    store = MemoryEventStore()
+    for spec in (SubscriptionSpec("", "orders.events"), SubscriptionSpec("conformance", "")):
+        with pytest.raises(Invalid, match="a subscription needs a name and a source"):
+            await store.subscribe(spec)
 
 
 async def test_redeliver_of_a_revoked_segment_is_a_no_op() -> None:
