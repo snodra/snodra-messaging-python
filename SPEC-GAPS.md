@@ -587,7 +587,7 @@ library does there. Where an entry is settled, its behaviour is this library's r
   with another instance whose retention is whole seconds fail for a value MongoDB never sees.
 - **Wire change:** no.
 
-### SG-36: the Python stream client's high-level classes cannot carry the wire rules
+### SG-36: the Python stream client's high-level producer and consumer cannot carry the wire rules
 
 - **Specification:** [RabbitMQ Streams wire rules](https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/#rabbitmq-streams-wire-rules)
   says a subscription's consumer carries `snodra-member=<a random id per subscription instance>`, that a subscription
@@ -601,16 +601,18 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **This library:** `snodra_rabbitmq/rabbitmq.py` pins `rstream==1.1.1` and uses its low-level
   `rstream.client.Client` with the `rstream.schema` frames and `rstream.amqp.amqp_decoder`; it does not use
   `rstream.SuperStreamProducer` or `rstream.SuperStreamConsumer`. The spike (`CLIENT-SPIKE.md`) found that the
-  high-level producer hashes a routing key as UTF-16 (`rstream/superstream.py:88`), not the wire rule's UTF-8; that
-  the high-level consumer's update listener passes `ConsumerOffsetSpecification` to the frame encoder
-  (`rstream/consumer.py:559`) where only `rstream.schema.OffsetSpecification` encodes; and that its consumer connects
-  to a random replica (`rstream/consumer.py:201`), not the leader. The low-level client sets all four subscribe
-  properties, answers updates with a stored offset, publishes one confirmed message per event and reads offsets on the
-  leader. `test_a_second_instance_shares_the_processor_and_the_member_is_visible` and
+  high-level producer routes a key with UTF-16 bytes and a 128-bit `mmh3.hash_bytes` read little-endian
+  (`rstream/superstream.py:88`), not the wire rule's x86_32 of the UTF-8 bytes, and that the high-level consumer
+  connects to a random replica (`rstream/consumer.py:201`), not the leader. The consumer update reply is **not** a
+  blocker: `rstream.OffsetSpecification` is public (`rstream/__init__.py:44`) and encodes, unlike the different
+  `rstream.ConsumerOffsetSpecification` constant. The low-level client sets all four subscribe properties, answers
+  updates with a stored offset, publishes one confirmed message per event and reads offsets on the leader.
+  `test_a_second_instance_shares_the_processor_and_the_member_is_visible` and
   `test_the_stored_offset_is_the_next_one_and_a_new_subscription_resumes` pin those on a real broker.
 - **Question:** should the specification name the low-level capabilities a Python client must expose (so another
-  client can replace `rstream`), or require the client's high-level API to add custom subscribe properties, a leader
-  connection and the stored-offset reply?
+  client can replace `rstream`), or require the client's high-level API to add leader selection and the wire rules'
+  routing? The wire rules' statement that a high-level API can neither set `snodra-member` nor answer a consumer
+  update with a stored offset does not hold for `rstream`.
 
 ### SG-37: a management-API consumer without `snodra-member`
 
@@ -674,7 +676,8 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **This library:** the core's event-store port has no `open` step, so `RabbitMQEventStore` declares `replay` from
   the configured management URL when it is constructed; `RabbitMQAdmin.members` asks `/api/overview` and fails with
   `Failed` when `disable_stats` is true, so every reset asks the consumer list and never reads "nobody reads" from
-  untrustworthy statistics. A management API that is down fails `members`, `plan` and `apply`, not the constructor.
+  untrustworthy statistics. A management API that is down (or has its metrics off) fails `members` and `apply`;
+  `plan` reads only the streams and does not ask it. The constructor does not fail.
 - **Question:** should disabled metrics be a startup failure or a store without `replay`, and should the event-store
   port have an explicit open/verify step rather than the constructor's configuration?
 

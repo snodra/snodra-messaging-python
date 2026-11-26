@@ -2,7 +2,7 @@
 
 The stream clients' hash routing is murmur3 x86_32 of the routing key's UTF-8 bytes, seed 104729,
 taken **unsigned** and modulo the partitions in the broker's order. A signed modulo lands
-``order-7`` on partition 1 instead of 3, so the unsigned value is the rule every Snodra add-on
+``order-7`` on partition 5 instead of 3, so the unsigned value is the rule every Snodra add-on
 follows. The routing key is the event's key, or its id when it has none.
 
 A segment is the partition stream's suffix after ``<source>-`` (``snodra.events-3`` is ``3``), and

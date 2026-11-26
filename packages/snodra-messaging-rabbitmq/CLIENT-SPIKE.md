@@ -17,21 +17,26 @@ A client for this add-on must be able to
 
 ## What `rstream` offers
 
-- The high-level `SuperStreamProducer` hashes the routing key as **UTF-16** bytes
-  (`rstream/superstream.py:88-89`), not the wire rule's UTF-8 bytes, so a key would land on another
-  partition than the Kotlin, Rust and Go publishers put it on. Its `SuperStreamConsumer` also has
-  no leader API.
+- The high-level `SuperStreamProducer` routes a key with `bytes(key, "UTF-16")` and
+  `mmh3.hash_bytes` (a **128-bit** murmur3, read little-endian), not the wire rule's x86_32 of the
+  key's UTF-8 bytes (`rstream/superstream.py:88-89`). A key would land on another partition than
+  the Kotlin, Rust and Go publishers put it on, so the high-level producer is not usable.
 - The high-level `Consumer` accepts arbitrary subscribe properties and a
   `consumer_update_listener`, so `snodra-member`, `single-active-consumer`, `name` and
-  `super-stream` do reach the broker. But the listener's returned
-  `ConsumerOffsetSpecification` is passed to `Client.consumer_update` unchanged
-  (`rstream/consumer.py:559`, `:569`), while the encoder requires a `schema.OffsetSpecification`;
-  the reply raises `ValueError: Could not encode frame` and the subscription receives nothing.
-  Returning `rstream.schema.OffsetSpecification` works, but it is a private type of the client.
+  `super-stream` do reach the broker. Its listener must return the **public**
+  `rstream.OffsetSpecification` (exported at the top level); that reply encodes and the
+  subscription starts at the stored offset. Returning the different
+  `rstream.ConsumerOffsetSpecification` constant does not encode, but that is a type choice, not a
+  client limitation.
 - The high-level `Consumer` connects to a **random replica** when the stream has any
   (`rstream/consumer.py:201`), while the wire rules say offset reads, read-backs and a reset's
   stores go to the partition's leader, and both official add-ons subscribe on the leader's
-  connection.
+  connection. This is the second blocker.
+- The low-level `Client` (`rstream/client.py`) exposes `subscribe` with arbitrary properties,
+  `consumer_update`, `query_offset`, `store_offset`, `publish`, `declare_publisher` and
+  `query_leader_and_replicas`; its `schema` module encodes and decodes the stream frames, and
+  `rstream.amqp.amqp_decoder` reads AMQP 1.0 messages. It is the low-level class the wire rules
+  name.
 - The low-level `Client` (`rstream/client.py`) exposes `subscribe` with arbitrary properties,
   `consumer_update`, `query_offset`, `store_offset`, `publish`, `declare_publisher` and
   `query_leader_and_replicas`; its `schema` module encodes and decodes the stream frames, and
@@ -57,10 +62,11 @@ A throwaway script and the add-on's real-broker tests confirmed, on RabbitMQ 4.4
   application property, exactly one data section, and no footer or delivery annotations;
 - the management API is plain HTTP and answers with Basic auth.
 
-The high-level path was rejected for the three reasons above. The add-on therefore pins `rstream`
-and uses its low-level `Client` with its frame and AMQP codecs, the same choice the wire rules
-describe for the official add-ons ("use each client's low-level client class"). The decision and
-the client's constraints are recorded as SG-36 in `SPEC-GAPS.md`.
+The high-level path was rejected for its producer's routing and its consumer's replica choice; the
+consumer-update reply is not a reason. The add-on therefore pins `rstream` and uses its low-level
+`Client` with its frame and AMQP codecs, the same choice the wire rules describe for the official
+add-ons ("use each client's low-level client class"). The decision and the client's constraints
+are recorded as SG-36 in `SPEC-GAPS.md`.
 
 ## Reading a stream's bounds
 

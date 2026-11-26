@@ -7,10 +7,14 @@ pinned RabbitMQ container for the run (see ``conftest.py``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 import pytest
+from rstream.exceptions import OffsetNotFound
 from snodra import (
     Assigned,
     Capability,
@@ -18,28 +22,38 @@ from snodra import (
     Earliest,
     EventHeaders,
     Failed,
+    Latest,
     MemoryStore,
     OutgoingEvent,
+    Positions,
     Rejected,
+    ReplayRange,
     Revoked,
     SubscribersActive,
     SubscriptionSpec,
+    Timestamp,
     Unsupported,
 )
 from snodra.testing import run_event_store_conformance
 from snodra_rabbitmq import RabbitMQEventStore, RabbitMQSubscription, decode_message, partition_for
+from snodra_rabbitmq.rabbitmq import _Layout, _Part
 from support import (
     Broker,
+    bind_partition,
     connect,
+    create_stream,
+    delete_stream,
     delete_super_stream,
     event,
     ids,
     management_consumers,
+    partition_streams,
     raw_stream_messages,
     read_all,
     read_deliveries,
     stream_offset,
     wait_for,
+    wait_for_async,
 )
 
 pytestmark = pytest.mark.timeout(300)
@@ -101,7 +115,7 @@ async def test_a_key_lands_on_the_stream_clients_partition(
 
     found: dict[str, int] = {}
     for partition in range(6):
-        messages = await raw_stream_messages(f"{source}-{partition}", 0, broker=broker, within=2.0)
+        messages = await raw_stream_messages(f"{source}-{partition}", None, broker=broker, within=10.0)
         for message in messages:
             decoded_key, _, _ = decode_message(message)
             if decoded_key is not None:
@@ -179,13 +193,26 @@ async def test_a_second_instance_shares_the_processor_and_the_member_is_visible(
     readers = [Pump(first), Pump(second)]
     try:
         await wait_for("both instances hold a partition", lambda: bool(first.segments()) and bool(second.segments()))
+
+        def managed_members() -> set[str]:
+            found: set[str] = set()
+            for consumer in management_consumers(broker):
+                properties = consumer.get("properties", {})
+                if properties.get("name") != name:
+                    continue
+                member = properties.get("snodra-member")
+                if isinstance(member, str):
+                    found.add(member)
+            return found
+
+        await wait_for(
+            "the management API lists both members",
+            lambda: {first.member, second.member} <= managed_members(),
+        )
         consumers = [
             consumer for consumer in management_consumers(broker) if consumer.get("properties", {}).get("name") == name
         ]
         assert consumers, "the management API lists the subscription"
-        members = {consumer["properties"].get("snodra-member") for consumer in consumers}
-        assert first.member in members
-        assert second.member in members
         assert all(consumer["properties"].get("single-active-consumer") == "true" for consumer in consumers)
         assert all(consumer["properties"].get("super-stream") == source for consumer in consumers)
 
@@ -418,3 +445,161 @@ async def test_the_head_and_lag_advance_while_paused(create_source: CreateSource
         assert deliveries[0].position == "0"
     finally:
         await subscription.close()
+
+
+async def test_reset_targets_latest_timestamp_positions_and_a_multi_range_apply(
+    create_source: CreateSource, make_store: MakeStore
+) -> None:
+    source = await create_source(2, prefix="targets")
+    store = make_store()
+    published: list[OutgoingEvent] = []
+    for index, key in enumerate(("order-1", "order-7")):
+        for copy in range(2):
+            outgoing = event(source, key, event_id=f"targets-{index}-{copy}")
+            published.append(outgoing)
+            await store.publish(outgoing)
+    name = f"orders-service.targets-{uuid.uuid4().hex}"
+    spec = SubscriptionSpec(name=name, source=source)
+    subscription = await store.subscribe(spec)
+    try:
+        deliveries = await read_deliveries(subscription, len(published))
+        assert sorted(ids(deliveries)) == sorted(outgoing.id for outgoing in published)
+    finally:
+        await subscription.close()
+
+    admin = store.admin(spec)
+    latest = await admin.plan(Latest())
+    assert [(item.segment, item.start, item.until) for item in latest] == [("0", "2", "2"), ("1", "2", "2")]
+    early = await admin.plan(Timestamp(0))
+    assert [(item.segment, item.start, item.until) for item in early] == [("0", "0", "2"), ("1", "0", "2")]
+    future = int(time.time() * 1000) + 60_000
+    late = await admin.plan(Timestamp(future))
+    assert [(item.segment, item.start) for item in late] == [("0", "2"), ("1", "2")]
+    positions = await admin.plan(Positions((("0", "0"), ("1", "0"))))
+    assert [(item.segment, item.start, item.until) for item in positions] == [("0", "0", "2"), ("1", "0", "2")]
+    await admin.apply(positions)
+
+    again = await store.subscribe(spec)
+    try:
+        replayed = await read_all(again, until=lambda seen: len(seen) == len(published))
+        assert sorted(ids(replayed)) == sorted(outgoing.id for outgoing in published)
+    finally:
+        await again.close()
+
+
+async def test_a_partition_added_later_is_seen_by_a_new_subscription_and_the_admin(
+    broker: Broker, create_source: CreateSource, make_store: MakeStore
+) -> None:
+    source = await create_source(2, prefix="grown")
+    store = make_store()
+    await store.publish(event(source, "order-1", event_id="grown-0"))
+    first = await store.subscribe(
+        SubscriptionSpec(name=f"orders-service.grown-first-{uuid.uuid4().hex}", source=source)
+    )
+    try:
+        await wait_for("the first subscription holds two segments", lambda: len(first.segments()) == 2)
+        added = f"{source}-2"
+        await create_stream(broker, added)
+        try:
+            bind_partition(broker, source, 2)
+            await wait_for_async(
+                "the broker lists the added partition",
+                lambda: _partition_count_at_least(broker, source, 3),
+            )
+            second = await store.subscribe(
+                SubscriptionSpec(name=f"orders-service.grown-second-{uuid.uuid4().hex}", source=source)
+            )
+            try:
+                await wait_for(
+                    "the new subscription holds the added partition",
+                    lambda: {status.segment for status in second.segments()} == {"0", "1", "2"},
+                )
+            finally:
+                await second.close()
+            admin = store.admin(SubscriptionSpec(name=f"orders-service.grown-admin-{uuid.uuid4().hex}", source=source))
+            plan = await admin.plan(Latest())
+            assert {item.segment for item in plan} == {"0", "1", "2"}
+        finally:
+            with contextlib.suppress(Exception):
+                await delete_stream(broker, added)
+    finally:
+        await first.close()
+
+
+async def _partition_count_at_least(broker: Broker, source: str, count: int) -> bool:
+    return len(await partition_streams(broker, source)) >= count
+
+
+async def test_an_admin_plan_of_a_vanished_stream_is_failed(
+    broker: Broker, create_source: CreateSource, make_store: MakeStore
+) -> None:
+    source = await create_source(1, prefix="vanished")
+    store = make_store()
+    admin = store.admin(SubscriptionSpec(name=f"orders-service.vanished-{uuid.uuid4().hex}", source=source))
+    await delete_super_stream(broker, source)
+    with pytest.raises(Failed):
+        await admin.plan(Latest())
+
+
+async def test_an_admin_plan_and_apply_wrap_a_non_store_error_as_failed(
+    create_source: CreateSource, make_store: MakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = await create_source(1, prefix="admin-timeout")
+    store = make_store()
+    spec = SubscriptionSpec(name=f"orders-service.admin-timeout-{uuid.uuid4().hex}", source=source)
+    admin = store.admin(spec)
+
+    async def slow_bounds(*args: Any, **kwargs: Any) -> tuple[int, int, int, bool]:
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(store, "_bounds", slow_bounds)
+    with pytest.raises(Failed, match="plan"):
+        await admin.plan(Earliest())
+    with pytest.raises(Failed, match="reset"):
+        await admin.apply([ReplayRange(source=source, segment="0", start="0", until="")])
+
+
+class _FakeStreamClient:
+    """A stream client for the activation unit test."""
+
+    def __init__(self, stored: int | None) -> None:
+        self.stored = stored
+        self.updates: list[tuple[int, int, int]] = []
+        self.credits = 0
+
+    async def query_offset(self, stream: str, reference: str) -> int:
+        if self.stored is None:
+            raise OffsetNotFound()
+        return self.stored
+
+    async def consumer_update(self, correlation_id: int, specification: Any) -> None:
+        self.updates.append((correlation_id, int(specification.offset_type), int(specification.offset)))
+
+    async def credit(self, subscription_id: int, credit: int) -> None:
+        self.credits += 1
+
+
+class _FakeStore:
+    async def _request(self, what: str, call: Awaitable[Any]) -> Any:
+        return await call
+
+
+async def test_reactivation_keeps_the_greater_known_head() -> None:
+    client = _FakeStreamClient(stored=2)
+    store = cast(Any, _FakeStore())
+    subscription = RabbitMQSubscription(
+        store,
+        SubscriptionSpec(name="orders-service.reactivated", source="s"),
+        _Layout(streams=("s",), segments=("0",), super=False),
+        "member",
+    )
+    part = _Part(segment="0", stream="s", client=cast(Any, client), head=7, next=5)
+    await subscription._activate(part, 1)
+    assert part.active
+    assert part.next == 2
+    assert part.head == 7, "the known head is greater than the stored offset"
+    client.stored = None
+    part.head = 11
+    await subscription._activate(part, 2)
+    assert part.next is None
+    assert part.head == 11, "an activation without a stored offset leaves the known head"

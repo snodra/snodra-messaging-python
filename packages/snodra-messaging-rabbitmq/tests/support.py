@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import socket
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -241,8 +242,13 @@ def event(
     )
 
 
-async def raw_stream_messages(stream: str, expected: int, *, broker: Broker, within: float = 30.0) -> list[bytes]:
-    """Every AMQP message of one plain stream (a partition), read from the first offset."""
+async def raw_stream_messages(
+    stream: str, expected: int | None, *, broker: Broker, within: float = 30.0
+) -> list[bytes]:
+    """Every AMQP message of one plain stream (a partition), read from the first offset.
+
+    ``expected`` is the count the read waits for; ``None`` reads until the stream has been quiet
+    for 1.5 s (an empty stream returns after that window)."""
     client = await connect(broker, "snodra-tests-reader")
     messages: list[bytes] = []
 
@@ -260,16 +266,20 @@ async def raw_stream_messages(stream: str, expected: int, *, broker: Broker, wit
         await client.subscribe(stream, 1, schema.OffsetSpec.from_params(OffsetType.FIRST, None), 10, None)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + within
-        while loop.time() < deadline:
+        quiet_deadline = loop.time() + 1.5
+        last = 0
+        while loop.time() < min(deadline, quiet_deadline):
             await asyncio.sleep(0.05)
             if messages:
                 await client.credit(1, 10)
-            if len(messages) >= expected:
+            if len(messages) != last:
+                last = len(messages)
+                quiet_deadline = loop.time() + 1.5
+            if expected is not None and len(messages) >= expected:
                 # Take what the same chunk still holds, then let a quiet moment settle the rest.
                 await asyncio.sleep(0.2)
-                if len(messages) >= expected:
-                    break
-        if len(messages) < expected:
+                break
+        if expected is not None and len(messages) < expected:
             raise AssertionError(f"the stream {stream!r} held {len(messages)} messages, wanted {expected}")
         return messages
     finally:
@@ -298,3 +308,27 @@ def management_consumers(broker: Broker) -> list[dict[str, Any]]:
     if isinstance(body, list):
         return body
     return list(body.get("items", []))
+
+
+def bind_partition(broker: Broker, source: str, index: int) -> None:
+    """Binds a freshly created plain stream to a super stream as its partition ``index``."""
+    exchange = urllib.parse.quote(source, safe="")
+    queue = urllib.parse.quote(f"{source}-{index}", safe="")
+    body = json.dumps({"routing_key": str(index), "arguments": {}}).encode()
+    request = urllib.request.Request(
+        f"{broker.management}/api/bindings/%2F/e/{exchange}/q/{queue}", data=body, method="POST"
+    )
+    request.add_header("Authorization", "Basic " + base64.b64encode(b"guest:guest").decode())
+    request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        response.read()
+
+
+async def partition_streams(broker: Broker, source: str) -> list[str]:
+    """The partition streams the broker lists for ``source`` now."""
+    client = await connect(broker, "snodra-tests-partitions")
+    try:
+        return list(await client.partitions(source))
+    finally:
+        with suppress(Exception):
+            await client.close()

@@ -58,7 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cmp_to_key
 from typing import Any, Final
@@ -78,6 +78,7 @@ from rstream.exceptions import (
     StreamDoesNotExist,
 )
 from snodra import (
+    MAX_SEGMENT_BYTES,
     Assigned,
     Capability,
     Delivery,
@@ -500,7 +501,7 @@ class RabbitMQEventStore:
         if self._closed:
             raise Failed("rabbitmq: the event store is closed")
         seed = await self._seed_client()
-        layout = await self._layout(seed, spec.source)
+        layout = await self._layout(seed, spec.source, fresh=True)
         subscription = RabbitMQSubscription(self, spec, layout, self._member_id())
         try:
             await subscription.start()
@@ -599,8 +600,16 @@ class RabbitMQEventStore:
             connection_closed_handler=closed,
         )
         try:
-            await client.start()
-            await client.authenticate(self._config.virtual_host, self._config.username, self._config.password)
+            async with asyncio.timeout(self._config.request_timeout):
+                await client.start()
+                await client.authenticate(self._config.virtual_host, self._config.username, self._config.password)
+        except TimeoutError as error:
+            with contextlib.suppress(Exception):
+                await client.close()
+            raise Failed(
+                f"rabbitmq: connecting to {address[0]}:{address[1]} did not finish within "
+                f"{self._config.request_timeout:g} s"
+            ) from error
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await client.close()
@@ -611,10 +620,19 @@ class RabbitMQEventStore:
             raise
         return client
 
-    async def _layout(self, seed: Client, source: str) -> _Layout:
-        cached = self._layouts.get(source)
-        if cached is not None and time.monotonic() - cached[0] < LAYOUT_FOR:
-            return cached[1]
+    async def _request[T](self, what: str, call: Awaitable[T]) -> T:
+        """One stream request bounded by :attr:`RabbitMQConfig.request_timeout`."""
+        try:
+            async with asyncio.timeout(self._config.request_timeout):
+                return await call
+        except TimeoutError as error:
+            raise Failed(f"rabbitmq: {what} did not answer within {self._config.request_timeout:g} s") from error
+
+    async def _layout(self, seed: Client, source: str, *, fresh: bool = False) -> _Layout:
+        if not fresh:
+            cached = self._layouts.get(source)
+            if cached is not None and time.monotonic() - cached[0] < LAYOUT_FOR:
+                return cached[1]
         try:
             streams = tuple(await seed.partitions(source))
         except asyncio.CancelledError:
@@ -624,8 +642,10 @@ class RabbitMQEventStore:
         if streams:
             segments = tuple(segment_of(source, stream) for stream in streams)
             for segment in segments:
-                if not segment or len(segment.encode()) > 128:
-                    raise Failed(f"rabbitmq: the partition of {source!r} names a segment over 128 bytes: {segment!r}")
+                if not segment or len(segment.encode()) > MAX_SEGMENT_BYTES:
+                    raise Invalid(
+                        f"the partition of {source!r} names a segment over {MAX_SEGMENT_BYTES} bytes: {segment!r}"
+                    )
             layout = _Layout(streams=streams, segments=segments, super=True)
         else:
             try:
@@ -644,10 +664,11 @@ class RabbitMQEventStore:
         self._layouts[source] = (time.monotonic(), layout)
         return layout
 
-    async def _leader(self, seed: Client, stream: str) -> tuple[str, int]:
-        cached = self._leaders.get(stream)
-        if cached is not None and time.monotonic() - cached[0] < LAYOUT_FOR:
-            return cached[1]
+    async def _leader(self, seed: Client, stream: str, *, fresh: bool = False) -> tuple[str, int]:
+        if not fresh:
+            cached = self._leaders.get(stream)
+            if cached is not None and time.monotonic() - cached[0] < LAYOUT_FOR:
+                return cached[1]
         try:
             broker, _ = await seed.query_leader_and_replicas(stream)
         except LeaderNotAvailable as error:
@@ -713,7 +734,7 @@ class RabbitMQEventStore:
             client.add_handler(schema.Deliver, gate, name="1")
             await client.run_queue_listener_task(1, put)
             spec = schema.OffsetSpec.from_params(offset_type, offset)
-            await client.subscribe(stream, 1, spec, credit, None)
+            await self._request(f"subscribing {stream!r}", client.subscribe(stream, 1, spec, credit, None))
             try:
                 async with asyncio.timeout(within):
                     return await frames.get()
@@ -762,8 +783,11 @@ class RabbitMQEventStore:
             client.add_stream(stream)
             client.add_handler(schema.Deliver, gate, name="1")
             await client.run_queue_listener_task(1, put)
-            await client.subscribe(
-                stream, 1, schema.OffsetSpec.from_params(OffsetType.TIMESTAMP, timestamp_ms), 16, None
+            await self._request(
+                f"the timestamp read of {stream!r}",
+                client.subscribe(
+                    stream, 1, schema.OffsetSpec.from_params(OffsetType.TIMESTAMP, timestamp_ms), 16, None
+                ),
             )
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self._config.request_timeout + QUIET
@@ -826,7 +850,10 @@ class _PublisherConnection:
                 )
             publisher = self._next_id
             self._next_id += 1
-            await self.client.declare_publisher(stream, None, publisher)
+            await self._store._request(
+                f"declaring the publisher for {stream!r}",
+                self.client.declare_publisher(stream, None, publisher),
+            )
             self.client.add_stream(stream)
             self._publishers[stream] = publisher
             return publisher
@@ -919,7 +946,7 @@ class RabbitMQSubscription:
         seed = await self._store._seed_client()
         try:
             for index, stream in enumerate(self._layout.streams):
-                address = await self._store._leader(seed, stream)
+                address = await self._store._leader(seed, stream, fresh=True)
 
                 def closed(info: Any, stream: str = stream) -> None:
                     self._fail(f"rabbitmq: the connection to {stream!r} closed: {info.reason}")
@@ -948,12 +975,15 @@ class RabbitMQSubscription:
                 if self._layout.super:
                     properties["super-stream"] = self._spec.source
                 try:
-                    await client.subscribe(
-                        stream,
-                        1,
-                        schema.OffsetSpec.from_params(OffsetType.NEXT, None),
-                        1,
-                        properties,
+                    await self._store._request(
+                        f"subscribing {stream!r}",
+                        client.subscribe(
+                            stream,
+                            1,
+                            schema.OffsetSpec.from_params(OffsetType.NEXT, None),
+                            1,
+                            properties,
+                        ),
                     )
                 except ServerError as error:
                     raise Failed(f"rabbitmq: subscribing {stream!r}: {error}") from error
@@ -1212,6 +1242,8 @@ class RabbitMQSubscription:
     def _metadata_handler(self, part: _Part) -> Any:
         def handle(frame: schema.MetadataUpdate) -> None:
             if frame.metadata_info.stream == part.stream:
+                self._store._layouts.clear()
+                self._store._leaders.clear()
                 self._fail(f"rabbitmq: the stream {part.stream!r} changed (deleted or moved)")
 
         return handle
@@ -1232,7 +1264,10 @@ class RabbitMQSubscription:
     async def _activate(self, part: _Part, correlation_id: int) -> None:
         stored: int | None
         try:
-            stored = await part.client.query_offset(part.stream, self._spec.name)
+            stored = await self._store._request(
+                f"the stored offset of {part.stream!r}",
+                part.client.query_offset(part.stream, self._spec.name),
+            )
         except OffsetNotFound:
             stored = None
         except asyncio.CancelledError:
@@ -1255,7 +1290,8 @@ class RabbitMQSubscription:
         part.stored = stored
         part.ready.clear()
         part.inflight.clear()
-        part.head = stored
+        if stored is not None:
+            part.head = stored if part.head is None else max(part.head, stored)
         part.owed = self._paused
         part.last_store = time.monotonic()
         part.unstored = 0
@@ -1360,8 +1396,12 @@ class RabbitMQSubscription:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + STORE_WAIT
         while part.client.is_connection_alive() and loop.time() < deadline:
+            stored: int | None
             try:
-                stored = await part.client.query_offset(part.stream, self._spec.name)
+                stored = await self._store._request(
+                    f"reading back the offset of {part.stream!r}",
+                    part.client.query_offset(part.stream, self._spec.name),
+                )
             except OffsetNotFound:
                 stored = None
             except asyncio.CancelledError:
@@ -1420,6 +1460,16 @@ class RabbitMQAdmin:
     async def members(self) -> list[str]:
         """The instances reading the subscription now: the management API's consumers with the
         subscription's name on its partitions plus this process's own live subscriptions."""
+        try:
+            return await self._members()
+        except asyncio.CancelledError:
+            raise
+        except StoreError:
+            raise
+        except Exception as error:
+            raise Failed(f"rabbitmq: the members of {self._spec.name!r}: {error}") from error
+
+    async def _members(self) -> list[str]:
         if self._store._management is None:
             raise Unsupported(Capability.REPLAY)
         layout = await self._layout()
@@ -1433,6 +1483,16 @@ class RabbitMQAdmin:
 
     async def plan(self, target: ResetTarget) -> list[ReplayRange]:
         """Where ``target`` moves each segment, from the current positions; nothing moves yet."""
+        try:
+            return await self._plan(target)
+        except asyncio.CancelledError:
+            raise
+        except StoreError:
+            raise
+        except Exception as error:
+            raise Failed(f"rabbitmq: the plan of {self._spec.name!r}: {error}") from error
+
+    async def _plan(self, target: ResetTarget) -> list[ReplayRange]:
         now = await self._now()
         if isinstance(target, Earliest):
             moves = [(item, item.first) for item in now]
@@ -1472,6 +1532,16 @@ class RabbitMQAdmin:
         """Moves each range's committed position to its ``start``; refused while a member reads
         the subscription. Validates every range before storing; a storage failure after some
         partitions moved is reported and not rolled back (SG-41)."""
+        try:
+            await self._apply(ranges)
+        except asyncio.CancelledError:
+            raise
+        except StoreError:
+            raise
+        except Exception as error:
+            raise Failed(f"rabbitmq: the reset of {self._spec.name!r}: {error}") from error
+
+    async def _apply(self, ranges: Sequence[ReplayRange]) -> None:
         # TODO(spec-gap): SG-41
         if not ranges:
             return
@@ -1516,8 +1586,12 @@ class RabbitMQAdmin:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + STORE_WAIT
         while loop.time() < deadline:
+            stored: int | None
             try:
-                stored = await client.query_offset(stream, self._spec.name)
+                stored = await self._store._request(
+                    f"reading back the offset of {stream!r}",
+                    client.query_offset(stream, self._spec.name),
+                )
             except OffsetNotFound:
                 stored = None
             if stored == want:
@@ -1531,18 +1605,21 @@ class RabbitMQAdmin:
 
     async def _layout(self) -> _Layout:
         seed = await self._store._seed_client()
-        return await self._store._layout(seed, self._spec.source)
+        return await self._store._layout(seed, self._spec.source, fresh=True)
 
     async def _now(self) -> list[_Now]:
         seed = await self._store._seed_client()
-        layout = await self._store._layout(seed, self._spec.source)
+        layout = await self._store._layout(seed, self._spec.source, fresh=True)
         now: list[_Now] = []
         for stream, segment in zip(layout.streams, layout.segments, strict=True):
-            address = await self._store._leader(seed, stream)
+            address = await self._store._leader(seed, stream, fresh=True)
             client = await self._store._dial(address)
             try:
                 try:
-                    stored: int | None = await client.query_offset(stream, self._spec.name)
+                    stored: int | None = await self._store._request(
+                        f"the stored offset of {stream!r}",
+                        client.query_offset(stream, self._spec.name),
+                    )
                 except OffsetNotFound:
                     stored = None
             finally:
