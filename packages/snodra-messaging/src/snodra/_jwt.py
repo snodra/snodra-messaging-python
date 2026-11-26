@@ -200,6 +200,7 @@ class JwksVerifier:
     def _retry_wait(self) -> float:
         """How long after the failure of a first load the next attempt may start: ``first_retry`` doubling with each
         failure in a row, never above ``min_refresh``."""
+        # TODO(spec-gap): SG-13
         return min(self.first_retry * 2.0 ** max(0, self._failures - 1), self._min_refresh)
 
     def _fetched(self, task: asyncio.Task[dict[str, rsa.RSAPublicKey | None]]) -> None:

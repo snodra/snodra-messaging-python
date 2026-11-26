@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncIterator
 
 import pytest
-from fakehub import FakeHub, FakeStream, cancel, flow, forward
+from fakehub import FakeHub, FakeStream, ack, cancel, flow, forward
 from helpers import CancelOrder, GetOrder, ListOrders, Placed, acknowledged, library_tasks, new_app, next_reply
 from snodra import ErrorCode, HubError
 from snodra._hubpb import hub_pb2
@@ -251,6 +251,71 @@ async def test_a_point_query_of_an_own_streaming_type_is_invalid_in_process(hub:
         "orders.ListOrders is a streaming query: send it with App.stream (mode STREAMING)",
     )
     await s.nothing(0.2, "request", "permits")  # nothing went to the hub
+
+
+async def test_a_shared_streaming_type_is_registered_as_shared(hub: FakeHub) -> None:
+    app = new_app(hub)
+
+    @app.stream_handler(shared=True)
+    async def stream_orders(q: ListOrders) -> AsyncIterator[Placed]:
+        yield Placed(q.order_id, 1)
+
+    @app.stream_handler(shared=False)
+    async def stream_order(q: GetOrder) -> AsyncIterator[Placed]:
+        yield Placed(q.order_id, 2)
+
+    await app.start()
+    s = await hub.next_stream()
+    first = await s.recv_register()
+    assert list(first.shared_query_types) == ["orders.ListOrders"]
+    assert list(first.query_types) == ["orders.GetOrder"]
+    await s.ack(ack("hub-1"))
+    # A later Register of the same stream declares them the same way (the fake hub does not ack it by itself).
+    app._connections()[0].reregister(empty=False)
+    again = await s.recv_register()
+    assert list(again.shared_query_types) == ["orders.ListOrders"]
+    assert list(again.query_types) == ["orders.GetOrder"]
+
+
+async def test_a_stream_of_a_shared_type_is_served(hub: FakeHub) -> None:
+    app = new_app(hub)
+
+    @app.stream_handler(shared=True)
+    async def stream_orders(q: ListOrders) -> AsyncIterator[Placed]:
+        yield Placed(q.order_id, 1)
+        yield Placed(q.order_id, 2)
+
+    await app.start()
+    s = await acknowledged(hub)
+    await s.send(_stream(credit=2))
+    one, two = await s.recv_part(), await s.recv_part()
+    assert [p.seq for p in (one, two)] == [1, 2]
+    assert (await s.recv_end()).parts == 2
+
+
+async def test_a_point_query_of_an_own_shared_streaming_type_goes_through_the_hub(hub: FakeHub) -> None:
+    app = new_app(hub)
+
+    @app.stream_handler(shared=True)
+    async def stream_orders(q: ListOrders) -> AsyncIterator[Placed]:
+        raise AssertionError("a streaming type is never answered in-process")
+        yield Placed(q.order_id, 1)  # pragma: no cover
+
+    await app.start()
+    s = await acknowledged(hub)
+    call = asyncio.create_task(app.query(ListOrders("o-1"), Placed))
+    r = await s.recv_request()  # a shared type is never answered here: the point query goes to the hub
+    assert (r.type, r.kind, r.mode) == ("orders.ListOrders", hub_pb2.QUERY, hub_pb2.UNARY)
+    await s.send(forward(r))  # the hub forwards it here: the streaming-handler mode cell refuses it
+    reply = await next_reply(s)
+    assert reply.request_id == r.id
+    assert reply.WhichOneof("result") == "error"
+    expected = "orders.ListOrders is a streaming query: send it with App.stream (mode STREAMING)"
+    assert (reply.error.code, reply.error.message) == (hub_pb2.INVALID_REQUEST, expected)
+    await s.send(hub_pb2.ServerMessage(reply=reply))  # the hub routes the refusal back to the caller
+    with pytest.raises(HubError) as raised:
+        await call
+    assert (raised.value.code, raised.value.message) == (ErrorCode.INVALID_REQUEST, expected)
 
 
 async def test_a_stream_answers_on_its_arrival_stream(hub: FakeHub, hub2: FakeHub) -> None:

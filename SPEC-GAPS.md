@@ -191,3 +191,20 @@ library does there. Where an entry is settled, its behaviour is this library's r
   there is no initial result to return; an end carrying an error is that error. A first part whose `seq` is not `1` is
   a lost part instead (`LostParts`, as for a stream), and the subscription is cancelled.
 - **Question:** open: should such an end read as a loss (`LostParts`) or as this local contract failure?
+
+### SG-13: the wait after a failed first JWKS load
+
+- **Specification:** silent. `messages.md` (Forwarded identity) says a forwarded token is verified against the issuer's
+  JWKS, and that a token fails while the endpoint is down (`UNAUTHENTICATED`), but it sets no pacing for fetching the
+  keys: neither their cache nor a retry after a failed load.
+- **Other Snodra libraries:** they differ: some retry a failed first load on every token until it succeeds, while
+  another leaves the retry pacing to its JWT decoder.
+- **This library:** `snodra/_jwt.py` (`JwksVerifier._load`, `_retry_wait`). After a first load that failed, the next
+  one starts after `first_retry` (1 s, doubling with each failure in a row, never above `jwks_min_refresh`); tokens in
+  between are refused `UNAUTHENTICATED` `signing keys unavailable`. Once a load has succeeded, an unknown `kid`
+  fetches the keys at most once per `jwks_min_refresh`.
+- **Question:** open: should the specification name the backoff after a failed first load, or leave it to each
+  library? (a) name the 1 s doubling wait, capped at the refresh interval; (b) retry on every token, as some libraries
+  do; (c) leave it open. Recommend (a): a down JWKS endpoint should not get one fetch per forwarded token, and the
+  wait is capped at the normal refresh interval anyway.
+- **Wire change:** no.

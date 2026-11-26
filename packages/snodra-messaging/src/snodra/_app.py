@@ -204,19 +204,31 @@ class App:
     @overload
     def stream_handler(self, fn: S, /) -> S: ...
     @overload
-    def stream_handler(self, fn: None = None, /, *, guard: Guard | None = None) -> Callable[[S], S]: ...
-    def stream_handler(self, fn: S | None = None, /, *, guard: Guard | None = None) -> S | Callable[[S], S]:
+    def stream_handler(
+        self, fn: None = None, /, *, shared: bool = False, guard: Guard | None = None
+    ) -> Callable[[S], S]: ...
+    def stream_handler(
+        self, fn: S | None = None, /, *, shared: bool = False, guard: Guard | None = None
+    ) -> S | Callable[[S], S]:
         """Registers a streaming query handler, bare (``@app.stream_handler``) or called
         (``@app.stream_handler()``): an ``async def`` generator whose first parameter is annotated with a
         ``@message_type`` class, the query type it serves, and whose items are the stream's parts. A query of its type
-        is answered in mode ``STREAMING`` only (``App.stream``); a unary query of it is ``INVALID_REQUEST``. ``guard``
-        is that of :meth:`command_handler`. Returns the function unchanged."""
+        is answered in mode ``STREAMING`` only (``App.stream``); a unary query of it is ``INVALID_REQUEST``.
+
+        ``shared=True`` registers its type as a shared query type (``Register.shared_query_types``), as
+        :meth:`query_handler` does: many services may own it, and a stream goes to one live instance that owns it.
+        Every owner must register it shared (the hub refuses a type registered exclusive by one owner and shared by
+        another). A point query of a shared streaming type this instance handles still goes through the hub, never
+        in-process, and the hub's streaming-handler mode cell refuses it ``INVALID_REQUEST``. ``guard`` is that of
+        :meth:`command_handler`. Returns the function unchanged."""
+        if not isinstance(shared, bool):
+            raise TypeError(f"shared must be True or False, got {shared!r}")
         if guard is not None and not isinstance(guard, Guard):
             raise TypeError(f"guard must be made by authenticated(), role() or caller_matches(), got {guard!r}")
 
         def register(f: S) -> S:
             self._check_guard(f, guard)
-            self._registry.add("query", f, guard, stream=True)
+            self._registry.add("query", f, guard, shared=shared, stream=True)
             return f
 
         return register if fn is None else register(fn)
