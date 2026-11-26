@@ -53,11 +53,20 @@ done
 if uv lock --check >/dev/null 2>&1; then ok "the lock is the one uv resolves"; else fail "the lock is stale"; fi
 
 # Only the version lines move: one in the core, two in the observability package (its version and
-# its pin), two in the lock. Nothing else, and no other line carries the version.
+# its pin), and in the lock every added line carries 9.8.7, at least the two versions. The lock's
+# `revision` is uv's own header, not a package: a newer uv writes a newer revision whenever it
+# writes the lock, so it is dropped from both copies before the diff. Nothing else moves, and no
+# other line carries the version.
 [ "$(changed "$core")" -eq 1 ] && ok "one line in the core" || fail "$(changed "$core") lines in the core"
 [ "$(changed "$observability")" -eq 2 ] && ok "two lines in the observability package" \
   || fail "$(changed "$observability") lines in the observability package"
-[ "$(changed uv.lock)" -eq 2 ] && ok "two lines in uv.lock" || fail "$(changed uv.lock) lines in uv.lock"
+grep -v '^revision = ' "$root/uv.lock" >"$work/lock.before"
+grep -v '^revision = ' uv.lock >"$work/lock.after"
+added=$(diff "$work/lock.before" "$work/lock.after" | grep '^>')
+[ "$(printf '%s\n' "$added" | grep -cF 9.8.7)" -ge 2 ] && ok "two or more version lines in uv.lock" \
+  || fail "$(printf '%s\n' "$added" | grep -cF 9.8.7) version lines in uv.lock"
+[ "$(printf '%s\n' "$added" | grep -vcF 9.8.7)" -eq 0 ] && ok "every added uv.lock line carries 9.8.7" \
+  || fail "uv.lock lines without 9.8.7: $(printf '%s\n' "$added" | grep -vF 9.8.7 | tr '\n' ' ')"
 [ "$(grep -cF 9.8.7 "$core")" -eq 1 ] && ok "the core names 9.8.7 once" || fail "the core names 9.8.7 more than once"
 [ "$(grep -cF 9.8.7 "$observability")" -eq 2 ] && ok "the observability package names 9.8.7 twice" \
   || fail "the observability package names 9.8.7 $(grep -cF 9.8.7 "$observability") times"
