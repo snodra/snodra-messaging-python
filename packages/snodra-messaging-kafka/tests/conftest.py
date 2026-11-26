@@ -288,6 +288,13 @@ async def committed_offset(admin: AIOKafkaAdminClient, group: str, topic_partiti
     return int(metadata.offset)
 
 
+def kafka_tasks() -> list[Any]:
+    """The add-on's live tasks, by their ``snodra:kafka:`` prefix (never another library's)."""
+    import asyncio
+
+    return [task for task in asyncio.all_tasks() if task.get_name().startswith("snodra:kafka:")]
+
+
 def positions(deliveries: Sequence[Any]) -> list[str]:
     """The positions of ``deliveries``."""
     return [delivery.position for delivery in deliveries]

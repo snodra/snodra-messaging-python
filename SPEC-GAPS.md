@@ -423,11 +423,15 @@ library does there. Where an entry is settled, its behaviour is this library's r
   again without leaving the subscription"; it does not say what a call with a position at or after the subscription's
   next position does.
 - **Other Snodra libraries:** the Rust add-on seeks back to whatever position it is given (`snodra-messaging-rs@4d63802:crates/snodra-messaging-kafka/src/subscription.rs:509`);
-  the memory store moves the position back only for an earlier one (SG-14 in this file, from
-  `snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/eventstore/memory/MemoryEventStore.kt:279`).
+  the Kotlin Kafka add-on records every redelivery as a seek, a forward one included
+  (`snodra-messaging@64dde1e:snodra-messaging-kafka/src/main/kotlin/com/damoreira/snodra/messaging/kafka/KafkaSubscription.kt:127`,
+  applied at lines 189-194); the memory store moves the position back only for an earlier one (SG-14 in this file,
+  from `snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/eventstore/memory/MemoryEventStore.kt:279`).
 - **This library:** `snodra_kafka/kafka.py` (`KafkaSubscription.redeliver`). Only an earlier position moves the
-  subscription's next position back and seeks the partition; a position at or after it changes nothing, so a
-  redelivery never skips an event. This follows the memory store's guard (SG-14) rather than the Rust add-on's seek.
+  subscription's next position back and seeks the partition; a position at or after it changes nothing. A forward
+  seek would skip every event between the subscription's next position and the given one, which a redelivery must
+  never do; this keeps the memory store's earlier-only guard (SG-14) rather than copying the Kotlin Kafka add-on's
+  forward seek.
 - **Question:** settled: a position at or after the next one changes nothing.
 - **Wire change:** no.
 
@@ -461,4 +465,21 @@ library does there. Where an entry is settled, its behaviour is this library's r
   add-on sets `partition_assignment_strategy=(RangePartitionAssignor,)` explicitly, which is the rule's intent.
 - **Question:** settled: a client whose default is not `range` must set it, so that every official member offers the
   assignor the group decides on.
+- **Wire change:** no.
+
+### SG-29: the atomicity of a Kafka reset's apply
+
+- **Specification:** `event-store-add-ons.md` says an admin's `apply` "moves each range's segment's committed
+  position to its `from`, all or nothing"; Kafka's offset commit answers each partition separately, and the page does
+  not say what a client does when one part is refused after another was accepted.
+- **Other Snodra libraries:** the Rust and Go add-ons check the group is empty, build one offset commit for every
+  range and send it; neither rolls a partly applied commit back.
+- **This library:** `snodra_kafka/kafka.py` (`KafkaAdmin.apply`). Every range is validated first (source, segment,
+  position, end offset), then the group is checked empty, then one offset commit is sent. A validation failure or an
+  active member moves nothing; a group-level commit refusal moves nothing; a broker-side per-partition refusal after
+  another partition was accepted is reported as :class:`~snodra.Failed` and is not rolled back, because a
+  compensating commit is itself another non-atomic request and can fail too. "All or nothing" is therefore exact at
+  the validation and group level and best-effort at Kafka's per-partition boundary.
+- **Question:** settled: validate all ranges and send one commit; do not attempt a rollback. A future version may add
+  a compensating commit if the broker's per-partition failures become observable enough to justify it.
 - **Wire change:** no.

@@ -145,7 +145,10 @@ def test_the_configuration_defaults_and_comes_from_the_environment(monkeypatch: 
         {"bootstrap_servers": ""},
         {"client_id": " "},
         {"request_timeout_ms": 0},
+        {"request_timeout_ms": 10_000},
         {"session_timeout_ms": 0},
+        {"session_timeout_ms": 1, "request_timeout_ms": 2},
+        {"client_id": "x" * 256},
         {"max_poll_records": 0},
         {"status_refresh": 0},
         {"admin_timeout": 0},
@@ -168,6 +171,7 @@ def test_the_client_settings_fix_the_group_protocol_the_assignor_and_the_next_of
     assert producer["acks"] == "all"
     assert producer["enable_idempotence"] is True
     assert producer["bootstrap_servers"] == "h:1"
+    assert producer["client_id"] == "snodra-messaging"
 
 
 async def test_a_publish_after_close_is_failed() -> None:
@@ -198,9 +202,19 @@ async def test_a_header_or_key_that_is_not_utf8_text_is_rejected() -> None:
         headers=broken_key.headers,
         payload=broken_key.payload,
     )
-    for outgoing in (broken_header, broken_key):
+    broken_name = _event("broken-name")
+    broken_name.headers["\ud800"] = "x"
+    for outgoing in (broken_header, broken_key, broken_name):
         with pytest.raises(Rejected):
             await store.publish(outgoing)
+    await store.close()
+
+
+async def test_a_topic_name_no_kafka_topic_can_have_is_rejected() -> None:
+    store = KafkaEventStore(KafkaConfig(bootstrap_servers="127.0.0.1:1"))
+    for name in ("invalid topic!", ".", "..", "a" * 250):
+        with pytest.raises(Rejected):
+            await store.publish(_event("bad-topic", source=name))
     await store.close()
 
 

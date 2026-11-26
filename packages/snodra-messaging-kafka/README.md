@@ -54,9 +54,11 @@ offsets are written explicitly and are the next offset to read; a new group star
 offset. The add-on declares `replay`, `lag` and `native-dead-letter`; it has no event browser and
 declares no `browse`. Dead letters of the `event-store` mode go to `<source>.dlt`.
 
-The add-on creates no topic: the infrastructure does. A topic that cannot exist, a record too large
-for the broker or a refused authorization is rejected for good; any other failure is retried by the
-outbox relay.
+The add-on creates no topic: the infrastructure does, and the broker must keep
+`auto.create.topics.enable=false` (the add-on's tests pin it off). With auto-creation on, the broker
+would create a missing topic on the first publish or subscription. A name no Kafka topic can have, a
+record too large for the broker or a refused authorization is rejected for good; a missing topic and
+any other failure (a missing topic may appear later) is retried by the outbox relay.
 
 Where the public specification leaves a choice, [SPEC-GAPS.md](../../SPEC-GAPS.md) records what this
 library does.

@@ -18,6 +18,7 @@ from snodra import (
     Capability,
     Earliest,
     EventHeaders,
+    Failed,
     Invalid,
     Latest,
     MemoryStore,
@@ -37,6 +38,7 @@ from .conftest import (
     describe_group,
     group_members,
     ids,
+    kafka_tasks,
     positions,
     raw_records,
     read_all,
@@ -59,6 +61,30 @@ async def test_the_event_store_passes_the_nine_conformance_checks(
     source = await create_topic(4, prefix="snodra.conformance")
     await create_topic(1, name=dead_letter_source(source))
     await run_event_store_conformance(source, lambda: make_store(), MemoryStore())
+
+
+async def test_the_segment_head_and_lag_advance_while_paused(create_topic: CreateTopic, make_store: MakeStore) -> None:
+    topic = await create_topic(1, prefix="paused")
+    store = make_store()
+    first = event(topic, "paused-0", "order-42")
+    second = event(topic, "paused-1", "order-42")
+    await store.publish(first)
+    spec = SubscriptionSpec(name=unique_group("orders-service", "paused"), source=topic)
+    subscription = await store.subscribe(spec)
+    try:
+        await read_deliveries(subscription, 1)
+        subscription.pause()
+        await store.publish(second)
+        await wait_for(
+            "the paused subscription's head and lag move",
+            lambda: bool(subscription.segments()) and subscription.segments()[0].head == "2",
+        )
+        status = subscription.segments()[0]
+        assert status.position == "1"
+        assert status.committed == "1"
+        assert status.lag == 1, "the paused subscription is behind by the record it has not read"
+    finally:
+        await subscription.close()
 
 
 async def test_a_key_lands_on_the_java_clients_partition(
@@ -116,7 +142,9 @@ async def test_the_group_is_named_after_the_processor_on_the_classic_protocol_wi
     service = f"orders-service-{uuid.uuid4().hex[:8]}"
     spec = SubscriptionSpec(name=f"{service}.audit", source=topic)
     subscription = await store.subscribe(spec)
+    assert kafka_tasks(), "the subscription's refresher runs until it closes"
     try:
+        await wait_for_async("the group has a member", lambda: _has_members(admin, spec.name))
         described = await describe_group(admin, spec.name)
         assert described is not None
         assert described.protocol_type == "consumer"
@@ -127,6 +155,7 @@ async def test_the_group_is_named_after_the_processor_on_the_classic_protocol_wi
     finally:
         await subscription.close()
     await wait_for_async("the group has no members", lambda: _no_members(admin, spec.name))
+    assert kafka_tasks() == [], "close leaves no snodra:kafka: task behind"
 
 
 async def test_the_group_commits_the_next_offset_and_a_new_subscription_resumes_there(
@@ -288,17 +317,24 @@ async def test_the_reset_side_plans_and_applies_positions_and_refuses_while_read
     assert ids(again) == [outgoing.id for outgoing in sent]
 
 
-async def test_topic_names_are_unique(admin: AIOKafkaAdminClient, create_topic: CreateTopic) -> None:
-    first = await create_topic(1, prefix="unique")
-    second = await create_topic(1, prefix="unique")
-    assert first != second
-    topics = await admin.describe_topics([first, second])
-    assert {topic["topic"] for topic in topics} == {first, second}
-    assert all(not topic["error_code"] for topic in topics)
+async def test_a_publish_to_a_missing_topic_fails_and_creates_nothing(
+    admin: AIOKafkaAdminClient, make_store: MakeStore
+) -> None:
+    missing = f"missing-{uuid.uuid4().hex}"
+    store = make_store(request_timeout_ms=1_000, session_timeout_ms=100)
+    with pytest.raises(Failed):
+        await store.publish(event(missing, "missing-topic", "order-42"))
+    described = await admin.describe_topics([missing])
+    assert described
+    assert described[0]["error_code"] != 0, "the broker creates no topic; the store must not either"
 
 
 async def _no_members(admin: AIOKafkaAdminClient, group: str) -> bool:
     return not await group_members(admin, group)
+
+
+async def _has_members(admin: AIOKafkaAdminClient, group: str) -> bool:
+    return bool(await group_members(admin, group))
 
 
 def unique_group(service: str, processor: str) -> str:

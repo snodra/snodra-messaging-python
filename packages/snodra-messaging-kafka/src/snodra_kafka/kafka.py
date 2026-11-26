@@ -19,7 +19,9 @@ the wire is the one every Snodra library writes
 - a dead letter goes to ``<source>.dlt``.
 
 The store declares ``replay``, ``lag`` and ``native-dead-letter``. This library has no event browser,
-so the store declares no ``browse``. It never creates or changes topics: the infrastructure does.
+so the store declares no ``browse``. It never creates or changes topics: the infrastructure does, and
+the broker must keep ``auto.create.topics.enable=false``; with auto-creation on, the broker would
+create a missing topic on the first publish or subscription (the add-on tests pin the setting off).
 
 Every subscription owns a Kafka consumer; :meth:`KafkaSubscription.close` flushes what was
 acknowledged and leaves the group. :meth:`KafkaEventStore.close` stops the producer and does not
@@ -116,6 +118,15 @@ DEFAULT_BOOTSTRAP: Final = "kafka:19092"
 BOOTSTRAP_VARIABLE: Final = "SNODRA_KAFKA_BOOTSTRAP"
 """The environment variable that carries the bootstrap servers."""
 
+_TOPIC_NAME_MAX: Final = 249
+"""The longest Kafka topic name."""
+
+_CLIENT_ID_LIMIT: Final = 255
+"""The longest Kafka client id, in bytes."""
+
+_TOPIC_NAME_CHARS: Final = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+"""The characters a Kafka topic name may use."""
+
 # TODO(spec-gap): SG-27
 _CAPABILITIES: Final[frozenset[Capability]] = frozenset(
     {Capability.REPLAY, Capability.LAG, Capability.NATIVE_DEAD_LETTER}
@@ -137,9 +148,6 @@ processor stays a group member; the client's own bound is raised so it does not 
 either. A dead process is found by the session timeout, which the heartbeat task cannot miss while
 it is alive. (SG-24.)
 """
-
-_CLIENT_ID_LIMIT: Final = 255
-"""The longest Kafka client id, in bytes."""
 
 _PERMANENT_PUBLISH_ERRORS: Final[tuple[type[BaseException], ...]] = (
     RecordTooLargeError,
@@ -182,10 +190,23 @@ class KafkaConfig:
             raise Invalid("the Kafka bootstrap servers are empty")
         if not self.client_id.strip():
             raise Invalid("the Kafka client id is empty")
+        if len(self.client_id.encode()) > _CLIENT_ID_LIMIT:
+            raise Invalid(f"the Kafka client id is longer than {_CLIENT_ID_LIMIT} bytes")
         if self.request_timeout_ms < 1:
             raise Invalid(f"the Kafka request timeout must be at least 1 ms, got {self.request_timeout_ms}")
         if self.session_timeout_ms < 1:
             raise Invalid(f"the Kafka session timeout must be at least 1 ms, got {self.session_timeout_ms}")
+        if self.request_timeout_ms <= self.session_timeout_ms:
+            raise Invalid(
+                f"the Kafka request timeout ({self.request_timeout_ms} ms) must be longer than the "
+                f"session timeout ({self.session_timeout_ms} ms)"
+            )
+        heartbeat = min(HEARTBEAT_INTERVAL_MS, max(1, self.session_timeout_ms // 3))
+        if heartbeat >= self.session_timeout_ms:
+            raise Invalid(
+                f"the Kafka heartbeat interval ({heartbeat} ms) must be shorter than the session timeout "
+                f"({self.session_timeout_ms} ms)"
+            )
         if self.max_poll_records < 1:
             raise Invalid(f"the Kafka max poll records must be at least 1, got {self.max_poll_records}")
         if self.status_refresh <= 0:
@@ -206,6 +227,7 @@ class KafkaConfig:
             "bootstrap_servers": self.bootstrap_servers,
             "request_timeout_ms": self.request_timeout_ms,
             "acks": "all",
+            "client_id": self.client_id,
             "enable_idempotence": True,
             "partitioner": _partitioner,
         }
@@ -277,12 +299,14 @@ class KafkaEventStore:
 
     async def publish(self, event: OutgoingEvent) -> None:
         """Appends ``event`` to the topic named by its source and returns once the broker
-        acknowledged it. A blank source, an oversized record, an invalid or unknown topic or a
-        refused authorization is :class:`~snodra.Rejected`; any other failure, an
-        unknown topic included (it may appear later), is :class:`~snodra.Failed`."""
+        acknowledged it. A blank source, a name no Kafka topic can have, an oversized record or a
+        refused authorization is :class:`~snodra.Rejected`; an unknown topic (it may appear later)
+        and any other failure is :class:`~snodra.Failed`."""
         # TODO(spec-gap): SG-18
         if not event.source.strip():
             raise Rejected("an event needs a source")
+        if not _valid_topic_name(event.source):
+            raise Rejected(f"the topic {event.source!r} cannot exist")
         try:
             headers = record_headers(event.headers)
             key = None if event.key is None else event.key.encode()
@@ -300,11 +324,14 @@ class KafkaEventStore:
 
     async def subscribe(self, spec: SubscriptionSpec) -> EventStoreSubscription:
         """Joins ``spec`` as one more instance: a consumer of the group ``spec.name`` reading the
-        topic ``spec.source``. The group joins before the call returns, so the first
-        :meth:`~snodra.EventStoreSubscription.next` yields the first assignment."""
+        topic ``spec.source``. The consumer connects and subscribes before the call returns; the
+        group joins in the background, so the first :meth:`~snodra.EventStoreSubscription.next`
+        waits for the assignment (an empty one included) instead of ``subscribe`` waiting for it."""
         # TODO(spec-gap): SG-18
         if not spec.name or not spec.source:
             raise Invalid("a subscription needs a name and a source")
+        if not _valid_topic_name(spec.source):
+            raise Invalid(f"the topic {spec.source!r} cannot exist")
         self._instances += 1
         subscription = KafkaSubscription(self._config, spec, self._client_id(spec, self._instances))
         try:
@@ -322,6 +349,8 @@ class KafkaEventStore:
         # TODO(spec-gap): SG-18
         if not spec.name or not spec.source:
             raise Invalid("a subscription needs a name and a source")
+        if not _valid_topic_name(spec.source):
+            raise Invalid(f"the topic {spec.source!r} cannot exist")
         return KafkaAdmin(self._config, spec)
 
     def compare(self, a: str, b: str) -> int:
@@ -380,7 +409,11 @@ def record_headers(headers: Mapping[str, str]) -> list[tuple[str, bytes]]:
     trailing = (EventHeaders.TYPE, EventHeaders.ID, EventHeaders.TIMESTAMP, EventHeaders.SOURCE)
     names = sorted(name for name in headers if name not in trailing)
     names.extend(name for name in trailing if name in headers)
-    return [(name, headers[name].encode()) for name in names]
+    record: list[tuple[str, bytes]] = []
+    for name in names:
+        name.encode()  # a header name is UTF-8 text too; a lone surrogate is rejected by publish
+        record.append((name, headers[name].encode()))
+    return record
 
 
 def delivered_headers(record: ConsumerRecord) -> dict[str, str]:
@@ -432,18 +465,17 @@ class KafkaSubscription(ConsumerRebalanceListener):  # type: ignore[misc]  # aio
         self._client_id = client_id
 
     async def start(self) -> None:
-        """Creates the consumer and joins the group; the first assignment is queued when it comes."""
+        """Creates the consumer, connects it and subscribes. The group joins in the background; the
+        first :meth:`next` waits for its assignment (an empty one included)."""
         consumer = AIOKafkaConsumer(**self._config.consumer_settings(self._client_id), group_id=self._group)
-        consumer.subscribe(topics=[self._source], listener=self)
         self._consumer = consumer
         try:
             await consumer.start()
+            consumer.subscribe(topics=[self._source], listener=self)
         except BaseException:
             await self._stop_consumer()
             raise
         self._started = True
-        if not self._changes:
-            self._assignment_changed()
         self._refresh = asyncio.create_task(self._refresh_loop(), name=f"snodra:kafka:{self._spec.name}")
 
     async def next(self) -> SubscriptionEvent:
@@ -663,16 +695,6 @@ class KafkaSubscription(ConsumerRebalanceListener):  # type: ignore[misc]  # aio
         self._changes.append(Assigned(segment_names(partitions)))
         self._refresh_wake.set()
 
-    def _assignment_changed(self) -> None:
-        """Queues the assignment the consumer reports when the callback did not (defensive)."""
-        consumer = self._consumer
-        if consumer is None:
-            return
-        partitions = sorted(tp.partition for tp in consumer.assignment() if tp.topic == self._source)
-        self._assigned.update(partitions)
-        self._changes.append(Assigned(segment_names(partitions)))
-        self._refresh_wake.set()
-
     def _pause_assigned(self) -> None:
         consumer = self._consumer
         if consumer is None or not self._assigned:
@@ -712,8 +734,12 @@ class KafkaSubscription(ConsumerRebalanceListener):  # type: ignore[misc]  # aio
         consumer = self._consumer
         if consumer is None:
             return
-        with contextlib.suppress(IllegalStateError):
+        try:
             consumer.seek(TopicPartition(self._source, partition), offset)
+        except IllegalStateError:
+            return
+        except KafkaError as error:
+            raise Failed(f"kafka: the seek to {partition}/{offset} failed: {error}") from error
 
     def _committed_position(self, partition: int) -> int | None:
         own = self._acked.get(partition)
@@ -725,15 +751,22 @@ class KafkaSubscription(ConsumerRebalanceListener):  # type: ignore[misc]  # aio
         return max(own, broker)
 
     def _head(self, partition: int) -> int | None:
+        """The segment's head: the greater of the refreshed end-offset cache and the client's
+        highwater. While a subscription is paused the client's highwater stops moving, so the
+        refreshed cache is what keeps the head and the lag honest."""
+        cached = self._ends.get(partition)
         consumer = self._consumer
         if consumer is not None:
             try:
                 highwater = consumer.highwater(TopicPartition(self._source, partition))
             except (AssertionError, IllegalStateError):
                 highwater = None
+            except KafkaError as error:
+                raise Failed(f"kafka: the head of {partition} was not read: {error}") from error
             if highwater is not None:
-                return int(highwater)
-        return self._ends.get(partition)
+                head = int(highwater)
+                return head if cached is None else max(head, cached)
+        return cached
 
     async def _refresh_loop(self) -> None:
         while not self._closed:
@@ -802,6 +835,8 @@ class KafkaAdmin:
                     return await self._members_of(admin)
         except TimeoutError as error:
             raise Failed(f"kafka: the members of {self._group!r} were not read in time") from error
+        except KafkaError as error:
+            raise Failed(f"kafka: the members of {self._group!r} were not read: {error}") from error
 
     async def plan(self, target: ResetTarget) -> list[ReplayRange]:
         """Where ``target`` moves each partition, from the topic's offsets and the group's committed
@@ -815,6 +850,8 @@ class KafkaAdmin:
                     committed = await self._committed_of(admin, topic_partitions)
         except TimeoutError as error:
             raise Failed(f"kafka: the plan of {self._group!r} was not read in time") from error
+        except KafkaError as error:
+            raise Failed(f"kafka: the plan of {self._group!r} was not read: {error}") from error
         ranges = [
             ReplayRange(
                 source=self._source,
@@ -829,7 +866,13 @@ class KafkaAdmin:
 
     async def apply(self, ranges: Sequence[ReplayRange]) -> None:
         """Moves each range's segment's committed position to its ``start``, all or nothing; refused
-        with :class:`~snodra.SubscribersActive` while an instance reads the group."""
+        with :class:`~snodra.SubscribersActive` while an instance reads the group.
+
+        Every range is validated before the one offset commit; a client-side validation failure
+        moves nothing. Kafka answers the commit per partition, so a broker-side per-partition
+        failure after another partition was accepted is reported as :class:`~snodra.Failed` and not
+        rolled back (SG-29)."""
+        # TODO(spec-gap): SG-29
         if not ranges:
             return
         try:
@@ -863,6 +906,8 @@ class KafkaAdmin:
                         raise Failed(f"kafka: the offsets of {self._group!r} were not committed: {error}") from error
         except TimeoutError as error:
             raise Failed(f"kafka: the reset of {self._group!r} was not applied in time") from error
+        except KafkaError as error:
+            raise Failed(f"kafka: the reset of {self._group!r} was not applied: {error}") from error
 
     @asynccontextmanager
     async def _admin(self) -> AsyncIterator[AIOKafkaAdminClient]:
@@ -931,9 +976,14 @@ class KafkaAdmin:
                 continue
             if topic.get("error_code"):
                 raise Invalid(f"the topic {self._source!r} does not exist")
-            partitions = sorted(
-                partition["partition"] for partition in topic.get("partitions", ()) if not partition.get("error_code")
-            )
+            metadata = topic.get("partitions", ())
+            unavailable = [partition for partition in metadata if partition.get("error_code")]
+            if unavailable:
+                raise Failed(
+                    f"kafka: the topic {self._source!r} has unavailable partition(s): "
+                    + ", ".join(str(partition["partition"]) for partition in unavailable)
+                )
+            partitions = sorted(partition["partition"] for partition in metadata)
             if partitions:
                 return partitions
             raise Invalid(f"the topic {self._source!r} has no partitions")
@@ -976,12 +1026,7 @@ class KafkaAdmin:
                 if found_at is not None and found_at.offset >= 0:
                     moves[topic_partition.partition] = found_at.offset
                 else:
-                    end = ends.get(topic_partition)
-                    if end is None:
-                        raise Invalid(
-                            f"the topic {self._source!r} has no end offset for partition {topic_partition.partition}"
-                        )
-                    moves[topic_partition.partition] = end
+                    moves[topic_partition.partition] = _end_of(ends, self._source, topic_partition.partition)
             return moves
         if isinstance(target, Positions):
             if not target.positions:
@@ -994,8 +1039,8 @@ class KafkaAdmin:
                 if partition not in known:
                     raise Invalid(f"the topic {self._source!r} has no partition {segment}")
                 offset = parse_position(position)
-                end = ends.get(TopicPartition(self._source, partition))
-                if end is not None and offset > end:
+                end = _end_of(ends, self._source, partition)
+                if offset > end:
                     raise Invalid(f"position {offset} is past the head {end} of segment {partition}")
                 if partition in moves:
                     raise Invalid(f"partition {partition} is given twice")
@@ -1018,14 +1063,30 @@ class KafkaAdmin:
             if partition not in known:
                 raise Invalid(f"the topic {self._source!r} has no partition {replay_range.segment}")
             offset = parse_position(replay_range.start)
-            end = ends.get(TopicPartition(self._source, partition))
-            if end is not None and offset > end:
+            end = _end_of(ends, self._source, partition)
+            if offset > end:
                 raise Invalid(f"position {offset} is past the head {end} of segment {partition}")
             topic_partition = TopicPartition(self._source, partition)
             if topic_partition in moves:
                 raise Invalid(f"segment {partition} is moved twice")
             moves[topic_partition] = offset
         return moves
+
+
+def _end_of(ends: Mapping[TopicPartition, int], source: str, partition: int) -> int:
+    """The end offset of one partition, or :class:`~snodra.Failed` when the client did not have it."""
+    end = ends.get(TopicPartition(source, partition))
+    if end is None:
+        raise Failed(f"kafka: the end offset of {source}/{partition} is unknown")
+    return int(end)
+
+
+def _valid_topic_name(name: str) -> bool:
+    """Whether ``name`` is a topic Kafka can have: 1 to 249 characters from ``[A-Za-z0-9._-]``, and
+    neither ``.`` nor ``..``. A name like this that does not exist yet is still a valid topic."""
+    return (
+        0 < len(name) <= _TOPIC_NAME_MAX and name not in {".", ".."} and all(char in _TOPIC_NAME_CHARS for char in name)
+    )
 
 
 def _topic_partitions(source: str, partitions: Sequence[int]) -> list[TopicPartition]:
@@ -1039,7 +1100,7 @@ def _checked_offsets(
     for partition in partitions:
         offset = offsets.get(TopicPartition(source, partition))
         if offset is None:
-            raise Invalid(f"the topic {source!r} has no {what} offset for partition {partition}")
+            raise Failed(f"kafka: the topic {source!r} has no {what} offset for partition {partition}")
         moves[partition] = offset
     return moves
 
