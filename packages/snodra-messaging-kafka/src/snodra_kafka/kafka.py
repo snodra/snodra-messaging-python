@@ -69,7 +69,7 @@ from aiokafka.errors import (
     UnsupportedForMessageFormatError,
 )
 from aiokafka.structs import ConsumerRecord, TopicPartition
-from snodra._eventstore import (
+from snodra import (
     Assigned,
     Capability,
     Delivery,
@@ -278,8 +278,8 @@ class KafkaEventStore:
     async def publish(self, event: OutgoingEvent) -> None:
         """Appends ``event`` to the topic named by its source and returns once the broker
         acknowledged it. A blank source, an oversized record, an invalid or unknown topic or a
-        refused authorization is :class:`~snodra._eventstore.Rejected`; any other failure, an
-        unknown topic included (it may appear later), is :class:`~snodra._eventstore.Failed`."""
+        refused authorization is :class:`~snodra.Rejected`; any other failure, an
+        unknown topic included (it may appear later), is :class:`~snodra.Failed`."""
         # TODO(spec-gap): SG-18
         if not event.source.strip():
             raise Rejected("an event needs a source")
@@ -301,7 +301,7 @@ class KafkaEventStore:
     async def subscribe(self, spec: SubscriptionSpec) -> EventStoreSubscription:
         """Joins ``spec`` as one more instance: a consumer of the group ``spec.name`` reading the
         topic ``spec.source``. The group joins before the call returns, so the first
-        :meth:`~snodra._eventstore.EventStoreSubscription.next` yields the first assignment."""
+        :meth:`~snodra.EventStoreSubscription.next` yields the first assignment."""
         # TODO(spec-gap): SG-18
         if not spec.name or not spec.source:
             raise Invalid("a subscription needs a name and a source")
@@ -542,7 +542,7 @@ class KafkaSubscription(ConsumerRebalanceListener):  # type: ignore[misc]  # aio
             consumer.resume(*_topic_partitions(self._source, sorted(self._assigned)))
 
     def segments(self) -> list[SegmentStatus]:
-        """The assigned segments, in :func:`snodra._eventstore.segment_order`, with their positions,
+        """The assigned segments, in :func:`snodra.segment_order`, with their positions,
         committed offsets, heads and lag as last known; never blocking."""
         if self._closed:
             return []
@@ -829,7 +829,7 @@ class KafkaAdmin:
 
     async def apply(self, ranges: Sequence[ReplayRange]) -> None:
         """Moves each range's segment's committed position to its ``start``, all or nothing; refused
-        with :class:`~snodra._eventstore.SubscribersActive` while an instance reads the group."""
+        with :class:`~snodra.SubscribersActive` while an instance reads the group."""
         if not ranges:
             return
         try:

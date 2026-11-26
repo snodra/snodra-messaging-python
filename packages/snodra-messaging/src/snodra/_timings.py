@@ -79,7 +79,8 @@ class Timings:
     event_resubscribe_min: float
     """After a failed event subscription, the first wait before subscribing again."""
     event_resubscribe_max: float
-    """The cap of that wait (the wait doubles until it, and starts over once a subscription delivers)."""
+    """The cap of that wait (the wait doubles until it, and starts over once a subscription delivers or lived
+    :attr:`event_resubscribe_stable`)."""
     event_resubscribe_stable: float
     """A subscription that lived this long before it failed counts as a good one: the next wait starts over."""
     dns_refresh: float

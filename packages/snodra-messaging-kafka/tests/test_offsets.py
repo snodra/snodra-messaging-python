@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from aiokafka.coordinator.assignors.range import RangePartitionAssignor
-from snodra._eventstore import (
+from snodra import (
     Capability,
     EventHeaders,
     Failed,

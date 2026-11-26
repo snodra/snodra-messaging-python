@@ -13,7 +13,8 @@ For every record the event store delivers:
 
 A record is never acknowledged before its handling committed: a crash in between leaves the record to the next
 subscription of the same name, whose marker skips what was handled already. A subscription that fails is closed and
-joined again after a backoff (1 s doubling to 30 s).
+joined again after a backoff (1 s doubling to 30 s), which starts over after a subscription delivered a record or lived
+30 s before it failed.
 
 See https://snodra.damoreira.com/docs/library-authors/writing-a-library/#level-2-events (Consume) and
 https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/#the-rule.
@@ -60,6 +61,14 @@ def _cancelling() -> bool:
 class _Duplicate(Exception):
     """Raised inside the marker's transaction so a duplicate aborts it instead of committing (the port contract:
     the caller aborts when ``record`` answers false)."""
+
+
+class _Undecodable(Exception):
+    """The codec could not read the payload as one handler's message: another attempt cannot change it."""
+
+    def __init__(self, error: DecodeError) -> None:
+        super().__init__(str(error))
+        self.error = error
 
 
 class EventConsumer:
@@ -230,10 +239,10 @@ class EventConsumer:
                 if _cancelling():
                     raise
                 failure = error
-            except DecodeError as error:
+            except _Undecodable as error:
                 # TODO(spec-gap): SG-22
                 # The payload does not fit the handler's message class: another attempt cannot change it.
-                failure = error
+                failure = error.error
                 break
             except Exception as error:
                 failure = error
@@ -287,7 +296,10 @@ class EventConsumer:
                     # every add-on's context manager roll back, and nothing of this attempt commits.
                     raise _Duplicate
                 for handler in handlers:
-                    message: object = self._codec.decode(delivery.payload, handler.message)
+                    try:
+                        message: object = self._codec.decode(delivery.payload, handler.message)
+                    except DecodeError as error:
+                        raise _Undecodable(error) from error
                     await handler.fn(message)
         except _Duplicate:
             return True

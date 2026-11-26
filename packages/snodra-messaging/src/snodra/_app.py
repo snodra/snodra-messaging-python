@@ -727,11 +727,14 @@ class App:
         every live stream (its ack awaited for at most 1 s), then a clean ``ReplyEnd`` on every subscription target this
         instance serves (so their subscribers hear them end before the stream is gone), then the handlers in flight
         drained (awaited for at most 5 s, then cancelled and never awaited again), then each stream half-closed and its
-        end awaited (at most 2 s). A handler still running when ``timeout`` is reached is cancelled and left behind: one
-        warning names it. A second call returns at once. The handlers being drained can still send commands and queries,
-        and a stream lost meanwhile is opened again with no types (no new work arrives on it); once the drain is over
-        nothing is sent: a call fails as :class:`NeverSent`, and one still waiting for its answer as
-        :class:`OutcomeUnknown` ("hub connection stopped").
+        end awaited (at most 2 s). Before the hubs are left, the event phase cancels the outbox relay and the consumers
+        and awaits them for at most ``timeout``; a task that ignores its cancellation is left behind with a warning.
+        That bound is the event phase's own, in addition to the hub leave's, so the call can spend up to about twice
+        ``timeout`` before the connection close phases. A handler still running when ``timeout`` is reached is cancelled
+        and left behind: one warning names it. A second call returns at once. The handlers being drained can still send
+        commands and queries, and a stream lost meanwhile is opened again with no types (no new work arrives on it);
+        once the drain is over nothing is sent: a call fails as :class:`NeverSent`, and one still waiting for its answer
+        as :class:`OutcomeUnknown` ("hub connection stopped").
 
         The unexpected error that crashed a connection (a library bug, logged at error level when it happened) is
         raised here once everything is stopped, unless another exception or a cancellation is already propagating

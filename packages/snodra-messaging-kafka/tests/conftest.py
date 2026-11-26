@@ -171,7 +171,7 @@ async def read_deliveries(
     """Reads ``count`` deliveries, acknowledging those ``ack`` accepts (all by default)."""
     import asyncio
 
-    from snodra._eventstore import Delivery
+    from snodra import Delivery
 
     deliveries: list[Any] = []
     async with asyncio.timeout(within):
@@ -195,7 +195,7 @@ async def read_all(
     """Reads deliveries until ``until`` accepts the accumulated list."""
     import asyncio
 
-    from snodra._eventstore import Delivery
+    from snodra import Delivery
 
     deliveries: list[Any] = []
     async with asyncio.timeout(within):
@@ -295,6 +295,6 @@ def positions(deliveries: Sequence[Any]) -> list[str]:
 
 def ids(deliveries: Sequence[Any]) -> list[str]:
     """The ``id`` headers of ``deliveries``."""
-    from snodra._eventstore import EventHeaders
+    from snodra import EventHeaders
 
     return [delivery.headers.get(EventHeaders.ID, "") for delivery in deliveries]

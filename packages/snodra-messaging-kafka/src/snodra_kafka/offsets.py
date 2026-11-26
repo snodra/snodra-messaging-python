@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Final
 
-from snodra._eventstore import Invalid
+from snodra import Invalid
 
 MAX_PARTITION: Final = 2**31 - 1
 """The largest Kafka partition number (the protocol's int32)."""
@@ -27,7 +27,7 @@ def parse_segment(segment: str) -> int:
     """``segment`` as a partition number: a decimal int32 that is not negative.
 
     The forms the Kafka clients accept are accepted (an optional sign and leading zeros); anything
-    else is :class:`~snodra._eventstore.Invalid`.
+    else is :class:`~snodra.Invalid`.
     """
     partition = _decimal(segment, MAX_PARTITION)
     if partition is None:
@@ -37,7 +37,7 @@ def parse_segment(segment: str) -> int:
 
 def parse_position(position: str) -> int:
     """``position`` as an offset: a decimal int64 that is not negative; anything else is
-    :class:`~snodra._eventstore.Invalid`."""
+    :class:`~snodra.Invalid`."""
     offset = _decimal(position, MAX_OFFSET)
     if offset is None:
         raise Invalid(f"position {position!r} is not an offset")
@@ -48,7 +48,7 @@ def committed_offset(position: str) -> int:
     """The offset a group commits for an acknowledgement of ``position``: the next one to read.
 
     Kafka always stores the next offset, never the acknowledged one; a position with no next offset
-    is :class:`~snodra._eventstore.Invalid`.
+    is :class:`~snodra.Invalid`.
     """
     offset = parse_position(position)
     if offset == MAX_OFFSET:
@@ -75,7 +75,7 @@ def compare_positions(a: str, b: str) -> int:
     """The order of two offsets: decimal offsets by value, text that is not an offset after every
     offset (and by its UTF-8 bytes among themselves).
 
-    :func:`snodra._eventstore.EventStore.compare` reports a difference for any two positions, also
+    :func:`snodra.EventStore.compare` reports a difference for any two positions, also
     for text that is not an offset, so the comparison is total.
     """
     first = _decimal(a, MAX_OFFSET)

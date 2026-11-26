@@ -19,7 +19,7 @@ from eventhelpers import (
 )
 from fakehub import FakeHub, ack
 from helpers import SCALED, eventually, library_tasks, new_app
-from snodra import App, Caller, MemoryStore, MessageInfo, current_caller, current_message
+from snodra import App, Caller, DecodeError, MemoryStore, MessageInfo, current_caller, current_message
 from snodra._eventstore import ReplayRange, SubscriptionSpec
 from snodra._store import ProcessedMarker, ProcessedStore, Tx
 from snodra._timings import Timings
@@ -155,6 +155,32 @@ async def test_a_payload_that_does_not_fit_the_handler_is_skipped_at_once(hub: F
     await _acked(sub)
     assert calls == 0
     assert len(processed.markers) == 1  # one transaction, no retry
+    assert not await store.processed.exists("processor:default:e-1")
+
+
+async def test_a_decode_error_raised_by_a_handler_is_an_ordinary_failure(hub: FakeHub) -> None:
+    store = MemoryStore()
+    events = ScriptedEventStore()
+    app = new_app(
+        hub,
+        store=store,
+        event_store=events,
+        outbox_enabled=False,
+        consumer_max_attempts=3,
+        _timings=_fast_timings(),
+    )
+    calls = 0
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        nonlocal calls
+        calls += 1
+        raise DecodeError("the handler's own decode")
+
+    sub = await _started(hub, app, events)
+    sub.deliver(delivery())
+    await _acked(sub)
+    assert calls == 3
     assert not await store.processed.exists("processor:default:e-1")
 
 

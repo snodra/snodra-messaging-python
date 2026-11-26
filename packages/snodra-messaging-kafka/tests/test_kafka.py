@@ -14,12 +14,13 @@ from datetime import UTC, datetime
 import pytest
 from aiokafka.admin import AIOKafkaAdminClient
 from aiokafka.structs import TopicPartition
-from snodra._eventstore import (
+from snodra import (
     Capability,
     Earliest,
     EventHeaders,
     Invalid,
     Latest,
+    MemoryStore,
     OutgoingEvent,
     Positions,
     Rejected,
@@ -28,7 +29,6 @@ from snodra._eventstore import (
     Timestamp,
     dead_letter_source,
 )
-from snodra._store_memory import MemoryStore
 from snodra.testing import run_event_store_conformance
 from snodra_kafka import KafkaEventStore, KafkaSubscription, partition_for
 

@@ -14,6 +14,13 @@ implements it.
 - **Times** are epoch milliseconds; a time a store stamps itself (an entry's sending, a lease) is the application's
   clock, never the database's.
 
+The ports and their values are re-exported from :mod:`snodra` for add-ons: import ``MessageStore``, ``Tx``,
+``TransactionScope``, ``OutboxStore``, ``Conflict``, ``InvalidMessage`` and the rest from ``snodra``, never from this
+private module. The message store's base ``StoreError``, ``Failed`` and ``Unsupported`` are exported there as
+``MessageStoreError``, ``MessageStoreFailed`` and ``MessageStoreUnsupported``, since the event store owns the shorter
+names. ``Tx`` is the opaque transaction handle the port's ``tx=`` parameter takes; ``TransactionScope`` is the context
+manager behind :meth:`MessageStore.transaction`.
+
 See https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/.
 """
 

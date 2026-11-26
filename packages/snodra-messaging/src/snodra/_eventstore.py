@@ -21,6 +21,11 @@ position of every segment.
 This library declares no event browser and no add-on declares ``browse`` at these levels; the interface stops at
 :meth:`EventStore.admin`, and an add-on that needs a browser is out of scope here.
 
+The ports, their values and their errors are re-exported from :mod:`snodra` for add-ons: import ``EventStore``,
+``EventStoreSubscription``, ``Assigned``, ``Rejected`` and the rest from ``snodra``, never from this private module.
+``StoreError``, ``Failed`` and ``Unsupported`` are this module's; the message store's errors of those names are
+``MessageStoreError``, ``MessageStoreFailed`` and ``MessageStoreUnsupported`` in :mod:`snodra`.
+
 See https://snodra.damoreira.com/docs/library-authors/event-store-add-ons/.
 """
 
