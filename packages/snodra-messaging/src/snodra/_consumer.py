@@ -27,6 +27,7 @@ import time
 
 from snodra._backoff import next_wait
 from snodra._codec import Codec
+from snodra._errors import DecodeError
 from snodra._events import (
     EventHandler,
     EventRegistry,
@@ -56,6 +57,11 @@ def _cancelling() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+class _Duplicate(Exception):
+    """Raised inside the marker's transaction so a duplicate aborts it instead of committing (the port contract:
+    the caller aborts when ``record`` answers false)."""
+
+
 class EventConsumer:
     """One processor's consumer: its subscription on the event store and its handlers."""
 
@@ -73,6 +79,7 @@ class EventConsumer:
         backoff: float,
         resubscribe_min: float,
         resubscribe_max: float,
+        resubscribe_stable: float,
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"the event handler attempts must be at least 1, got {max_attempts}")
@@ -86,6 +93,7 @@ class EventConsumer:
         self._backoff = backoff
         self._resubscribe_min = resubscribe_min
         self._resubscribe_max = resubscribe_max
+        self._resubscribe_stable = resubscribe_stable
         self._spec = SubscriptionSpec(
             name=processor_subscription(service, processor),
             source=source,
@@ -133,26 +141,16 @@ class EventConsumer:
                 wait = next_wait(wait, self._resubscribe_min, self._resubscribe_max)
                 continue
             self._delivered = False
+            started = time.monotonic()
+            trouble: BaseException | None = None
             try:
                 await self._read(subscription)
             except asyncio.CancelledError as error:
                 if _cancelling():
                     raise
-                log.warning(
-                    "the event processor %s stopped reading %s, subscribing again in %.2f s: %s",
-                    self._processor,
-                    self._spec.name,
-                    wait,
-                    error,
-                )
+                trouble = error
             except Exception as error:
-                log.warning(
-                    "the event processor %s stopped reading %s, subscribing again in %.2f s: %s",
-                    self._processor,
-                    self._spec.name,
-                    wait,
-                    error,
-                )
+                trouble = error
             finally:
                 try:
                     await subscription.close()
@@ -162,12 +160,18 @@ class EventConsumer:
                     log.warning("closing the subscription %s failed: %s", self._spec.name, error)
                 except Exception as error:
                     log.warning("closing the subscription %s failed: %s", self._spec.name, error)
-            wait = (
-                self._resubscribe_min
-                if self._delivered
-                else next_wait(wait, self._resubscribe_min, self._resubscribe_max)
-            )
+            if self._delivered or time.monotonic() - started >= self._resubscribe_stable:
+                wait = self._resubscribe_min
+            if trouble is not None:
+                log.warning(
+                    "the event processor %s stopped reading %s, subscribing again in %.2f s: %s",
+                    self._processor,
+                    self._spec.name,
+                    wait,
+                    trouble,
+                )
             await asyncio.sleep(wait)
+            wait = next_wait(wait, self._resubscribe_min, self._resubscribe_max)
 
     async def _read(self, subscription: EventStoreSubscription) -> None:
         """Reads until cancelled or the subscription fails."""
@@ -217,6 +221,7 @@ class EventConsumer:
         user_id = delivery.headers.get(EventHeaders.USER_ID, "")
         # TODO(spec-gap): SG-20
         failure: BaseException | None = None
+        attempt = 0
         for attempt in range(1, self._max_attempts + 1):
             try:
                 with event_handling(info, user_id):
@@ -225,6 +230,11 @@ class EventConsumer:
                 if _cancelling():
                     raise
                 failure = error
+            except DecodeError as error:
+                # TODO(spec-gap): SG-22
+                # The payload does not fit the handler's message class: another attempt cannot change it.
+                failure = error
+                break
             except Exception as error:
                 failure = error
             else:
@@ -247,7 +257,7 @@ class EventConsumer:
             "skipping the %s event %s after %d attempt(s) in processor %s: %s",
             type_,
             event_id,
-            self._max_attempts,
+            attempt,
             self._processor,
             failure,
         )
@@ -270,12 +280,17 @@ class EventConsumer:
             segment=delivery.segment,
             position=delivery.position,
         )
-        async with self._store.transaction():
-            if not await self._store.processed.record(marker):
-                return True
-            for handler in handlers:
-                message: object = self._codec.decode(delivery.payload, handler.message)
-                await handler.fn(message)
+        try:
+            async with self._store.transaction():
+                if not await self._store.processed.record(marker):
+                    # The port contract: a duplicate aborts the caller's transaction. Raising inside the context makes
+                    # every add-on's context manager roll back, and nothing of this attempt commits.
+                    raise _Duplicate
+                for handler in handlers:
+                    message: object = self._codec.decode(delivery.payload, handler.message)
+                    await handler.fn(message)
+        except _Duplicate:
+            return True
         return False
 
     async def _ack(self, subscription: EventStoreSubscription, delivery: Delivery) -> None:

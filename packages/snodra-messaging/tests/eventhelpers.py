@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -162,6 +163,7 @@ class ScriptedEventStore:
     def __init__(self) -> None:
         self.subscriptions: list[ScriptedSubscription] = []
         self.specs: list[SubscriptionSpec] = []
+        self.subscribe_times: list[float] = []
         self.subscribe_failures: deque[BaseException] = deque()
         self.subscribed = asyncio.Event()
 
@@ -169,6 +171,7 @@ class ScriptedEventStore:
         raise NotImplementedError("the scripted event store publishes nothing")
 
     async def subscribe(self, spec: SubscriptionSpec) -> EventStoreSubscription:
+        self.subscribe_times.append(time.monotonic())
         if self.subscribe_failures:
             raise self.subscribe_failures.popleft()
         subscription = ScriptedSubscription()

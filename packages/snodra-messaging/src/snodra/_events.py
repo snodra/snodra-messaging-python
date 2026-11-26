@@ -193,14 +193,14 @@ def event_headers(*, telemetry: Telemetry | None = None) -> dict[str, str]:
     """The headers of an event published now: its correlation id, the acting user id and, when the work that publishes
     carries one, its valid trace context.
 
-    The correlation id is the handled message's, or a fresh UUID outside any handling; an empty correlation id is kept
-    empty, as the request side keeps it (SG-9). The user id is the verified caller's subject for a command or a query
-    and the handled event's ``userId`` inside an event handler; a token never crosses into an event.
+    The correlation id is the handled message's, or a fresh UUID when there is none or it is empty; a published event
+    never carries an empty ``correlationId`` (SG-9). The user id is the verified caller's subject for a command or a
+    query and the handled event's ``userId`` inside an event handler; a token never crosses into an event.
     """
     info = current_message()
     # TODO(spec-gap): SG-23
     headers = {
-        EventHeaders.CORRELATION_ID: new_id() if info is None else info.correlation_id,
+        EventHeaders.CORRELATION_ID: new_id() if info is None or not info.correlation_id else info.correlation_id,
         EventHeaders.USER_ID: _acting_user(),
     }
     if info is not None:
@@ -272,11 +272,18 @@ def outgoing_event(entry: OutboxEntry, *, source: str, service: str) -> Outgoing
 
 
 def is_json_object(payload: bytes) -> bool:
-    """Whether ``payload`` is a JSON object, the only event payload the suite holds."""
+    """Whether ``payload`` is a JSON object, the only event payload the suite holds.
+
+    ``NaN``, ``Infinity`` and ``-Infinity`` are not JSON and are refused, as the outbox contract refuses them.
+    """
     if not payload.lstrip().startswith(b"{"):
         return False
     try:
-        value = json.loads(payload.decode("utf-8"))
+        value = json.loads(payload.decode("utf-8"), parse_constant=_no_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
         return False
     return isinstance(value, dict)
+
+
+def _no_constant(token: str) -> None:
+    raise ValueError(f"{token} is not JSON")

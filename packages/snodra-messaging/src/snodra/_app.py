@@ -665,17 +665,23 @@ class App:
                     backoff=self._timings.event_handler_backoff,
                     resubscribe_min=self._timings.event_resubscribe_min,
                     resubscribe_max=self._timings.event_resubscribe_max,
+                    resubscribe_stable=self._timings.event_resubscribe_stable,
                 )
                 self._event_tasks.append(consumer.start())
 
-    async def _stop_events(self) -> None:
-        """Cancels the outbox relay and the consumers, and waits for them to end."""
+    async def _stop_events(self, budget: float) -> None:
+        """Cancels the outbox relay and the consumers, and waits for them to end within ``budget`` seconds."""
         tasks, self._event_tasks = self._event_tasks, []
         for task in tasks:
             task.cancel()
         if not tasks:
             return
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            async with asyncio.timeout(budget):
+                outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        except TimeoutError:
+            log.warning("the event tasks did not stop within %.2f s: leaving them behind", budget)
+            return
         for outcome in outcomes:
             if isinstance(outcome, Exception):
                 log.error("an event task ended with an error: %s", outcome)
@@ -739,7 +745,7 @@ class App:
         self._stop.set()
         propagating = False
         try:
-            await self._stop_events()
+            await self._stop_events(budget)
             if self._started:
                 try:
                     async with asyncio.timeout(budget):

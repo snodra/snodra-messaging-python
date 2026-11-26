@@ -153,7 +153,11 @@ library does there. Where an entry is settled, its behaviour is this library's r
   request whose `correlationId` header is present but empty carries one.
 - **This library:** `snodra/_dispatch.py` (`Dispatcher._call`) and `snodra/_propagation.py`. A request without the
   header has its id as its correlation id; a request with an empty header keeps the empty string: the handler's
-  `current_message().correlation_id` is `""`, and the requests it sends carry `correlationId: ""` on.
+  `current_message().correlation_id` is `""`, and the requests it sends carry `correlationId: ""` on. **An event
+  published while handling a message whose correlation id is empty gets a fresh UUID instead** (`snodra/_events.py`,
+  `event_headers`): an event never carries an empty `correlationId`, as Go and Rust also write a new one when there is
+  none. The request side keeps the empty value because SG-9's question is open; the event side follows the
+  specification's "a new UUID when there is none".
 - **Question:** open: should an empty `correlationId` header count as none, so that the request's id stands in?
 
 ### SG-10: a scatter-gather a hub answers with `NO_HANDLER`
@@ -330,11 +334,13 @@ library does there. Where an entry is settled, its behaviour is this library's r
   subscriptions keep failing before they delivered anything, and starts over from 1 s after a subscription that
   delivered an event or lived 30 s (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/Resubscribe.kt:65`);
   the Rust consumer has its own constants.
-- **This library:** `snodra/_consumer.py` (`EventConsumer.run`) with `Timings.event_resubscribe_min` (1 s) and
-  `event_resubscribe_max` (30 s): the wait doubles per failed subscription up to the cap, and starts over at the first
-  wait once a subscription delivered a record. A close that fails is logged and does not stop the resubscribe.
-- **Question:** open: should a long-lived subscription without a delivery also reset the wait, as the Kotlin reader
-  does with its 30 s stability window? Recommend no: a delivery is the signal that the subscription works.
+- **This library:** `snodra/_consumer.py` (`EventConsumer.run`) with `Timings.event_resubscribe_min` (1 s),
+  `event_resubscribe_max` (30 s) and `event_resubscribe_stable` (30 s): the wait is slept first and doubled only after
+  the sleep, so the first retry waits the minimum; it starts over at the minimum once a subscription delivered a record
+  or lived the stability window before it failed. A close that fails is logged and does not stop the resubscribe.
+- **Question:** open: should a long-lived subscription without a delivery reset the wait, as the Kotlin reader does
+  with its 30 s stability window? Recommend yes: the Kotlin reference treats a subscription that lived 30 s as one
+  that worked, and this library does the same.
 - **Wire change:** no.
 
 ### SG-22: what a level-2 library does with a record it can never handle
@@ -349,11 +355,13 @@ library does there. Where an entry is settled, its behaviour is this library's r
   the invalid path at line 521).
 - **This library:** `snodra/_consumer.py` (`EventConsumer._handle`). A record without a type header (or with a blank
   one) and a record whose payload is not a JSON object are logged at warning, without the payload, and acknowledged
-  with no handler run and no marker. A payload of a handled type that the codec cannot read as the handler's message is
-  a handler failure: it is retried with the other handler failures and skipped after its attempts. This library records
-  one marker only after a handler ran to a clean commit.
+  with no handler run and no marker. A payload of a handled type that the codec cannot read as the handler's message
+  (`DecodeError`) is logged at error and acknowledged after that one attempt: the marker recorded before the decode
+  rolls back with the transaction, so it leaves no marker and no handler effect, and the other attempts are not made.
+  Any other handler failure is retried as SG-20 says.
 - **Question:** open: should the level-2 rule name the malformed record explicitly, and should a decode failure be
-  tried once (as Kotlin breaks at once) or with the other attempts? Recommend naming both as this library does.
+  tried once (as Kotlin breaks at once) or with the other attempts? Recommend naming both as this library does: a
+  decode failure is logged and skipped once, without a marker.
 - **Wire change:** no.
 
 ### SG-23: the seven event headers when nothing being handled carries a trace context
@@ -366,9 +374,10 @@ library does there. Where an entry is settled, its behaviour is this library's r
   headers from the current context and writes none when there is none
   (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/OutboxEventBus.kt:58`);
   the Rust relay adds it only when the publishing context carries a valid one.
-- **This library:** `snodra/_events.py` (`event_headers`). The other six headers are always written; `traceparent` is
-  written when the message being handled carries a valid one (and telemetry may supply a child), and omitted when there
-  is none. An empty `traceparent` is never written: it is not a W3C trace context.
+- **This library:** `snodra/_events.py` (`event_headers`, `outgoing_event`). Six headers are always written, with a
+  non-empty `correlationId`; the seventh, `traceparent`, is written when the message being handled carries a valid one
+  (and telemetry may supply a child), and omitted when there is none. An empty `traceparent` is never written: it is
+  not a W3C trace context.
 - **Question:** open: should the specification allow the six headers when no trace context exists, as every official
   library does, or require an empty `traceparent`? Recommend the former; a fabricated or empty trace id is worse than
   its absence.

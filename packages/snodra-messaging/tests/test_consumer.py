@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 
 import pytest
@@ -19,7 +20,8 @@ from eventhelpers import (
 from fakehub import FakeHub, ack
 from helpers import SCALED, eventually, library_tasks, new_app
 from snodra import App, Caller, MemoryStore, MessageInfo, current_caller, current_message
-from snodra._eventstore import SubscriptionSpec
+from snodra._eventstore import ReplayRange, SubscriptionSpec
+from snodra._store import ProcessedMarker, ProcessedStore, Tx
 from snodra._timings import Timings
 
 
@@ -28,6 +30,7 @@ def _fast_timings(**changes: object) -> Timings:
         "event_handler_backoff": 0.01,
         "event_resubscribe_min": 0.01,
         "event_resubscribe_max": 0.02,
+        "event_resubscribe_stable": 0.05,
     }
     values.update(changes)
     return replace(SCALED, **values)  # type: ignore[arg-type]
@@ -41,6 +44,43 @@ async def _started(hub: FakeHub, app: App, events: ScriptedEventStore) -> Script
 
 async def _acked(sub: ScriptedSubscription, count: int = 1) -> None:
     await eventually(lambda: len(sub.acks) >= count)
+
+
+class _RefusingProcessed:
+    """A processed store that answers every record false, as a duplicate marker does."""
+
+    def __init__(self, inner: ProcessedStore) -> None:
+        self._inner = inner
+
+    async def record(self, marker: ProcessedMarker, *, tx: Tx | None = None) -> bool:
+        return False
+
+    async def exists(self, marker_id: str) -> bool:
+        return await self._inner.exists(marker_id)
+
+    async def delete_markers(self, processor: str, ranges: Sequence[ReplayRange]) -> int:
+        return await self._inner.delete_markers(processor, ranges)
+
+    async def purge(self, before_ms: int) -> int:
+        return await self._inner.purge(before_ms)
+
+
+class _NoCommitStore(MemoryStore):
+    """A memory store counting its transactions' commits and rollbacks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.commits = 0
+        self.rollbacks = 0
+        self.processed = _RefusingProcessed(self.processed)
+
+    async def commit(self, tx: Tx) -> None:
+        self.commits += 1
+        await super().commit(tx)
+
+    async def rollback(self, tx: Tx) -> None:
+        self.rollbacks += 1
+        await super().rollback(tx)
 
 
 async def test_the_marker_and_the_handlers_writes_commit_together(hub: FakeHub) -> None:
@@ -90,6 +130,34 @@ async def test_a_failing_handler_rolls_back_the_marker_and_the_published_event(h
     assert await store.outbox.pending() == 0
 
 
+async def test_a_payload_that_does_not_fit_the_handler_is_skipped_at_once(hub: FakeHub) -> None:
+    store = MemoryStore()
+    processed = RecordingProcessed(store.processed)
+    store.processed = processed
+    events = ScriptedEventStore()
+    app = new_app(
+        hub,
+        store=store,
+        event_store=events,
+        outbox_enabled=False,
+        consumer_max_attempts=5,
+        _timings=_fast_timings(),
+    )
+    calls = 0
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        nonlocal calls
+        calls += 1
+
+    sub = await _started(hub, app, events)
+    sub.deliver(delivery(payload=b'{"orderId":42}'))
+    await _acked(sub)
+    assert calls == 0
+    assert len(processed.markers) == 1  # one transaction, no retry
+    assert not await store.processed.exists("processor:default:e-1")
+
+
 async def test_the_record_is_acknowledged_only_after_the_commit(hub: FakeHub) -> None:
     store = MemoryStore()
     events = ScriptedEventStore()
@@ -131,6 +199,46 @@ async def test_a_redelivered_event_whose_marker_exists_skips_the_handlers(hub: F
     assert sub.acks == [("0", "0"), ("0", "1")]
 
 
+async def test_a_duplicate_marker_aborts_its_transaction(hub: FakeHub) -> None:
+    store = _NoCommitStore()
+    events = ScriptedEventStore()
+    app = new_app(hub, store=store, event_store=events, outbox_enabled=False, _timings=_fast_timings())
+    calls = 0
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        nonlocal calls
+        calls += 1
+
+    sub = await _started(hub, app, events)
+    sub.deliver(delivery())
+    await _acked(sub)
+    assert store.commits == 0
+    assert store.rollbacks >= 1
+    assert calls == 0
+    assert sub.acks == [("0", "0")]
+
+
+async def test_two_handlers_of_one_type_run_in_registration_order(hub: FakeHub) -> None:
+    store = MemoryStore()
+    events = ScriptedEventStore()
+    app = new_app(hub, store=store, event_store=events, outbox_enabled=False, _timings=_fast_timings())
+    calls: list[str] = []
+
+    @app.event_handler
+    async def first(event: OrderPlaced) -> None:
+        calls.append("first")
+
+    @app.event_handler
+    async def second(event: OrderPlaced) -> None:
+        calls.append("second")
+
+    sub = await _started(hub, app, events)
+    sub.deliver(delivery())
+    await _acked(sub)
+    assert calls == ["first", "second"]
+
+
 async def test_an_event_type_no_handler_handles_is_acknowledged_and_runs_nothing(hub: FakeHub) -> None:
     store = MemoryStore()
     events = ScriptedEventStore()
@@ -162,10 +270,12 @@ async def test_a_malformed_record_is_acknowledged_and_runs_nothing(hub: FakeHub)
 
     sub = await _started(hub, app, events)
     sub.deliver(delivery(type_=None))
-    sub.deliver(delivery(event_id="e-2", payload=b"[]"))
+    sub.deliver(delivery(event_id="e-2", position="1", payload=b"[]"))
     await _acked(sub, 2)
     assert calls == 0
+    assert sub.acks == [("0", "0"), ("0", "1")]
     assert not await store.processed.exists("processor:default:e-1")
+    assert not await store.processed.exists("processor:default:e-2")
 
 
 async def test_the_handler_reads_the_event_as_the_current_message(hub: FakeHub) -> None:
@@ -240,6 +350,61 @@ async def test_a_failed_subscription_is_joined_again(hub: FakeHub) -> None:
     await app.start()
     await asyncio.wait_for(events.subscribed.wait(), 1.0)
     assert len(events.subscriptions) == 1
+
+
+async def test_the_first_resubscribe_waits_the_minimum(hub: FakeHub) -> None:
+    events = ScriptedEventStore()
+    for _ in range(2):
+        events.subscribe_failures.append(RuntimeError("the event store is down"))
+    app = new_app(
+        hub,
+        store=MemoryStore(),
+        event_store=events,
+        outbox_enabled=False,
+        _timings=_fast_timings(event_resubscribe_min=0.2, event_resubscribe_max=0.8),
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await eventually(lambda: len(events.subscribe_times) >= 3, within=2.0)
+    times = list(events.subscribe_times[:3])
+    first_gap = times[1] - times[0]
+    second_gap = times[2] - times[1]
+    assert 0.15 <= first_gap < 0.35, f"the first wait was {first_gap:.3f} s, not the 0.2 s minimum"
+    assert second_gap >= 0.35, f"the second wait was {second_gap:.3f} s, not twice the minimum"
+
+
+async def test_a_stable_subscription_resets_the_resubscribe_wait(hub: FakeHub) -> None:
+    events = ScriptedEventStore()
+    events.subscribe_failures.append(RuntimeError("the event store is down"))
+    app = new_app(
+        hub,
+        store=MemoryStore(),
+        event_store=events,
+        outbox_enabled=False,
+        _timings=_fast_timings(
+            event_resubscribe_min=0.15,
+            event_resubscribe_max=0.8,
+            event_resubscribe_stable=0.2,
+        ),
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await eventually(lambda: len(events.subscriptions) == 1, within=2.0)
+    subscription = events.subscriptions[0]
+    await asyncio.sleep(0.25)  # the subscription lived past the 0.2 s stability window
+    failed_at = time.monotonic()
+    subscription.fail(RuntimeError("the subscription broke"))
+    await eventually(lambda: len(events.subscribe_times) >= 3, within=2.0)
+    gap = events.subscribe_times[2] - failed_at
+    assert 0.12 <= gap < 0.26, f"the wait after a stable subscription was {gap:.3f} s, not the 0.15 s minimum"
 
 
 async def test_a_subscription_that_fails_while_reading_is_closed_and_joined_again(hub: FakeHub) -> None:

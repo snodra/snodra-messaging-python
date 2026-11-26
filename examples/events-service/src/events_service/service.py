@@ -3,8 +3,8 @@
 The command writes no database row itself: the outbox entry of ``orders.OrderPlaced`` is the only state it writes, and
 the event handler projects it. ``orders.GetOrder`` answers what the projection holds. Both stores are in memory here,
 so the example runs with no infrastructure; the service's own database would be an add-on's ``store=`` (for example
-``snodra-mongodb`` or ``snodra-sql``) and its brokers an add-on's ``event_store=`` (``snodra-kafka`` or
-``snodra-rabbitmq``).
+``snodra-messaging-mongo`` or ``snodra-messaging-sql``) and its brokers an add-on's ``event_store=``
+(``snodra-messaging-kafka`` or ``snodra-messaging-rabbitmq``).
 """
 
 from __future__ import annotations

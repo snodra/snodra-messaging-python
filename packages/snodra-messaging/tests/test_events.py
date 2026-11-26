@@ -12,7 +12,7 @@ from eventhelpers import OrderPlaced, OrderShipped, RecordingEventStore, SlowOut
 from fakehub import FakeHub
 from helpers import TP, library_tasks, new_app, start_app
 from snodra import ConfigurationError, JsonCodec, MemoryEventStore, MemoryStore, RegistrationClosed, Settings
-from snodra._events import event_handling, event_message, event_timestamp, outgoing_event
+from snodra._events import event_handling, event_message, event_timestamp, is_json_object, outgoing_event
 from snodra._events import outbox_entry as build_entry
 from snodra._eventstore import EventHeaders
 
@@ -69,6 +69,23 @@ async def test_an_event_without_a_correlation_id_uses_its_own_id() -> None:
     with event_handling(info, ""):
         entry = build_entry(OrderShipped(order_id="o-1"), key=None, seq=1, codec=JsonCodec())
     assert entry.headers[EventHeaders.CORRELATION_ID] == "e-1"
+
+
+async def test_an_empty_handled_correlation_id_gets_a_fresh_one() -> None:
+    info = event_message(
+        "e-1",
+        "orders.OrderPlaced",
+        {
+            EventHeaders.TYPE: "orders.OrderPlaced",
+            EventHeaders.ID: "e-1",
+            EventHeaders.CORRELATION_ID: "",
+        },
+    )
+    with event_handling(info, ""):
+        entry = build_entry(OrderShipped(order_id="o-1"), key=None, seq=1, codec=JsonCodec())
+    correlation = entry.headers[EventHeaders.CORRELATION_ID]
+    assert correlation != ""
+    uuid.UUID(correlation)
 
 
 async def test_a_published_event_carries_the_callers_user_and_the_requests_correlation(hub: FakeHub) -> None:
@@ -166,6 +183,26 @@ async def test_a_service_with_only_commands_queries_and_subscriptions_starts_wit
     assert not any(name.startswith("snodra:consumer:") for name in library_tasks())
 
 
+async def test_turning_the_outbox_off_starts_no_relay(hub: FakeHub) -> None:
+    app = await start_app(hub, store=MemoryStore(), event_store=MemoryEventStore(), outbox_enabled=False)
+    await asyncio.sleep(0.02)
+    assert "snodra:outbox" not in library_tasks()
+    assert app.hub_ids() == []
+
+
+async def test_turning_the_consumer_off_starts_no_consumer(hub: FakeHub) -> None:
+    app = new_app(hub, store=MemoryStore(), event_store=MemoryEventStore(), consumer_enabled=False)
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await asyncio.sleep(0.02)
+    assert not any(name.startswith("snodra:consumer:") for name in library_tasks())
+    assert "snodra:outbox" in library_tasks()
+
+
 async def test_an_event_handler_registered_after_start_is_refused(hub: FakeHub) -> None:
     app = await start_app(hub, store=MemoryStore(), event_store=MemoryEventStore())
     with pytest.raises(RegistrationClosed, match="registered before the app starts"):
@@ -188,6 +225,28 @@ async def test_an_event_handler_must_be_an_async_function_taking_a_message(hub: 
         @app.event_handler
         async def not_a_message(event: object) -> None:
             pass
+
+
+async def test_the_processor_name_and_replay_flag_are_checked(hub: FakeHub) -> None:
+    app = new_app(hub, store=MemoryStore(), event_store=MemoryEventStore())
+    for processor in ("", "Default", "mail_", "a" * 49):
+        with pytest.raises(ValueError, match="processor name"):
+
+            @app.event_handler(processor=processor)
+            async def bad(event: OrderPlaced) -> None:
+                pass
+
+    with pytest.raises(TypeError, match="replay"):
+
+        @app.event_handler(replay=1)  # type: ignore[call-overload, untyped-decorator]
+        async def bad_replay(event: OrderPlaced) -> None:
+            pass
+
+    @app.event_handler(processor="default", replay=False)
+    async def accepted(event: OrderPlaced) -> None:
+        pass
+
+    assert app._events.handlers("default", "orders.OrderPlaced")[0].replay is False
 
 
 def test_the_timestamp_header_is_rfc3339_in_utc_with_milliseconds() -> None:
@@ -221,3 +280,13 @@ def test_a_delivery_helper_omits_none_headers() -> None:
     event = delivery(event_id="e-2", headers={"correlationId": None})
     assert EventHeaders.ID in event.headers
     assert EventHeaders.CORRELATION_ID not in event.headers
+
+
+def test_is_json_object_refuses_the_constants_json_has_not() -> None:
+    assert is_json_object(b'{"n":1}')
+    assert is_json_object(b' {"n":{}} ')
+    assert not is_json_object(b"[]")
+    assert not is_json_object(b'{"n":NaN}')
+    assert not is_json_object(b'{"n":Infinity}')
+    assert not is_json_object(b'{"n":-Infinity}')
+    assert not is_json_object(b"\xef\xbb\xbf{}")

@@ -11,8 +11,8 @@ import pytest
 from eventhelpers import Clock, OrderPlaced, RecordingEventStore, SlowOutbox
 from eventhelpers import outbox_entry as entry_of
 from fakehub import FakeHub, ack
-from helpers import eventually, library_tasks, start_app
-from snodra import MemoryStore
+from helpers import eventually, library_tasks, new_app, start_app
+from snodra import MemoryEventStore, MemoryStore
 from snodra._eventstore import Failed, Rejected
 from snodra._outbox import OUTBOX_SEND_TIMEOUT, OutboxRelay, OutboxSettings
 
@@ -196,6 +196,25 @@ async def test_an_event_store_raising_a_cancelled_error_does_not_end_the_relay(h
     await eventually(lambda: len(events.events) == 1)
     assert events.attempts == 2
     assert "snodra:outbox" in library_tasks()
+
+
+async def test_the_shutdown_budget_bounds_the_event_tasks(hub: FakeHub) -> None:
+    app = new_app(hub, store=MemoryStore(), event_store=MemoryEventStore())
+
+    async def stubborn() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(10.0)
+
+    task = asyncio.create_task(stubborn(), name="snodra:test-stubborn")
+    app._event_tasks.append(task)
+    begin = time.monotonic()
+    await app._stop_events(0.05)
+    assert time.monotonic() - begin < 0.5
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 async def test_a_blocking_outbox_store_does_not_delay_heartbeats(hub: FakeHub) -> None:

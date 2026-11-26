@@ -80,6 +80,8 @@ class Timings:
     """After a failed event subscription, the first wait before subscribing again."""
     event_resubscribe_max: float
     """The cap of that wait (the wait doubles until it, and starts over once a subscription delivers)."""
+    event_resubscribe_stable: float
+    """A subscription that lived this long before it failed counts as a good one: the next wait starts over."""
     dns_refresh: float
     """How often a ``dns:///`` target is resolved again."""
     dns_drain_limit: float
@@ -121,6 +123,7 @@ DEFAULT_TIMINGS: Final = Timings(
     event_handler_backoff=1.0,
     event_resubscribe_min=1.0,
     event_resubscribe_max=30.0,
+    event_resubscribe_stable=30.0,
     dns_refresh=30.0,
     dns_drain_limit=65.0,
 )
