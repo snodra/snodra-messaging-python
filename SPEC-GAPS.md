@@ -208,3 +208,32 @@ library does there. Where an entry is settled, its behaviour is this library's r
   do; (c) leave it open. Recommend (a): a down JWKS endpoint should not get one fetch per forwarded token, and the
   wait is capped at the normal refresh interval anyway.
 - **Wire change:** no.
+
+### SG-14: a redelivery that does not move a held segment's position back
+
+- **Specification:** `event-store-add-ons.md` says `redeliver(segment, position)` "hands that delivery and the
+  segment's later ones out again without leaving the subscription". It does not say what a store does with a position
+  that is not one the subscription has delivered from a segment it holds: a position ahead of its next one, or a
+  delivery of a segment that was revoked since.
+- **Other Snodra libraries:** they ignore such a call: the segment's new holder puts its own unacknowledged events out
+  again from the committed position, and a live subscription keeps reading from where it was.
+- **This library:** `snodra/_eventstore_memory.py` (`_MemorySubscription.redeliver`). The segment and the position are
+  still validated (an unknown segment or a non-canonical position is `Invalid`), but the cursor moves only back: a
+  position at or after the next one, or a segment the subscription no longer holds, changes nothing.
+- **Question:** open: should a redelivery of a position the subscription does not hold be an error
+  (`Invalid`/`NotOwner`), or a no-op as here?
+
+### SG-15: the append times of the in-memory event store when the clock steps back
+
+- **Specification:** `event-store-add-ons.md` says an in-memory event's time is the store's clock, and a reset to a
+  time moves each segment to "the first position at or after" it. It does not require a segment's append times to be
+  nondecreasing, nor say what a time-targeted reset does when they are not (the first position at or after a time is
+  ambiguous if a later event carries an earlier time).
+- **Other Snodra libraries:** they differ: one keeps the clock's value as it is, so a backward clock step can make a
+  later event older; another keeps the append times of a segment nondecreasing.
+- **This library:** `snodra/_eventstore_memory.py` (`MemoryEventStore.publish`). An event is stamped with the later of
+  the segment's last time and the clock, so a segment's append times never go back and a time-targeted reset always
+  has one meaning. The store takes the clock as an injectable keyword argument for tests.
+- **Question:** open: should the specification require nondecreasing append times, or define a time-targeted reset
+  without relying on them?
+- **Wire change:** no.
