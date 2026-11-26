@@ -483,3 +483,73 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** settled: validate all ranges and send one commit; do not attempt a rollback. A future version may add
   a compensating commit if the broker's per-partition failures become observable enough to justify it.
 - **Wire change:** no.
+
+### SG-30: the Python core does not bind a message store's lifecycle
+
+- **Specification:** `message-store-add-ons.md` (The SQL layout) says the schema is applied at startup under the
+  database lock, and the state page's `L2-STORE-KIT` row says every store's schema is ready before the kit runs. It
+  does not say which interface a library uses to prepare it.
+- **Other Snodra libraries:** the Rust `MessageStore` trait owns `init_schema` and `check_schema`
+  (`snodra-messaging-rs@4d63802:src/store/mod.rs:122`), and the Rust SQL add-on applies V1 in `start()`
+  (`snodra-messaging-rs@4d63802:crates/snodra-messaging-sqlx/src/lib.rs:16`); Go has `StoreLifecycle`, which the
+  builder calls with the application's clock, the schema steps and `Background`
+  (`snodra-messaging-go@2d0aea9:store.go:63`). Kotlin applies the SQL schema through Spring/Flyway, outside the
+  store interface.
+- **This library:** the Python core's `MessageStore` has no lifecycle methods and `App.start()` does not call any;
+  `snodra_sql.StoreLifecycle` and `SqlStore` offer `use_clock`, `init_schema`, `check_schema` and `background`, and
+  the service calls `await store.init_schema()` before `app.start()` and runs `store.background()` in a task.
+- **Question:** should the Python core gain a `StoreLifecycle` protocol and bind it in `App.start()`, as Go does?
+  Recommend yes in a level-2 follow-up: the SQL and MongoDB add-ons both need it, and a service that forgets
+  `init_schema` otherwise fails on the first append.
+- **Wire change:** no.
+
+### SG-31: an empty outbox claim owner
+
+- **Specification:** `message-store-add-ons.md` (The stores) says a claim returns entries "now held by the claimer
+  until its lease passes", and names the owner as the claimer; it does not say what an empty owner means.
+- **Other Snodra libraries:** the Go SQL and MongoDB add-ons refuse an empty owner with `ErrInvalid`
+  (`snodra-messaging-go@2d0aea9:sql/outbox.go:59`, `mongo/outbox.go:46`); the Rust SQL add-on binds it as it is
+  (`snodra-messaging-rs@4d63802:crates/snodra-messaging-sqlx/src/outbox.rs:151`), and the Kotlin stores do not check it
+  (`snodra-messaging@64dde1e:snodra-messaging-jdbc/src/main/kotlin/com/damoreira/snodra/messaging/jdbc/JdbcOutboxStore.kt:40`).
+- **This library:** `snodra_sql/sql.py` (`_SqlOutbox.claim`) refuses an empty owner with `InvalidMessage`: an empty
+  owner is indistinguishable from "nobody" in the SQL rows, so a second empty-owner relay would be given the first
+  one's entries.
+- **Question:** is an empty owner invalid on every store? Recommend yes, and the specification should say so; the
+  other add-ons would then refuse it too.
+- **Wire change:** no.
+
+### SG-32: a service connection bound to `transaction(conn=...)` that is not in a transaction
+
+- **Specification:** `message-store-add-ons.md` (The stores) says an add-on joins the caller's transaction and never
+  writes beside it, and `The rule` says the service's writes and the library's commit together. It does not say what
+  an add-on does with a connection the service hands it that is not in a transaction, or whose transaction already
+  ended.
+- **Other Snodra libraries:** Go's `WithConn` documents that the store sends its write on the connection as it is and
+  the connection's transaction is the service's to manage (`snodra-messaging-go@2d0aea9:sql/sql.go:491`). The Rust
+  scope refuses a transaction that is not the store's (`snodra-messaging-rs@4d63802:crates/snodra-messaging-sqlx/src/db.rs:805`);
+  Kotlin follows Spring's transaction manager.
+- **This library:** `SqlStore.transaction(conn=conn)` binds the given `asyncpg` or `asyncmy` connection with the
+  core's public `bind_transaction`, writes on it and never begins, commits or rolls back anything on it. On a
+  connection in autocommit each write commits at once, and a connection whose transaction ended accepts the write in
+  a new one; the store cannot tell the two apart without driver-specific transaction inspection.
+- **Question:** should the add-on refuse a connection it can see is not in a transaction, or is the service
+  responsible for the connection's state? Recommend the latter, as Go documents: a driver's way of reporting an open
+  transaction differs, and a false refusal would break a legitimate service-managed transaction.
+- **Wire change:** no.
+
+### SG-33: MySQL applies the schema statement by statement
+
+- **Specification:** `message-store-add-ons.md` (The SQL layout) says the schema is applied under a database lock so
+  instances starting together apply it once, and that the files are idempotent; it does not say whether applying a
+  file is atomic when the database commits DDL on its own.
+- **Other Snodra libraries:** the Go SQL add-on runs the PostgreSQL script in one transaction and each MySQL
+  statement in turn (`snodra-messaging-go@2d0aea9:sql/schema.go:199`); the Rust SQL add-on does the same
+  (`snodra-messaging-rs@4d63802:crates/snodra-messaging-sqlx/src/schema.rs:218`). Kotlin applies the files through
+  Flyway, which also cannot roll MySQL DDL back.
+- **This library:** `snodra_sql/sql.py` (`SqlStore._apply_schema`) wraps the PostgreSQL statements in one transaction;
+  on MySQL each statement commits as it runs. A failure midway leaves the statements before it applied; because every
+  statement is `IF NOT EXISTS` or `INSERT ... ON DUPLICATE KEY`, a retry of `init_schema()` finishes the file. The
+  schema lock is released in either case.
+- **Question:** settled: applying the file is idempotent and retryable, not atomic on MySQL; the specification should
+  say so, since "applied once" can otherwise be read as all-or-nothing.
+- **Wire change:** no.

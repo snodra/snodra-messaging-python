@@ -16,6 +16,7 @@ snodra-messaging = { workspace = true }
 snodra-conformance-service = { workspace = true }
 snodra-messaging-observability = { workspace = true }
 snodra-messaging-kafka = { workspace = true }
+snodra-messaging-sql = { workspace = true }
 orders-quickstart = { workspace = true }
 events-service = { workspace = true }
 
@@ -33,6 +34,7 @@ dev = [
     "snodra-conformance-service",
     "snodra-messaging-observability",
     "snodra-messaging-kafka",
+    "snodra-messaging-sql",
     "orders-quickstart",
     "events-service",
     "testcontainers==4.15.0",
@@ -55,6 +57,7 @@ select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF", "SIM", "PT"]
 [tool.mypy]
 strict = true
 files = ["packages", "examples"]
+exclude = ["^packages/snodra-messaging-sql/tests/conftest\\.py$"]
 
 [[tool.mypy.overrides]]
 module = "snodra._hubpb.*"
@@ -64,11 +67,16 @@ ignore_errors = true
 module = ["aiokafka", "aiokafka.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["asyncmy", "asyncmy.*", "asyncpg", "asyncpg.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = [
     "packages/snodra-messaging/tests",
     "packages/snodra-messaging-observability/tests",
     "packages/snodra-messaging-kafka/tests",
+    "packages/snodra-messaging-sql/tests",
     "examples",
 ]
 pythonpath = ["packages/snodra-messaging/tests"]
