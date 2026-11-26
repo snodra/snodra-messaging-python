@@ -2,9 +2,12 @@
 runs and single-process demos, with no database.
 
 - **Real transactions.** What a transaction writes is seen by others only at its commit and is gone after a rollback;
-  a transaction reads its own writes. A transaction reserves every record it writes: a second live transaction writing
-  one of them is refused at once with :class:`~snodra._store.Conflict`, and a commit fails when a record it wrote was
-  changed meanwhile (a write outside any transaction). What runs outside a transaction commits at once.
+  its own later writes see its earlier ones (a repeated marker is a duplicate, a repeated entry id a conflict), while
+  the reads that take no transaction (``exists``, ``claim``, ``pending``, ``oldest_pending``) see committed state only.
+  A transaction reserves every record it writes: a second live transaction writing one of them is refused at once with
+  :class:`~snodra._store.Conflict`, and a commit fails when a record it wrote was changed meanwhile (a write outside any
+  transaction). What runs outside a transaction commits at once, and a transaction dropped without a commit releases
+  its reservations.
 - **The outbox and the processed events** implement their level-2 contract: atomic claims under a lease in
   ``(created_at_ms, seq)`` order, pending counts, purge of what was sent, payload refusal and one marker per id, plus
   the wake-up of the relay after every committed append.
@@ -23,6 +26,7 @@ from __future__ import annotations
 import builtins
 import contextlib
 import itertools
+import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Final
@@ -54,9 +58,11 @@ from snodra._store import (
     TransactionScope,
     Tx,
     Unsupported,
+    bind_transaction,
     check_outbox_payload,
     current_transaction,
     now_ms,
+    unbind_transaction,
 )
 
 NAME: Final = "memory"
@@ -126,11 +132,20 @@ class _MemoryTx:
 
     store_id: int
     number: int
+    owner: weakref.ReferenceType[MemoryStore] | None = field(default=None, repr=False)
     ended: bool = False
     doomed: bool = False
     reserved: list[tuple[str, str]] = field(default_factory=list)
     outbox: _Overlay[_OutboxRow] = field(default_factory=_Overlay)
     processed: _Overlay[_ProcessedRow] = field(default_factory=_Overlay)
+
+    def __del__(self) -> None:
+        """A transaction dropped without a commit releases its reservations, as a database's connection does."""
+        with contextlib.suppress(Exception):  # the interpreter may be shutting its modules down
+            owner = self.owner
+            store = None if owner is None else owner()
+            if store is not None:
+                store.release_abandoned(self)
 
 
 _STORE_IDS = itertools.count(1)
@@ -176,7 +191,7 @@ class MemoryStore:
     async def begin(self) -> Tx:
         number = self._data.next_tx
         self._data.next_tx += 1
-        return Tx(_MemoryTx(self._store_id, number))
+        return Tx(_MemoryTx(self._store_id, number, weakref.ref(self)))
 
     def plain(self) -> Tx:
         return Tx.none()
@@ -200,7 +215,10 @@ class MemoryStore:
             self._wake()
 
     async def rollback(self, tx: Tx) -> None:
-        inner = self._open(tx)
+        try:
+            inner = self._open(tx)
+        except Failed:
+            return
         if inner is None:
             return
         inner.ended = True
@@ -339,6 +357,13 @@ class MemoryStore:
             row.failed_at_ms = self.now()
             self._bump(self._data.outbox, entry_id)
 
+    def release_abandoned(self, tx: _MemoryTx) -> None:
+        """Lets go of a dropped transaction's reservations and writes (its finalizer)."""
+        tx.ended = True
+        tx.outbox.writes.clear()
+        tx.processed.writes.clear()
+        self._release(tx)
+
     # ---- transactions --------------------------------------------------------------------------
 
     def _open(self, tx: Tx | None) -> _MemoryTx | None:
@@ -415,9 +440,14 @@ class MemoryStore:
         table.versions[key] = self._data.version
 
     def _wake(self) -> None:
-        for wake in list(self._listeners.values()):
-            with contextlib.suppress(Exception):
-                wake()
+        # A wake runs with no transaction bound: the relay it starts must not inherit the append's transaction.
+        token = bind_transaction(None)
+        try:
+            for wake in list(self._listeners.values()):
+                with contextlib.suppress(Exception):
+                    wake()
+        finally:
+            unbind_transaction(token)
 
 
 def _copy_entry(entry: OutboxEntry) -> OutboxEntry:

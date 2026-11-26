@@ -20,6 +20,7 @@ See https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import json
 import math
 import time
@@ -137,6 +138,20 @@ def current_transaction() -> Tx | None:
     return _CURRENT_TX.get()
 
 
+def bind_transaction(tx: Tx | None) -> Token[Tx | None]:
+    """Binds ``tx`` (or no transaction) to the current context; returns the token :func:`unbind_transaction` takes.
+
+    The store binds its transaction while a handler runs; a store operation called without ``tx=`` joins what is bound.
+    A wake-up callback runs with no transaction bound, so a task it starts does not inherit the appending transaction.
+    """
+    return _CURRENT_TX.set(tx)
+
+
+def unbind_transaction(token: Token[Tx | None]) -> None:
+    """Restores the binding :func:`bind_transaction` replaced."""
+    _CURRENT_TX.reset(token)
+
+
 class TransactionScope(AbstractAsyncContextManager[Tx]):
     """What :meth:`MessageStore.transaction` returns: begins a transaction and binds it to the current context, or joins
     the one already bound; commits on a clean exit, rolls back on an exception.
@@ -157,7 +172,7 @@ class TransactionScope(AbstractAsyncContextManager[Tx]):
             return current
         tx = await self._store.begin()
         self._tx = tx
-        self._token = _CURRENT_TX.set(tx)
+        self._token = bind_transaction(tx)
         return tx
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -174,7 +189,7 @@ class TransactionScope(AbstractAsyncContextManager[Tx]):
         finally:
             token, self._token = self._token, None
             if token is not None:
-                _CURRENT_TX.reset(token)
+                unbind_transaction(token)
 
 
 class AppendListener(AbstractContextManager["AppendListener"]):
@@ -195,6 +210,11 @@ class AppendListener(AbstractContextManager["AppendListener"]):
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+    def __del__(self) -> None:
+        """A dropped listener removes itself from its store, as its docstring promises."""
+        with contextlib.suppress(Exception):  # the interpreter may be shutting its modules down
+            self.close()
 
 
 def check_outbox_payload(type_name: str, payload: bytes) -> None:
@@ -250,48 +270,50 @@ def _json_kind(value: object) -> str:
 
 
 def _check_number(value: object, type_name: str) -> None:
-    """Every float finite, every integer within a signed 64-bit integer (the parsed tree, recursively)."""
-    if isinstance(value, bool):
-        return
-    if isinstance(value, int):
-        if not -(2**63) <= value <= 2**63 - 1:
-            raise InvalidMessage(
-                f"the payload of event {type_name} holds the integer {value}, outside the signed 64-bit range, "
-                "so it cannot be an outbox entry"
-            )
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise InvalidMessage(
-                f"the payload of event {type_name} holds a number no double holds ({value!r}), so it cannot be an "
-                "outbox entry"
-            )
-        return
-    if isinstance(value, list):
-        for item in value:
-            _check_number(item, type_name)
-    elif isinstance(value, dict):
-        for item in value.values():
-            _check_number(item, type_name)
+    """Every float finite, every integer within a signed 64-bit integer (the parsed tree, iteratively)."""
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            if not -(2**63) <= item <= 2**63 - 1:
+                raise InvalidMessage(
+                    f"the payload of event {type_name} holds the integer {item}, outside the signed 64-bit range, "
+                    "so it cannot be an outbox entry"
+                )
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise InvalidMessage(
+                    f"the payload of event {type_name} holds a number no double holds ({item!r}), so it cannot be an "
+                    "outbox entry"
+                )
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            pending.extend(item.values())
 
 
 def _check_text(value: object, type_name: str) -> None:
     """No lone surrogate in a string or a name: a JSON parser reads an escaped one, a database cannot keep it."""
-    if isinstance(value, str):
-        if _has_surrogate(value):
-            raise InvalidMessage(
-                f"the payload of event {type_name} holds a lone surrogate escape, so it cannot be an outbox entry"
-            )
-    elif isinstance(value, list):
-        for item in value:
-            _check_text(item, type_name)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            if _has_surrogate(key):
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if _has_surrogate(item):
                 raise InvalidMessage(
                     f"the payload of event {type_name} holds a lone surrogate escape, so it cannot be an outbox entry"
                 )
-            _check_text(item, type_name)
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                if _has_surrogate(key):
+                    raise InvalidMessage(
+                        f"the payload of event {type_name} holds a lone surrogate escape, so it cannot be an "
+                        "outbox entry"
+                    )
+                pending.append(child)
 
 
 def _has_surrogate(text: str) -> bool:
@@ -308,12 +330,19 @@ def _check_depth(value: object, type_name: str) -> None:
 
 
 def _json_depth(value: object) -> int:
-    """MySQL's ``JSON_DEPTH``: a scalar or an empty object or array 1, a non-empty one 1 + its deepest member."""
-    if isinstance(value, list) and value:
-        return 1 + max(_json_depth(item) for item in value)
-    if isinstance(value, dict) and value:
-        return 1 + max(_json_depth(item) for item in value.values())
-    return 1
+    """MySQL's ``JSON_DEPTH``, iteratively: a scalar or an empty object or array 1, a non-empty one 1 + its deepest
+    member."""
+    deepest = 1
+    pending: list[tuple[object, int]] = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        deepest = max(deepest, depth)
+        if isinstance(item, list):
+            if item:
+                pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, dict) and item:
+            pending.extend((child, depth + 1) for child in item.values())
+    return deepest
 
 
 @dataclass(frozen=True, slots=True)

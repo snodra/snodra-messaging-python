@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import uuid
 
 import pytest
@@ -13,8 +14,12 @@ from snodra._store import (
     InvalidMessage,
     MessageStore,
     OutboxEntry,
+    Tx,
     Unsupported,
+    bind_transaction,
+    current_transaction,
     now_ms,
+    unbind_transaction,
 )
 from snodra._store_memory import MemoryStore
 
@@ -186,6 +191,45 @@ async def test_a_committed_append_wakes_the_relay() -> None:
     assert len(wakes) == 3, "a listener in a with block is registered and removed"
 
 
+async def test_a_dropped_append_listener_unregisters() -> None:
+    store = MemoryStore()
+    wakes: list[int] = []
+    listener = store.outbox.on_append(lambda: wakes.append(1))
+    del listener
+    gc.collect()
+    await store.outbox.append_now(_entry())
+    assert wakes == [], "a dropped listener is removed, as on_append promises"
+
+
+async def test_a_waker_task_does_not_inherit_the_appending_transaction() -> None:
+    store = MemoryStore()
+    observed: list[Tx | None] = []
+    tasks: list[asyncio.Task[None]] = []
+
+    async def waker_task() -> None:
+        observed.append(current_transaction())
+
+    def wake() -> None:
+        tasks.append(asyncio.get_running_loop().create_task(waker_task()))
+
+    with store.outbox.on_append(wake):
+        async with store.transaction():
+            assert current_transaction() is not None, "the appending context has its transaction bound"
+            await store.outbox.append(_entry())
+    await asyncio.gather(*tasks)
+    assert observed == [None], "the waker task sees no transaction, and cannot join the appending one"
+
+
+async def test_bind_and_unbind_a_transaction() -> None:
+    tx = Tx.none()
+    token = bind_transaction(tx)
+    try:
+        assert current_transaction() is tx
+    finally:
+        unbind_transaction(token)
+    assert current_transaction() is None
+
+
 REFUSED_PAYLOADS = [
     pytest.param(b"not json", id="not-json"),
     pytest.param(b'{"n":1e400}', id="above-double"),
@@ -195,6 +239,7 @@ REFUSED_PAYLOADS = [
     pytest.param(b"\xef\xbb\xbf{}", id="leading-bom"),
     pytest.param(b'{"s":"\xff"}', id="not-utf8"),
     pytest.param(_nested(101), id="depth-101"),
+    pytest.param(_nested(600), id="depth-600"),
     pytest.param(b"[1,2]", id="array"),
     pytest.param(b'"text"', id="string"),
     pytest.param(b"null", id="null"),
@@ -288,12 +333,32 @@ async def test_a_processed_marker_records_once_and_reads_back_after_commit() -> 
     assert await store.processed.record(marker) is False, "a duplicate after the commit"
 
 
+async def test_an_abandoned_transaction_releases_its_reservations() -> None:
+    store = MemoryStore()
+    marker = _marker()
+    tx = await store.begin()
+    assert await store.processed.record(marker, tx=tx), "the abandoned transaction wrote the marker"
+    del tx
+    gc.collect()
+    async with store.transaction():
+        assert await store.processed.record(marker), "a later transaction records the marker it held"
+    assert await store.processed.exists(marker.id), "and commits it"
+
+
 async def test_a_foreign_transaction_is_refused() -> None:
     store = MemoryStore()
     other = MemoryStore()
     tx = await other.begin()
     with pytest.raises(Failed):
         await store.outbox.append(_entry(), tx=tx)
+
+
+async def test_a_foreign_transaction_rolls_back_without_failing() -> None:
+    store = MemoryStore()
+    other = MemoryStore()
+    tx = await other.begin()
+    await store.rollback(tx)
+    await other.rollback(tx)
 
 
 async def test_the_level_3_and_level_4_ports_are_unsupported() -> None:
