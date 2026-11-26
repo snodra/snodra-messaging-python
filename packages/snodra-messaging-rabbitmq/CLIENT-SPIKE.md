@@ -25,18 +25,12 @@ A client for this add-on must be able to
   `consumer_update_listener`, so `snodra-member`, `single-active-consumer`, `name` and
   `super-stream` do reach the broker. Its listener must return the **public**
   `rstream.OffsetSpecification` (exported at the top level); that reply encodes and the
-  subscription starts at the stored offset. Returning the different
-  `rstream.ConsumerOffsetSpecification` constant does not encode, but that is a type choice, not a
-  client limitation.
+  subscription starts at the stored offset. (`rstream.ConsumerOffsetSpecification` is the
+  different type `Consumer.subscribe` takes for its initial offset, not a listener return.)
 - The high-level `Consumer` connects to a **random replica** when the stream has any
   (`rstream/consumer.py:201`), while the wire rules say offset reads, read-backs and a reset's
   stores go to the partition's leader, and both official add-ons subscribe on the leader's
   connection. This is the second blocker.
-- The low-level `Client` (`rstream/client.py`) exposes `subscribe` with arbitrary properties,
-  `consumer_update`, `query_offset`, `store_offset`, `publish`, `declare_publisher` and
-  `query_leader_and_replicas`; its `schema` module encodes and decodes the stream frames, and
-  `rstream.amqp.amqp_decoder` reads AMQP 1.0 messages. It is the low-level class the wire rules
-  name.
 - The low-level `Client` (`rstream/client.py`) exposes `subscribe` with arbitrary properties,
   `consumer_update`, `query_offset`, `store_offset`, `publish`, `declare_publisher` and
   `query_leader_and_replicas`; its `schema` module encodes and decodes the stream frames, and

@@ -33,10 +33,10 @@ streams: the infrastructure does.
 
 The client: this add-on pins ``rstream`` and uses its low-level :class:`rstream.client.Client` (the
 protocol frames, the AMQP 1.0 codec and the connection), not its high-level producer or consumer.
-The high-level consumer route hashes UTF-16 rather than the wire rule's UTF-8, its consumer update
-listener cannot encode the reply without the internal ``schema.OffsetSpecification`` type, and its
-consumer picks a replica rather than the partition's leader. See ``CLIENT-SPIKE.md`` and
-``SPEC-GAPS.md``.
+The high-level producer's route hashes a key as UTF-16 and a 128-bit mmh3 read little-endian, not
+the wire rule's x86_32 of the UTF-8 bytes; its consumer picks a replica rather than the partition's
+leader. The consumer-update reply is not a blocker: the public ``rstream.OffsetSpecification``
+encodes it. See ``CLIENT-SPIKE.md`` and ``SPEC-GAPS.md``.
 
 Every subscription owns its connections; :meth:`RabbitMQEventStore.close` releases the publisher's
 connections and does not close the subscriptions (the caller closes them).

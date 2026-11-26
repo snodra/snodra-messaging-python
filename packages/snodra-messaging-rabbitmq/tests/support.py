@@ -268,13 +268,15 @@ async def raw_stream_messages(
         deadline = loop.time() + within
         quiet_deadline = loop.time() + 1.5
         last = 0
-        while loop.time() < min(deadline, quiet_deadline):
+        limit = deadline if expected is not None else min(deadline, quiet_deadline)
+        while loop.time() < limit:
             await asyncio.sleep(0.05)
             if messages:
                 await client.credit(1, 10)
-            if len(messages) != last:
+            if expected is None and len(messages) != last:
                 last = len(messages)
                 quiet_deadline = loop.time() + 1.5
+                limit = min(deadline, quiet_deadline)
             if expected is not None and len(messages) >= expected:
                 # Take what the same chunk still holds, then let a quiet moment settle the rest.
                 await asyncio.sleep(0.2)

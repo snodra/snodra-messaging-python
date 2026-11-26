@@ -604,9 +604,10 @@ library does there. Where an entry is settled, its behaviour is this library's r
   high-level producer routes a key with UTF-16 bytes and a 128-bit `mmh3.hash_bytes` read little-endian
   (`rstream/superstream.py:88`), not the wire rule's x86_32 of the UTF-8 bytes, and that the high-level consumer
   connects to a random replica (`rstream/consumer.py:201`), not the leader. The consumer update reply is **not** a
-  blocker: `rstream.OffsetSpecification` is public (`rstream/__init__.py:44`) and encodes, unlike the different
-  `rstream.ConsumerOffsetSpecification` constant. The low-level client sets all four subscribe properties, answers
-  updates with a stored offset, publishes one confirmed message per event and reads offsets on the leader.
+  blocker: `rstream.OffsetSpecification` is public (`rstream/__init__.py:44`) and encodes it;
+  `rstream.ConsumerOffsetSpecification` is the different type `Consumer.subscribe` takes for its initial offset, not
+  a listener return. The low-level client sets all four subscribe properties, answers updates with a stored offset,
+  publishes one confirmed message per event and reads offsets on the leader.
   `test_a_second_instance_shares_the_processor_and_the_member_is_visible` and
   `test_the_stored_offset_is_the_next_one_and_a_new_subscription_resumes` pin those on a real broker.
 - **Question:** should the specification name the low-level capabilities a Python client must expose (so another

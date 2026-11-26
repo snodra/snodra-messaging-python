@@ -266,7 +266,11 @@ async def test_a_reset_plans_and_moves_only_with_the_management_api(
         await subscription.close()
 
     admin = store.admin(spec)
-    assert not await admin.members(), "the closed subscription has no members"
+
+    async def no_members() -> bool:
+        return not await admin.members()
+
+    await wait_for_async("the closed subscription has no members", no_members)
     plan = await admin.plan(Earliest())
     assert plan
     assert all(replay_range.until != "" for replay_range in plan), "the close stored the acknowledged offsets"
