@@ -78,13 +78,12 @@ minor, a `fix` or a `perf` the next patch, and `docs`, `test`, `chore`, `ci`, `r
 nothing. Below 1.0.0 a `!` or a `BREAKING CHANGE:` footer counts as a minor; 1.0.0 is declared by hand. Nobody pushes a
 tag: only the workflow makes tags.
 
-All five published distributions carry one version and one tag, `vX.Y.Z`. The release commit, `release: X.Y.Z`, writes
-that version into the six `pyproject.toml` files of `packages/` — the RabbitMQ add-on is versioned with them though it is
-not published yet — makes each add-on require `snodra-messaging==X.Y.Z`, and records them in `uv.lock`
-(`scripts/bump-version.sh`). `snodra-messaging-rabbitmq` publishes once its PyPI pending trusted publisher exists.
+All six published distributions carry one version and one tag, `vX.Y.Z`. The release commit, `release: X.Y.Z`, writes
+that version into the six `pyproject.toml` files of `packages/`, makes each add-on require `snodra-messaging==X.Y.Z`,
+and records them in `uv.lock` (`scripts/bump-version.sh`).
 
-That commit is pushed only after `scripts/release-check.sh X.Y.Z` has built the five sdists and the five wheels, run
-`twine check --strict` on them, installed all five wheels on Python 3.12 and 3.14, imported every distribution and run
+That commit is pushed only after `scripts/release-check.sh X.Y.Z` has built the six sdists and the six wheels, run
+`twine check --strict` on them, installed all six wheels on Python 3.12 and 3.14, imported every distribution and run
 the tests there. It is the check to run by hand when a release commit is in doubt, and it refuses a version PyPI
 already has.
 

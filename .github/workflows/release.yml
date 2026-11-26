@@ -1,12 +1,12 @@
 name: release
 
-# CI calls this after PyPI has all five distributions of a release (ci.yml, job `release`): a tag
+# CI calls this after PyPI has all six distributions of a release (ci.yml, job `release`): a tag
 # pushed with GITHUB_TOKEN starts no workflow by itself. Run it by hand only to finish an existing
 # release again; nobody pushes tags.
 #
-# check (read-only): the tag, its commit, and the version all five pyproject.toml files of that
+# check (read-only): the tag, its commit, and the version all six pyproject.toml files of that
 # commit carry.
-# github-release (write, no build): the ten files as PyPI serves them, each checked against the
+# github-release (write, no build): the twelve files as PyPI serves them, each checked against the
 # sha256 PyPI recorded, then the GitHub release.
 on:
   workflow_call:
@@ -70,7 +70,7 @@ jobs:
           # Through files, not pipes: awk stops early, and pipefail would count git's SIGPIPE.
           for f in packages/snodra-messaging packages/snodra-messaging-observability \
             packages/snodra-messaging-kafka packages/snodra-messaging-sql \
-            packages/snodra-messaging-mongo; do
+            packages/snodra-messaging-mongo packages/snodra-messaging-rabbitmq; do
             git show "$commit:$f/pyproject.toml" >"$RUNNER_TEMP/f.toml"
             got=$(awk '/^\[/ { p = ($0 == "[project]") } p && /^version = "/ { gsub(/^version = "|"$/, ""); print; exit }' \
               "$RUNNER_TEMP/f.toml")
@@ -82,7 +82,8 @@ jobs:
           done
           # Each add-on requires the core at this release, exactly.
           for f in packages/snodra-messaging-observability packages/snodra-messaging-kafka \
-            packages/snodra-messaging-sql packages/snodra-messaging-mongo; do
+            packages/snodra-messaging-sql packages/snodra-messaging-mongo \
+            packages/snodra-messaging-rabbitmq; do
             git show "$commit:$f/pyproject.toml" >"$RUNNER_TEMP/f.toml"
             pin=$(awk '/^\[/ { p = ($0 == "[project]") } p && /^[[:space:]]*"snodra-messaging==/ {
                 gsub(/^[[:space:]]*"|",$/, ""); print; exit }' "$RUNNER_TEMP/f.toml")
@@ -107,7 +108,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: the ten files of the release, as PyPI serves them
+      - name: the twelve files of the release, as PyPI serves them
         env:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
@@ -115,7 +116,7 @@ jobs:
           cd "$RUNNER_TEMP/files"
           : >"$RUNNER_TEMP/sums"
           for project in snodra-messaging snodra-messaging-observability snodra-messaging-kafka \
-            snodra-messaging-sql snodra-messaging-mongo; do
+            snodra-messaging-sql snodra-messaging-mongo snodra-messaging-rabbitmq; do
             json="$RUNNER_TEMP/$project.json"
             curl -fsS -o "$json" "https://pypi.org/pypi/$project/$VERSION/json"
             jq -r '.urls[].url' "$json" >"$RUNNER_TEMP/urls"
@@ -127,8 +128,8 @@ jobs:
             fi
             while read -r url; do curl -fsS -O "$url"; done <"$RUNNER_TEMP/urls"
           done
-          if [ "$(wc -l <"$RUNNER_TEMP/sums" | tr -d ' ')" -ne 10 ]; then
-            echo "::error::not the ten files of $VERSION"
+          if [ "$(wc -l <"$RUNNER_TEMP/sums" | tr -d ' ')" -ne 12 ]; then
+            echo "::error::not the twelve files of $VERSION"
             exit 1
           fi
           sha256sum --check "$RUNNER_TEMP/sums"
@@ -142,8 +143,9 @@ jobs:
         run: |
           NOTES="PyPI: \`pip install snodra-messaging==$VERSION
           snodra-messaging-observability==$VERSION snodra-messaging-kafka==$VERSION
-          snodra-messaging-sql==$VERSION snodra-messaging-mongo==$VERSION\`.
-          The sdist and the wheel of all five distributions are attached below."
+          snodra-messaging-sql==$VERSION snodra-messaging-mongo==$VERSION
+          snodra-messaging-rabbitmq==$VERSION\`.
+          The sdist and the wheel of all six distributions are attached below."
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "${GITHUB_REPOSITORY#*/} $TAG" --notes "$NOTES"

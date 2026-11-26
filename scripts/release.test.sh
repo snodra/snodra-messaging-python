@@ -1,13 +1,12 @@
 #!/bin/sh
 # Tests for release-check.sh on a scratch copy of the workspace: sh scripts/release.test.sh
 #
-# The scratch workspace carries the five published distributions and the RabbitMQ add-on: all are
-# members, but only ci.yml's PUBLISHED list is built and published, so the check must never build
-# snodra-messaging-rabbitmq until PyPI has its pending trusted publisher. Slow on purpose: the case
-# that passes builds the ten files, installs the five wheels into a fresh 3.12 and a fresh 3.14
-# environment and runs the core and observability tests there. Needs uv, git and unzip. The PyPI
-# probe is stubbed through SNODRA_PYPI_PROBE, so the case where a version is already on PyPI needs
-# no network, and the test never talks to PyPI.
+# The scratch workspace carries the six published distributions and the examples: all are members,
+# but only ci.yml's PUBLISHED list is built and published, so the check must never build a member
+# that list does not name. Slow on purpose: the case that passes builds the twelve files, installs
+# the six wheels into a fresh 3.12 and a fresh 3.14 environment and runs the core and observability
+# tests there. Needs uv, git and unzip. The PyPI probe is stubbed through SNODRA_PYPI_PROBE, so the
+# case where a version is already on PyPI needs no network, and the test never talks to PyPI.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
@@ -25,7 +24,7 @@ ok() {
 
 version=9.8.7
 core_wheel="snodra_messaging-$version-py3-none-any.whl"
-ten="snodra_messaging-$version.tar.gz
+twelve="snodra_messaging-$version.tar.gz
 $core_wheel
 snodra_messaging_observability-$version.tar.gz
 snodra_messaging_observability-$version-py3-none-any.whl
@@ -34,7 +33,9 @@ snodra_messaging_kafka-$version-py3-none-any.whl
 snodra_messaging_sql-$version.tar.gz
 snodra_messaging_sql-$version-py3-none-any.whl
 snodra_messaging_mongo-$version.tar.gz
-snodra_messaging_mongo-$version-py3-none-any.whl"
+snodra_messaging_mongo-$version-py3-none-any.whl
+snodra_messaging_rabbitmq-$version.tar.gz
+snodra_messaging_rabbitmq-$version-py3-none-any.whl"
 obs=packages/snodra-messaging-observability/pyproject.toml
 kafka=packages/snodra-messaging-kafka/pyproject.toml
 
@@ -135,25 +136,27 @@ else
   fail "the check: $(printf '%s' "$out" | tail -5)"
 fi
 
-# The five published distributions are built, the RabbitMQ add-on is a member but is never built:
-# the check builds only the five distributions PUBLISHED names, never --all-packages.
+# The six published distributions are built, and no member PUBLISHED does not name -- the examples
+# included -- is: the check builds only that list, never --all-packages.
 builds=$(grep '^build ' "$uv_log" || true)
 want_builds='build --package snodra-messaging --out-dir dist
 build --package snodra-messaging-observability --out-dir dist
 build --package snodra-messaging-kafka --out-dir dist
 build --package snodra-messaging-sql --out-dir dist
-build --package snodra-messaging-mongo --out-dir dist'
-[ "$builds" = "$want_builds" ] && ok "only the five published distributions are built" \
+build --package snodra-messaging-mongo --out-dir dist
+build --package snodra-messaging-rabbitmq --out-dir dist'
+[ "$builds" = "$want_builds" ] && ok "only the six published distributions are built" \
   || fail "uv build calls: $(printf '%s' "$builds" | tr '\n' ';')"
 case $builds in
-  *snodra-messaging-rabbitmq*) fail "the RabbitMQ add-on was built" ;;
-  *) ok "the RabbitMQ add-on is not built" ;;
+  *orders-quickstart* | *events-service* | *store-interop* | *snodra-conformance-service*)
+    fail "an unpublished workspace member was built" ;;
+  *) ok "no unpublished workspace member is built" ;;
 esac
 
-# What the publish jobs check: the ten names, in that order, and the files as they are now.
-[ "$(awk '{ print $2 }' dist/SHA256SUMS)" = "$ten" ] && ok "SHA256SUMS names the ten files" \
+# What the publish jobs check: the twelve names, in that order, and the files as they are now.
+[ "$(awk '{ print $2 }' dist/SHA256SUMS)" = "$twelve" ] && ok "SHA256SUMS names the twelve files" \
   || fail "SHA256SUMS: $(cat dist/SHA256SUMS)"
-sums && ok "the ten files verify" || fail "the ten files do not verify"
+sums && ok "the twelve files verify" || fail "the twelve files do not verify"
 cp "dist/$core_wheel" "$work/wheel"
 printf x >>"dist/$core_wheel"
 sums && fail "a tampered wheel verifies" || ok "a tampered wheel fails the sums"
@@ -180,6 +183,12 @@ refused "a file the wheel carries and the list does not" \
   "does not hold the files scripts/wheel-contents/snodra_messaging.txt names"
 restore
 
+printf 'EXTRA = 1\n' >packages/snodra-messaging-rabbitmq/src/snodra_rabbitmq/_extra.py
+retag
+refused "a file the RabbitMQ wheel carries and the list does not" \
+  "does not hold the files scripts/wheel-contents/snodra_messaging_rabbitmq.txt names"
+restore
+
 # A requirement a consumer may resolve to anything newer: uv locks it, and the wheel is wrong.
 sed 's/snodra-messaging==9\.8\.7/snodra-messaging>=9.8.7/' "$obs" >"$work/pyproject.toml" && mv "$work/pyproject.toml" "$obs"
 uv lock >/dev/null 2>&1 || fail "uv lock with a range"
@@ -196,7 +205,7 @@ restore
 
 # The tag of a version the tree does not carry.
 git tag -a v9.8.8 -m test
-refused "a tag for a version the tree does not carry" "does not hold exactly the ten files of 9.8.8" 9.8.8
+refused "a tag for a version the tree does not carry" "does not hold exactly the twelve files of 9.8.8" 9.8.8
 git tag -d v9.8.8 >/dev/null
 
 # A version PyPI already has.

@@ -1,0 +1,8 @@
+snodra_messaging_rabbitmq-X.Y.Z.dist-info/METADATA
+snodra_messaging_rabbitmq-X.Y.Z.dist-info/RECORD
+snodra_messaging_rabbitmq-X.Y.Z.dist-info/WHEEL
+snodra_messaging_rabbitmq-X.Y.Z.dist-info/licenses/LICENSE
+snodra_rabbitmq/__init__.py
+snodra_rabbitmq/py.typed
+snodra_rabbitmq/rabbitmq.py
+snodra_rabbitmq/routing.py
