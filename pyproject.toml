@@ -15,6 +15,7 @@ members = ["packages/*", "examples/*"]
 snodra-messaging = { workspace = true }
 snodra-conformance-service = { workspace = true }
 snodra-messaging-observability = { workspace = true }
+snodra-messaging-kafka = { workspace = true }
 orders-quickstart = { workspace = true }
 events-service = { workspace = true }
 
@@ -31,8 +32,10 @@ dev = [
     "snodra-messaging",
     "snodra-conformance-service",
     "snodra-messaging-observability",
+    "snodra-messaging-kafka",
     "orders-quickstart",
     "events-service",
+    "testcontainers==4.15.0",
     "opentelemetry-sdk==1.45.2",
 ]
 gen = ["grpcio-tools==1.85.4"]
@@ -57,8 +60,17 @@ files = ["packages", "examples"]
 module = "snodra._hubpb.*"
 ignore_errors = true
 
+[[tool.mypy.overrides]]
+module = ["aiokafka", "aiokafka.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
-testpaths = ["packages/snodra-messaging/tests", "packages/snodra-messaging-observability/tests", "examples"]
+testpaths = [
+    "packages/snodra-messaging/tests",
+    "packages/snodra-messaging-observability/tests",
+    "packages/snodra-messaging-kafka/tests",
+    "examples",
+]
 pythonpath = ["packages/snodra-messaging/tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

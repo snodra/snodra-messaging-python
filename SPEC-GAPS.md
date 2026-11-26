@@ -373,3 +373,83 @@ library does there. Where an entry is settled, its behaviour is this library's r
   library does, or require an empty `traceparent`? Recommend the former; a fabricated or empty trace id is worse than
   its absence.
 - **Wire change:** no.
+
+### SG-24: a paused Kafka subscription and the client's bound on the time between polls
+
+- **Specification:** `event-store-add-ons.md` says a subscription that is paused "stops delivering without losing the
+  place" and that the core keeps calling `next` while paused, "which keeps the membership alive". It does not say how
+  a client that leaves a consumer group when it has not fetched for a while must be configured, nor what a library
+  should do when its poll cadence is slower than that bound.
+- **Other Snodra libraries:** the Kotlin add-on pauses the assigned partitions and still polls to keep the group
+  membership alive (`snodra-messaging@64dde1e:snodra-messaging-kafka/src/main/kotlin/com/damoreira/snodra/messaging/kafka/KafkaSubscription.kt:37`,
+  its pause at line 139); the Rust add-on keeps calling `recv` and seeks back what it fetched while paused.
+- **This library:** `snodra_kafka/kafka.py` (`MAX_POLL_INTERVAL_MS`, `KafkaSubscription.next`). The subscription keeps
+  polling while paused and hands nothing out; the client's `max.poll.interval.ms` is raised to 24 h, because
+  `aiokafka` measures it from the last fetch and would otherwise make a paused processor leave its group. A dead
+  process is still found by the session timeout (10 s by default), which the heartbeat task misses as soon as the
+  event loop is blocked.
+- **Question:** open: should the specification name the bound, or is "keeps the membership alive" enough for every
+  client? Recommend naming it once ("a paused subscription stays a member however long it is paused") and leaving the
+  client setting to the add-on.
+- **Wire change:** no.
+
+### SG-25: an acknowledgement after a Kafka segment changed hands
+
+- **Specification:** `event-store-add-ons.md` says an acknowledgement "acknowledges that delivery and every earlier
+  one of the segment; a later subscription of the name resumes after it", and that what a revoked segment delivered
+  and was not acknowledged comes again to its next holder. It does not say what an acknowledgement of a segment the
+  subscription no longer holds does.
+- **Other Snodra libraries:** the Rust add-on accepts it and returns without committing (`snodra-messaging-rs@4d63802:crates/snodra-messaging-kafka/src/subscription.rs:487`,
+  the assignment check at line 489); the Kotlin memory store drops it after checking the segment and position
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/eventstore/memory/MemoryEventStore.kt:268`).
+- **This library:** `snodra_kafka/kafka.py` (`KafkaSubscription.ack`). The segment and position are parsed, and an
+  acknowledgement of a partition this subscription no longer holds is dropped: the partition's new holder starts
+  from the committed position, and the record it already delivered comes again there.
+- **Question:** settled: the acknowledgement is dropped.
+- **Wire change:** no.
+
+### SG-26: redelivering a Kafka position at or after the subscription's next one
+
+- **Specification:** `event-store-add-ons.md` says redeliver "hands that delivery and the segment's later ones out
+  again without leaving the subscription"; it does not say what a call with a position at or after the subscription's
+  next position does.
+- **Other Snodra libraries:** the Rust add-on seeks back to whatever position it is given (`snodra-messaging-rs@4d63802:crates/snodra-messaging-kafka/src/subscription.rs:509`);
+  the memory store moves the position back only for an earlier one (SG-14 in this file, from
+  `snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/eventstore/memory/MemoryEventStore.kt:279`).
+- **This library:** `snodra_kafka/kafka.py` (`KafkaSubscription.redeliver`). Only an earlier position moves the
+  subscription's next position back and seeks the partition; a position at or after it changes nothing, so a
+  redelivery never skips an event. This follows the memory store's guard (SG-14) rather than the Rust add-on's seek.
+- **Question:** settled: a position at or after the next one changes nothing.
+- **Wire change:** no.
+
+### SG-27: the capabilities of a Kafka add-on in a library without an event browser
+
+- **Specification:** `event-store-add-ons.md` says the Kafka add-on declares every capability, `browse` included, and
+  that a library whose interfaces have no event browser may still declare `browse` for a store another program can
+  read. It also says the browse checks are omitted from a kit without a browser, as the Kotlin kit omits them.
+- **Other Snodra libraries:** the Rust add-on declares all four capabilities and has a browser
+  (`snodra-messaging-rs@4d63802:crates/snodra-messaging-kafka/src/lib.rs:78`); the Kotlin event-store interface has no
+  browser (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/eventstore/EventStore.kt:28`)
+  and its kit runs no browse checks.
+- **This library:** `snodra_kafka/kafka.py` (`_CAPABILITIES`). This library has no event browser and the add-on
+  declares `replay`, `lag` and `native-dead-letter`, not `browse`; the four browse checks are omitted from its kit run.
+  The Rust-based event browser reads the same `snodra.events` topic with a Rust Kafka add-on, so nothing on the wire
+  is closed to it.
+- **Question:** open: should a library without a browser declare `browse` anyway? Recommend no: `browse` is a promise
+  to the hub that an instance can answer the five queries, and a browser-less library would have to lie or proxy them.
+  The page already allows a browser in another program.
+- **Wire change:** no.
+
+### SG-28: a Kafka client whose default partition assignor is not `range`
+
+- **Specification:** `event-store-add-ons.md` (Kafka wire rules, Group protocol) says the official add-ons "set
+  neither the group protocol nor the partition assignor: each client's default", because the Kotlin and Rust clients'
+  defaults are the classic protocol with `range`; "a third-party member must offer it too".
+- **Other Snodra libraries:** the Kotlin and Rust add-ons rely on their clients' defaults, which are the classic
+  protocol with `range`.
+- **This library:** `snodra_kafka/kafka.py` (`KafkaConfig.consumer_settings`). `aiokafka` offers only the classic
+  group protocol, and its default assignor is round-robin, which would not join a Kotlin or Rust instance's group; the
+  add-on sets `partition_assignment_strategy=(RangePartitionAssignor,)` explicitly, which is the rule's intent.
+- **Question:** settled: a client whose default is not `range` must set it, so that every official member offers the
+  assignor the group decides on.
+- **Wire change:** no.
