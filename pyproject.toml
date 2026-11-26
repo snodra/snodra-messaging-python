@@ -21,6 +21,7 @@ snodra-messaging-rabbitmq = { workspace = true }
 snodra-messaging-sql = { workspace = true }
 orders-quickstart = { workspace = true }
 events-service = { workspace = true }
+store-interop = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -41,6 +42,7 @@ dev = [
     "snodra-messaging-sql",
     "orders-quickstart",
     "events-service",
+    "store-interop",
     "testcontainers==4.15.0",
     "opentelemetry-sdk==1.45.2",
 ]

@@ -18,6 +18,7 @@ members = [
     "snodra-messaging-python-workspace",
     "snodra-messaging-rabbitmq",
     "snodra-messaging-sql",
+    "store-interop",
 ]
 
 [[package]]
@@ -1635,6 +1636,7 @@ dev = [
     { name = "snodra-messaging-observability" },
     { name = "snodra-messaging-rabbitmq" },
     { name = "snodra-messaging-sql" },
+    { name = "store-interop" },
     { name = "testcontainers" },
     { name = "twine" },
     { name = "types-grpcio" },
@@ -1663,6 +1665,7 @@ dev = [
     { name = "snodra-messaging-observability", editable = "packages/snodra-messaging-observability" },
     { name = "snodra-messaging-rabbitmq", editable = "packages/snodra-messaging-rabbitmq" },
     { name = "snodra-messaging-sql", editable = "packages/snodra-messaging-sql" },
+    { name = "store-interop", editable = "examples/store-interop" },
     { name = "testcontainers", specifier = "==4.15.0" },
     { name = "twine", specifier = "==7.0.0" },
     { name = "types-grpcio" },
@@ -1700,6 +1703,27 @@ requires-dist = [
     { name = "asyncmy", specifier = "==0.2.18" },
     { name = "asyncpg", specifier = "==0.32.0" },
     { name = "snodra-messaging", editable = "packages/snodra-messaging" },
+]
+
+[[package]]
+name = "store-interop"
+version = "0.0.0"
+source = { editable = "examples/store-interop" }
+dependencies = [
+    { name = "snodra-messaging" },
+    { name = "snodra-messaging-kafka" },
+    { name = "snodra-messaging-mongo" },
+    { name = "snodra-messaging-rabbitmq" },
+    { name = "snodra-messaging-sql" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "snodra-messaging", editable = "packages/snodra-messaging" },
+    { name = "snodra-messaging-kafka", editable = "packages/snodra-messaging-kafka" },
+    { name = "snodra-messaging-mongo", editable = "packages/snodra-messaging-mongo" },
+    { name = "snodra-messaging-rabbitmq", editable = "packages/snodra-messaging-rabbitmq" },
+    { name = "snodra-messaging-sql", editable = "packages/snodra-messaging-sql" },
 ]
 
 [[package]]
