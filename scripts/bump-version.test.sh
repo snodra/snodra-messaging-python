@@ -17,21 +17,22 @@ ok() {
   echo "ok   $*"
 }
 
-# The six files the bump writes, and the whole workspace `uv lock` reads: every member's manifest,
-# including the RabbitMQ add-on, which is a member even though no release publishes it.
+# The seven files the bump writes, and the whole workspace `uv lock` reads: every member's
+# manifest, including the RabbitMQ add-on, which is a member even though no release publishes it.
 core=packages/snodra-messaging/pyproject.toml
 observability=packages/snodra-messaging-observability/pyproject.toml
 kafka=packages/snodra-messaging-kafka/pyproject.toml
 sql=packages/snodra-messaging-sql/pyproject.toml
 mongo=packages/snodra-messaging-mongo/pyproject.toml
-packages="$core $observability $kafka $sql $mongo"
-addons="$observability $kafka $sql $mongo"
+rabbitmq=packages/snodra-messaging-rabbitmq/pyproject.toml
+packages="$core $observability $kafka $sql $mongo $rabbitmq"
+addons="$observability $kafka $sql $mongo $rabbitmq"
 versioned="$packages uv.lock"
 files="$versioned pyproject.toml"
 for f in "$root"/packages/*/pyproject.toml "$root"/examples/*/pyproject.toml; do
   f=${f#"$root/"}
   case $f in
-    "$core" | "$observability" | "$kafka" | "$sql" | "$mongo") ;;
+    "$core" | "$observability" | "$kafka" | "$sql" | "$mongo" | "$rabbitmq") ;;
     *) files="$files $f" ;;
   esac
 done
@@ -67,17 +68,20 @@ line "the observability version" "$observability" 'version = "9.8.7"'
 line "the Kafka version" "$kafka" 'version = "9.8.7"'
 line "the SQL version" "$sql" 'version = "9.8.7"'
 line "the MongoDB version" "$mongo" 'version = "9.8.7"'
+line "the RabbitMQ version" "$rabbitmq" 'version = "9.8.7"'
 line "the observability pin" "$observability" '    "snodra-messaging==9.8.7",'
 line "the Kafka pin" "$kafka" '    "snodra-messaging==9.8.7",'
 line "the SQL pin" "$sql" '    "snodra-messaging==9.8.7",'
 line "the MongoDB pin" "$mongo" '    "snodra-messaging==9.8.7",'
-for p in snodra-messaging snodra-messaging-observability snodra-messaging-kafka snodra-messaging-sql snodra-messaging-mongo; do
+line "the RabbitMQ pin" "$rabbitmq" '    "snodra-messaging==9.8.7",'
+for p in snodra-messaging snodra-messaging-observability snodra-messaging-kafka snodra-messaging-sql \
+  snodra-messaging-mongo snodra-messaging-rabbitmq; do
   records "$p"
 done
 if uv lock --check >/dev/null 2>&1; then ok "the lock is the one uv resolves"; else fail "the lock is stale"; fi
 
 # Only the version lines move: one in the core, two in each add-on (its version and its pin), and
-# in the lock every added line carries 9.8.7, at least the five versions. The lock's `revision` is
+# in the lock every added line carries 9.8.7, at least the six versions. The lock's `revision` is
 # uv's own header, not a package: a newer uv writes a newer revision whenever it writes the lock,
 # so it is dropped from both copies before the diff. Nothing else moves, and no other line carries
 # the version.
@@ -88,7 +92,7 @@ done
 grep -v '^revision = ' "$root/uv.lock" >"$work/lock.before"
 grep -v '^revision = ' uv.lock >"$work/lock.after"
 added=$(diff "$work/lock.before" "$work/lock.after" | grep '^>')
-[ "$(printf '%s\n' "$added" | grep -cF 9.8.7)" -ge 5 ] && ok "five or more version lines in uv.lock" \
+[ "$(printf '%s\n' "$added" | grep -cF 9.8.7)" -ge 6 ] && ok "six or more version lines in uv.lock" \
   || fail "$(printf '%s\n' "$added" | grep -cF 9.8.7) version lines in uv.lock"
 [ "$(printf '%s\n' "$added" | grep -vcF 9.8.7)" -eq 0 ] && ok "every added uv.lock line carries 9.8.7" \
   || fail "uv.lock lines without 9.8.7: $(printf '%s\n' "$added" | grep -vF 9.8.7 | tr '\n' ' ')"
@@ -133,10 +137,12 @@ missing_line "a missing version line in the observability package fails" "$obser
 missing_line "a missing version line in the Kafka package fails" "$kafka" '^version = "'
 missing_line "a missing version line in the SQL package fails" "$sql" '^version = "'
 missing_line "a missing version line in the MongoDB package fails" "$mongo" '^version = "'
+missing_line "a missing version line in the RabbitMQ package fails" "$rabbitmq" '^version = "'
 missing_line "a missing observability pin fails" "$observability" '^    "snodra-messaging=='
 missing_line "a missing Kafka pin fails" "$kafka" '^    "snodra-messaging=='
 missing_line "a missing SQL pin fails" "$sql" '^    "snodra-messaging=='
 missing_line "a missing MongoDB pin fails" "$mongo" '^    "snodra-messaging=='
+missing_line "a missing RabbitMQ pin fails" "$rabbitmq" '^    "snodra-messaging=='
 
 [ "$(diff "$root/$core" "$core" | grep -c '^>')" -eq 1 ] && ok "the files are back" || fail "the files are not back"
 
@@ -158,10 +164,12 @@ if sh scripts/bump-version.sh 0.1.0; then
   line "the Kafka package at 0.1.0" "$kafka" 'version = "0.1.0"'
   line "the SQL package at 0.1.0" "$sql" 'version = "0.1.0"'
   line "the MongoDB package at 0.1.0" "$mongo" 'version = "0.1.0"'
+  line "the RabbitMQ package at 0.1.0" "$rabbitmq" 'version = "0.1.0"'
   line "the observability pin at 0.1.0" "$observability" '    "snodra-messaging==0.1.0",'
   line "the Kafka pin at 0.1.0" "$kafka" '    "snodra-messaging==0.1.0",'
   line "the SQL pin at 0.1.0" "$sql" '    "snodra-messaging==0.1.0",'
   line "the MongoDB pin at 0.1.0" "$mongo" '    "snodra-messaging==0.1.0",'
+  line "the RabbitMQ pin at 0.1.0" "$rabbitmq" '    "snodra-messaging==0.1.0",'
   awk '$0 == "name = \"snodra-messaging\"" { getline; print; exit }' uv.lock | grep -qxF 'version = "0.1.0"' \
     && ok "uv.lock at 0.1.0" || fail "uv.lock: $(awk '$0 == "name = \"snodra-messaging\"" { getline; print; exit }' uv.lock)"
 else

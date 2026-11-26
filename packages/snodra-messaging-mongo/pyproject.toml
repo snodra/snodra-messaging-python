@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "snodra-messaging-mongo"
-version = "0.3.0"
+version = "0.4.0"
 description = "The MongoDB message store for the Snodra messaging suite."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-    "snodra-messaging==0.3.0",
+    "snodra-messaging==0.4.0",
     "pymongo==4.20.2",
 ]
 

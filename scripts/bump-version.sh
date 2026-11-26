@@ -4,10 +4,10 @@
 #   scripts/bump-version.sh 0.1.0
 #
 # - packages/snodra-messaging/pyproject.toml: the distribution's version.
-# - packages/snodra-messaging-{observability,kafka,sql,mongo}/pyproject.toml: each version, and
-#   each requirement on snodra-messaging becomes ==X.Y.Z. A consumer resolves the core through
-#   that line, so it must name a release.
-# - uv.lock: rewritten by `uv lock`, which records all five versions.
+# - packages/snodra-messaging-{observability,kafka,sql,mongo,rabbitmq}/pyproject.toml: each
+#   version, and each requirement on snodra-messaging becomes ==X.Y.Z. A consumer resolves the
+#   core through that line, so it must name a release.
+# - uv.lock: rewritten by `uv lock`, which records all six versions.
 #
 # Every line is found before anything is written, and a failure puts the files back: a release
 # commit is the whole bump or none of it.
@@ -23,7 +23,8 @@ observability=packages/snodra-messaging-observability/pyproject.toml
 kafka=packages/snodra-messaging-kafka/pyproject.toml
 sql=packages/snodra-messaging-sql/pyproject.toml
 mongo=packages/snodra-messaging-mongo/pyproject.toml
-addons="$observability $kafka $sql $mongo"
+rabbitmq=packages/snodra-messaging-rabbitmq/pyproject.toml
+addons="$observability $kafka $sql $mongo $rabbitmq"
 files="$core $addons"
 
 work=$(mktemp -d)
@@ -60,7 +61,7 @@ for addon in $addons; do
     { print }'
 done
 
-# The five files are rewritten together: a failure above leaves all of them as they were. `uv lock`
+# The six files are rewritten together: a failure above leaves all of them as they were. `uv lock`
 # then records the versions; if it fails, the files go back.
 for f in $files; do cp "$f" "$work/$(basename "$f").before"; done
 for f in $files; do mv "$f.tmp" "$f"; done
