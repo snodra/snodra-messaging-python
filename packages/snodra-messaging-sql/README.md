@@ -41,9 +41,9 @@ asyncio.run(main())
 `postgres://` or `postgresql://` for PostgreSQL, `mysql://` for MySQL. The driver is read from the scheme when
 the variable is empty.
 
-The store implements the level-2 ports: the outbox and the processed-event markers. The dead-letter,
-processor-control, external-call and saga ports are part of the interface frozen at level 2 and report
-`snodra.MessageStoreUnsupported` for now; the official add-ons implement every port by level 4.
+The store implements the outbox, the processed-event markers, the dead letters and the processor control state; the
+level-3 store checks pass on both engines. The external-call and saga ports are part of the interface frozen at
+level 2 and report `snodra.MessageStoreUnsupported` for now; the official add-ons implement every port by level 4.
 
 ### The transaction is the service's
 

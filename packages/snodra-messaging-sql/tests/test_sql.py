@@ -10,9 +10,14 @@ from typing import Any, cast
 
 import pytest
 from snodra import (
+    DeadLetter,
+    DeadLetterError,
+    DeadLetterReason,
     InvalidMessage,
+    Locked,
     MessageStoreFailed,
     OutboxEntry,
+    Parked,
     ProcessedMarker,
     ReplayRange,
     Tx,
@@ -354,6 +359,78 @@ async def test_delete_markers_removes_only_the_range(store: SqlStore) -> None:
         other_segment: True,
     }.items():
         assert await store.processed.exists(marker.id) == exists, marker.id
+
+
+async def test_a_dead_letter_payload_is_text_or_binary_and_expiry_is_its_retention(store: SqlStore) -> None:
+    """The layout's text/binary payload split keeps every byte; a letter whose expire_at passed is invisible and its
+    id is free again, so a park replaces it."""
+    t0 = 1_800_000_000_000
+
+    def letter(letter_id: str, payload: bytes, expire_at_ms: int) -> DeadLetter:
+        return DeadLetter(
+            id=letter_id,
+            processor="orders",
+            source="snodra.events",
+            segment="0",
+            position="1",
+            key=None,
+            event_id="evt-1",
+            event_type="orders.OrderShipped",
+            headers={"type": "orders.OrderShipped"},
+            payload=payload,
+            reason=DeadLetterReason.HANDLER_FAILED,
+            error=DeadLetterError.new("RuntimeError", "boom"),
+            blocked_by=None,
+            attempts=1,
+            parked_at_ms=t0,
+            last_attempt_at_ms=t0,
+            expire_at_ms=expire_at_ms,
+            replay=False,
+        )
+
+    text = letter("conformance:snodra.events:0:text", b'{"text":"\xc3\xa9"}', t0 + 86_400_000)
+    binary = letter("conformance:snodra.events:0:binary", b"\xff\xfe\x00\x01", t0 + 86_400_000)
+    for row in (text, binary):
+        assert await store.dead_letters.park(row) is Parked.NEW
+    async with store._read() as conn:
+        text_row = await store._fetchone(
+            conn, "SELECT payload, payload_binary FROM snodra_dead_letters WHERE id = ?", (text.id,)
+        )
+        binary_row = await store._fetchone(
+            conn, "SELECT payload, payload_binary FROM snodra_dead_letters WHERE id = ?", (binary.id,)
+        )
+    assert text_row is not None
+    assert text_row["payload"] == '{"text":"é"}'
+    assert text_row["payload_binary"] is None
+    assert binary_row is not None
+    assert binary_row["payload"] is None
+    assert binary_row["payload_binary"] == b"\xff\xfe\x00\x01"
+    found_text = await store.dead_letters.get(text.id)
+    assert found_text is not None
+    assert found_text.payload == text.payload
+    found_binary = await store.dead_letters.get(binary.id)
+    assert found_binary is not None
+    assert found_binary.payload == binary.payload
+
+    expired = letter("conformance:snodra.events:0:expired", b"{}", 1)
+    assert await store.dead_letters.park(expired) is Parked.NEW
+    assert await store.dead_letters.get(expired.id) is None, "expired: invisible"
+    assert await store.dead_letters.count("orders") == 2, "expired letters are not counted or blocking"
+    replacement = letter(expired.id, b'{"fresh":true}', t0 + 86_400_000)
+    assert await store.dead_letters.park(replacement) is Parked.NEW, "the id is free again"
+    found = await store.dead_letters.get(expired.id)
+    assert found is not None
+    assert found.payload == b'{"fresh":true}'
+
+
+async def test_a_renewal_that_writes_the_same_values_is_still_taken(store: SqlStore) -> None:
+    """A retried request can renew with the same lease and time; MySQL must report the matched row, not the changed
+    one, so the holder is not refused its own lock."""
+    processor = f"conformance-{uuid.uuid4()}"
+    assert await store.control.lock(processor, "op-1", 1_800_000_005_000, 1_800_000_000_000) == Locked.was_taken()
+    assert await store.control.lock(processor, "op-1", 1_800_000_005_000, 1_800_000_000_000) == Locked.was_taken()
+    assert await store.control.extend(processor, "op-1", 1_800_000_005_000, 1_800_000_000_000)
+    assert await store.control.release(processor, "op-1", 1_800_000_000_000)
 
 
 async def test_notify_false_on_postgres_registers_no_listener(store: SqlStore) -> None:

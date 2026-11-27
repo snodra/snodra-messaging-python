@@ -1,9 +1,10 @@
 """The SQL message store: PostgreSQL and MySQL on the shared layout version 1.
 
-The store keeps the outbox and the processed-event markers in the service's own database. Every
-operation joins the transaction bound to the current context (``async with store.transaction()``) or
-runs in a short transaction of its own, at READ COMMITTED; ``store.transaction(conn=conn)`` binds a
-connection the service already runs a transaction on, and the store never commits or rolls it back.
+The store keeps the outbox, the processed-event markers, the dead letters and the processor control
+state in the service's own database. Every operation joins the transaction bound to the current context
+(``async with store.transaction()``) or runs in a short transaction of its own, at READ COMMITTED;
+``store.transaction(conn=conn)`` binds a connection the service already runs a transaction on, and the
+store never commits or rolls it back.
 
 The layout is the published SQL version 1, byte for byte:
 
@@ -19,9 +20,10 @@ append's transaction sends ``pg_notify('snodra_outbox', '')`` and :meth:`SqlStor
 ``on_append`` listens on a connection of its own, so a commit wakes the relay and a rollback wakes
 nobody; MySQL has no notification and the relay polls.
 
-The dead-letter, processor-control, external-call and saga ports are part of the interface frozen at
-level 2 and report :class:`snodra.MessageStoreUnsupported` for now. The official add-ons implement
-every port by level 4.
+The dead-letter and processor-control stores use the layout's text/binary payload split and its
+``replay`` array, and a letter whose expiry passed is gone for every read and write here. The
+external-call and saga ports are part of the interface frozen at level 2 and report
+:class:`snodra.MessageStoreUnsupported` for now. The official add-ons implement every port by level 4.
 
 See https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/.
 """
@@ -47,11 +49,15 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import asyncmy
 import asyncmy.cursors
 import asyncpg
+from asyncmy.constants import CLIENT
 from snodra import (
+    RESET_KIND,
     AppendListener,
     Conflict,
+    ControlOperation,
     DeadLetter,
     DeadLetterError,
+    DeadLetterReason,
     DeadLetterStore,
     DeadLetterSummary,
     DeadlineDocument,
@@ -334,8 +340,8 @@ class SqlStore:
         self._listens = 0
         self.outbox: OutboxStore = _SqlOutbox(self)
         self.processed: ProcessedStore = _SqlProcessed(self)
-        self.dead_letters: DeadLetterStore = _UnsupportedDeadLetters()
-        self.control: ProcessorControlStore = _UnsupportedControl()
+        self.dead_letters: DeadLetterStore = _SqlDeadLetters(self)
+        self.control: ProcessorControlStore = _SqlControl(self)
         self.external: ExternalCallStore = _UnsupportedExternal()
         self.sagas: SagaStores = SagaStores(
             sagas=_UnsupportedSagas(),
@@ -1134,72 +1140,537 @@ def _position_bound(op: str, position: str) -> tuple[str, Any]:
     return f"position_num IS NULL AND position {op} ?", position
 
 
+# ---- the dead letters -----------------------------------------------------------------------------
+
+
+class _SqlDeadLetters:
+    """The dead letters on ``snodra_dead_letters``. Every write but :meth:`delete_in` commits on its own; a letter
+    whose ``expire_at`` passed is gone for every read and write here (it no longer blocks its key), and the purge
+    deletes it. Positions are ordered as the layout says: decimal ones by value, then the others by their bytes; a
+    bound compares only positions of its own kind."""
+
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
+
+    def _columns(self) -> str:
+        return (
+            "id, processor, source, segment, position, event_key, event_id, event_type, "
+            f"CAST(headers AS {self._store._text_type()}) AS headers, payload, payload_binary, reason, "
+            "error_type, error_message, blocked_by, attempts, parked_at, last_attempt_at, expire_at, replay"
+        )
+
+    async def park(self, letter: DeadLetter) -> Parked:
+        store = self._store
+        _check_text("a dead letter's id", letter.id, 578)
+        _check_optional_text("a dead letter's processor", letter.processor, MAX_PROCESSOR)
+        _check_optional_text("a dead letter's source", letter.source, MAX_SOURCE)
+        _check_optional_text("a dead letter's segment", letter.segment, MAX_SEGMENT)
+        _check_optional_text("a dead letter's position", letter.position, MAX_POSITION)
+        if letter.key is not None:
+            _check_text("a dead letter's key", letter.key, -1)
+        if letter.event_id is not None:
+            _check_text("a dead letter's event id", letter.event_id, -1)
+        if letter.event_type is not None:
+            _check_text("a dead letter's event type", letter.event_type, -1)
+        if letter.blocked_by is not None:
+            _check_text("a dead letter's blocked-by id", letter.blocked_by, -1)
+        headers = _headers_json(letter.headers)
+        payload, payload_binary = _dead_letter_payload(letter.payload)
+        error_type = _cut_free_text(letter.error.type_name)
+        error_message = _cut_free_text(letter.error.message)
+        key_hash = None if letter.key is None else _sha256(letter.key)
+        now = store._now()
+        query = (
+            "INSERT INTO snodra_dead_letters (id, processor, source, segment, position, position_num, "
+            "event_key, event_key_hash, event_id, event_type, headers, payload, payload_binary, reason, "
+            "error_type, error_message, blocked_by, attempts, parked_at, last_attempt_at, expire_at, replay) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS {store._json_type()}), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        if store._driver == DRIVER_POSTGRES:
+            query += " ON CONFLICT (id) DO NOTHING"
+        async with store._own() as conn:
+            # An expired letter of the same id no longer exists: its id is free again.
+            await store._exec(
+                conn,
+                "DELETE FROM snodra_dead_letters WHERE id = ? AND expire_at <= ?",
+                (letter.id, store._time(now)),
+            )
+            try:
+                affected = await store._exec(
+                    conn,
+                    query,
+                    (
+                        letter.id,
+                        letter.processor,
+                        letter.source,
+                        letter.segment,
+                        letter.position,
+                        _position_number(letter.position),
+                        letter.key,
+                        key_hash,
+                        letter.event_id,
+                        letter.event_type,
+                        headers,
+                        payload,
+                        payload_binary,
+                        letter.reason.value,
+                        error_type,
+                        error_message,
+                        letter.blocked_by,
+                        letter.attempts,
+                        store._time(letter.parked_at_ms),
+                        store._time(letter.last_attempt_at_ms),
+                        store._time(letter.expire_at_ms),
+                        letter.replay,
+                    ),
+                )
+            except Conflict as error:
+                if store._driver == DRIVER_MYSQL and _duplicate(error):
+                    return Parked.ALREADY
+                raise
+        return Parked.NEW if affected == 1 else Parked.ALREADY
+
+    async def head(self, processor: str, key: str) -> str | None:
+        _check_optional_text("a dead letter's processor", processor, MAX_PROCESSOR)
+        _check_text("a dead letter's key", key, -1)
+        store = self._store
+        async with store._read() as conn:
+            row = await store._fetchone(
+                conn,
+                "SELECT id FROM snodra_dead_letters WHERE processor = ? AND event_key_hash = ? "
+                "AND reason <> 'INVALID' AND expire_at > ? "
+                "ORDER BY position_num IS NULL, position_num, position, id LIMIT 1",
+                (processor, _sha256(key), store._time(store._now())),
+            )
+        return None if row is None else str(row["id"])
+
+    async def earlier(self, processor: str, key: str, position: str) -> str | None:
+        _check_optional_text("a dead letter's processor", processor, MAX_PROCESSOR)
+        _check_text("a dead letter's key", key, -1)
+        _check_text("a dead letter's position", position, MAX_POSITION)
+        bound, argument = _position_bound("<", position)
+        store = self._store
+        async with store._read() as conn:
+            row = await store._fetchone(
+                conn,
+                "SELECT id FROM snodra_dead_letters WHERE processor = ? AND event_key_hash = ? "
+                "AND reason <> 'INVALID' AND expire_at > ? AND "
+                f"{bound} ORDER BY position_num IS NULL, position_num, position, id LIMIT 1",
+                (processor, _sha256(key), store._time(store._now()), argument),
+            )
+        return None if row is None else str(row["id"])
+
+    async def parked_keys(self, processor: str, source: str, segments: Sequence[str]) -> set[str]:
+        if not segments:
+            return set()
+        _check_optional_text("a dead letter's processor", processor, MAX_PROCESSOR)
+        _check_optional_text("a dead letter's source", source, MAX_SOURCE)
+        for segment in segments:
+            _check_text("a dead letter's segment", segment, MAX_SEGMENT)
+        store = self._store
+        places = ", ".join("?" for _ in segments)
+        async with store._read() as conn:
+            rows = await store._fetchall(
+                conn,
+                "SELECT DISTINCT event_key FROM snodra_dead_letters "
+                f"WHERE processor = ? AND source = ? AND segment IN ({places}) "
+                "AND event_key IS NOT NULL AND reason <> 'INVALID' AND expire_at > ?",
+                (processor, source, *segments, store._time(store._now())),
+            )
+        return {str(row["event_key"]) for row in rows}
+
+    async def get(self, letter: str) -> DeadLetter | None:
+        _check_text("a dead letter's id", letter, 578)
+        store = self._store
+        async with store._read() as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_dead_letters WHERE id = ? AND expire_at > ?",
+                (letter, store._time(store._now())),
+            )
+        return None if row is None else _dead_letter_from_row(row)
+
+    async def list(self, processor: str | None = None, limit: int | None = None) -> builtins.list[DeadLetter]:
+        _check_optional_text("a dead letter's processor", processor or "", MAX_PROCESSOR)
+        store = self._store
+        query = f"SELECT {self._columns()} FROM snodra_dead_letters WHERE expire_at > ?"
+        args: list[Any] = [store._time(store._now())]
+        if processor is not None:
+            query += " AND processor = ?"
+            args.append(processor)
+        query += " ORDER BY parked_at, id"
+        if limit is not None:
+            query += " LIMIT ?"
+            args.append(max(0, int(limit)))
+        async with store._read() as conn:
+            rows = await store._fetchall(conn, query, tuple(args))
+        return [_dead_letter_from_row(row) for row in rows]
+
+    async def summaries(self, processor: str) -> builtins.list[DeadLetterSummary]:
+        _check_optional_text("a dead letter's processor", processor, MAX_PROCESSOR)
+        store = self._store
+        async with store._read() as conn:
+            rows = await store._fetchall(
+                conn,
+                "SELECT id, event_key, position, reason, parked_at FROM snodra_dead_letters "
+                "WHERE processor = ? AND expire_at > ? "
+                "ORDER BY position_num IS NULL, position_num, position, id",
+                (processor, store._time(store._now())),
+            )
+        return [
+            DeadLetterSummary(
+                id=str(row["id"]),
+                key=None if row["event_key"] is None else str(row["event_key"]),
+                position=str(row["position"]),
+                reason=DeadLetterReason(str(row["reason"])),
+                parked_at_ms=_ms_value(row["parked_at"]),
+            )
+            for row in rows
+        ]
+
+    async def count(self, processor: str | None = None) -> int:
+        _check_optional_text("a dead letter's processor", processor or "", MAX_PROCESSOR)
+        store = self._store
+        query = "SELECT COUNT(*) AS n FROM snodra_dead_letters WHERE expire_at > ?"
+        args: list[Any] = [store._time(store._now())]
+        if processor is not None:
+            query += " AND processor = ?"
+            args.append(processor)
+        async with store._read() as conn:
+            value = await store._fetchval(conn, query, tuple(args))
+        return 0 if value is None else int(value)
+
+    async def delete(self, letter: str) -> bool:
+        _check_text("a dead letter's id", letter, 578)
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "DELETE FROM snodra_dead_letters WHERE id = ? AND expire_at > ?",
+                (letter, store._time(store._now())),
+            )
+        return affected > 0
+
+    async def delete_in(self, letter: str, *, tx: Tx | None = None) -> bool:
+        _check_text("a dead letter's id", letter, 578)
+        store = self._store
+        async with store._scoped(tx) as conn:
+            affected = await store._exec(
+                conn,
+                "DELETE FROM snodra_dead_letters WHERE id = ? AND expire_at > ?",
+                (letter, store._time(store._now())),
+            )
+        return affected > 0
+
+    async def record_failure(self, letter: str, error: DeadLetterError, now_ms: int) -> bool:
+        _check_text("a dead letter's id", letter, 578)
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_dead_letters SET attempts = attempts + 1, error_type = ?, error_message = ?, "
+                "last_attempt_at = ?, reason = 'HANDLER_FAILED', blocked_by = NULL "
+                "WHERE id = ? AND expire_at > ?",
+                (
+                    _cut_free_text(error.type_name),
+                    _cut_free_text(error.message),
+                    store._time(now_ms),
+                    letter,
+                    store._time(store._now()),
+                ),
+            )
+        return affected > 0
+
+
+def _dead_letter_payload(payload: bytes) -> tuple[str | None, bytes | None]:
+    """The text or binary column a letter's payload needs: text only when it is UTF-8 without U+0000."""
+    raw = bytes(payload)
+    if not raw:
+        return "", None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, raw
+    if "\x00" in text:
+        return None, raw
+    return text, None
+
+
+def _dead_letter_from_row(row: dict[str, Any]) -> DeadLetter:
+    payload = row["payload"]
+    if payload is not None:
+        raw = str(payload).encode()
+    else:
+        raw = b"" if row["payload_binary"] is None else bytes(row["payload_binary"])
+    return DeadLetter(
+        id=str(row["id"]),
+        processor=str(row["processor"]),
+        source=str(row["source"]),
+        segment=str(row["segment"]),
+        position=str(row["position"]),
+        key=None if row["event_key"] is None else str(row["event_key"]),
+        event_id=None if row["event_id"] is None else str(row["event_id"]),
+        event_type=None if row["event_type"] is None else str(row["event_type"]),
+        headers=_headers_from_json(row["headers"]),
+        payload=raw,
+        reason=DeadLetterReason(str(row["reason"])),
+        error=DeadLetterError(str(row["error_type"]), str(row["error_message"])),
+        blocked_by=None if row["blocked_by"] is None else str(row["blocked_by"]),
+        attempts=int(row["attempts"]),
+        parked_at_ms=_ms_value(row["parked_at"]),
+        last_attempt_at_ms=_ms_value(row["last_attempt_at"]),
+        expire_at_ms=_ms_value(row["expire_at"]),
+        replay=bool(row["replay"]),
+    )
+
+
+# ---- the processor control ------------------------------------------------------------------------
+
+
+class _SqlControl:
+    """The processor control state on ``snodra_processor_control``: one row per processor, created by the first write
+    that needs it. Every write commits on its own; a lock is one conditional ``UPDATE`` after a renewal attempt."""
+
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
+
+    def _columns(self) -> str:
+        return (
+            "processor, paused, paused_at, paused_by, op_id, op_kind, op_lease_until, op_prepared_at, "
+            f"CAST(replay AS {self._store._text_type()}) AS replay, updated_at"
+        )
+
+    async def get(self, processor: str) -> ProcessorControlState:
+        _check_optional_text("a processor's name", processor, MAX_PROCESSOR)
+        store = self._store
+        async with store._read() as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_processor_control WHERE processor = ?",
+                (processor,),
+            )
+        return _control_state(processor, row)
+
+    async def _get_on(self, conn: Any, processor: str) -> ProcessorControlState:
+        row = await self._store._fetchone(
+            conn,
+            f"SELECT {self._columns()} FROM snodra_processor_control WHERE processor = ?",
+            (processor,),
+        )
+        return _control_state(processor, row)
+
+    async def _ensure(self, conn: Any, processor: str) -> None:
+        _check_text("a processor's name", processor, MAX_PROCESSOR)
+        store = self._store
+        query = (
+            "INSERT INTO snodra_processor_control (processor, paused, replay) "
+            f"VALUES (?, FALSE, CAST(? AS {store._json_type()}))"
+        )
+        if store._driver == DRIVER_POSTGRES:
+            query += " ON CONFLICT (processor) DO NOTHING"
+        else:
+            query += " ON DUPLICATE KEY UPDATE processor = processor"
+        await store._exec(conn, query, (processor, "[]"))
+
+    async def set_paused(self, processor: str, paused: bool, by: str, now_ms: int) -> None:
+        _check_text("a processor's name", processor, MAX_PROCESSOR)
+        _check_text("a pause's control id", by, -1)
+        store = self._store
+        async with store._own() as conn:
+            await self._ensure(conn, processor)
+            await store._exec(
+                conn,
+                "UPDATE snodra_processor_control SET paused = ?, paused_at = ?, paused_by = ?, updated_at = ? "
+                "WHERE processor = ?",
+                (
+                    paused,
+                    store._time(now_ms) if paused else None,
+                    by if paused else None,
+                    store._time(now_ms),
+                    processor,
+                ),
+            )
+
+    async def lock(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> Locked:
+        _check_text("a processor's name", processor, MAX_PROCESSOR)
+        _check_text("a reset's operation id", operation, -1)
+        store = self._store
+        async with store._own() as conn:
+            await self._ensure(conn, processor)
+            renewed = await store._exec(
+                conn,
+                "UPDATE snodra_processor_control SET op_lease_until = ?, updated_at = ? "
+                "WHERE processor = ? AND op_id = ?",
+                (store._time(lease_until_ms), store._time(now_ms), processor, operation),
+            )
+            if renewed == 1:
+                return Locked.was_taken()
+            taken = await store._exec(
+                conn,
+                "UPDATE snodra_processor_control SET op_id = ?, op_kind = ?, op_lease_until = ?, "
+                "op_prepared_at = ?, updated_at = ? "
+                "WHERE processor = ? AND (op_id IS NULL OR op_lease_until <= ?)",
+                (
+                    operation,
+                    RESET_KIND,
+                    store._time(lease_until_ms),
+                    store._time(now_ms),
+                    store._time(now_ms),
+                    processor,
+                    store._time(now_ms),
+                ),
+            )
+            if taken == 1:
+                return Locked.was_taken()
+            state = await self._get_on(conn, processor)
+            return Locked(False, state.operation)
+
+    async def extend(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:
+        _check_text("a processor's name", processor, MAX_PROCESSOR)
+        _check_text("a reset's operation id", operation, -1)
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_processor_control SET op_lease_until = ?, updated_at = ? "
+                "WHERE processor = ? AND op_id = ?",
+                (store._time(lease_until_ms), store._time(now_ms), processor, operation),
+            )
+        return affected == 1
+
+    async def release(self, processor: str, operation: str, now_ms: int) -> bool:
+        return await self._clear(processor, operation, now_ms, expired_only=False)
+
+    async def expire(self, processor: str, operation: str, now_ms: int) -> bool:
+        return await self._clear(processor, operation, now_ms, expired_only=True)
+
+    async def _clear(self, processor: str, operation: str, now_ms: int, *, expired_only: bool) -> bool:
+        _check_text("a processor's name", processor, MAX_PROCESSOR)
+        _check_text("a reset's operation id", operation, -1)
+        store = self._store
+        query = (
+            "UPDATE snodra_processor_control SET op_id = NULL, op_kind = NULL, op_lease_until = NULL, "
+            "op_prepared_at = NULL, updated_at = ? WHERE processor = ? AND op_id = ?"
+        )
+        args: list[Any] = [store._time(now_ms), processor, operation]
+        if expired_only:
+            query += " AND op_lease_until <= ?"
+            args.append(store._time(now_ms))
+        async with store._own() as conn:
+            affected = await store._exec(conn, query, tuple(args))
+        return affected == 1
+
+    async def set_replay(self, processor: str, ranges: Sequence[ReplayRange], now_ms: int) -> None:
+        _check_text("a processor's name", processor, MAX_PROCESSOR)
+        encoded = _encode_replay(ranges)
+        store = self._store
+        async with store._own() as conn:
+            await self._ensure(conn, processor)
+            await store._exec(
+                conn,
+                "UPDATE snodra_processor_control "
+                f"SET replay = CAST(? AS {store._json_type()}), updated_at = ? WHERE processor = ?",
+                (encoded, store._time(now_ms), processor),
+            )
+
+    async def remove_range(self, processor: str, replay_range: ReplayRange, now_ms: int) -> bool:
+        _check_text("a processor's name", processor, MAX_PROCESSOR)
+        _encode_replay((replay_range,))
+        store = self._store
+        async with store._own() as conn:
+            row = await store._fetchone(
+                conn,
+                "SELECT "
+                f"CAST(replay AS {store._text_type()}) AS replay FROM snodra_processor_control "
+                "WHERE processor = ? FOR UPDATE",
+                (processor,),
+            )
+            if row is None:
+                return False
+            ranges = list(_decode_replay(row["replay"]))
+            try:
+                ranges.remove(replay_range)
+            except ValueError:
+                return False
+            await store._exec(
+                conn,
+                "UPDATE snodra_processor_control "
+                f"SET replay = CAST(? AS {store._json_type()}), updated_at = ? WHERE processor = ?",
+                (_encode_replay(ranges), store._time(now_ms), processor),
+            )
+        return True
+
+
+def _control_state(processor: str, row: dict[str, Any] | None) -> ProcessorControlState:
+    if row is None:
+        return ProcessorControlState(processor)
+    operation: ControlOperation | None = None
+    if row["op_id"] is not None:
+        lease = row["op_lease_until"]
+        prepared = row["op_prepared_at"]
+        operation = ControlOperation(
+            id=str(row["op_id"]),
+            kind=RESET_KIND if row["op_kind"] is None else str(row["op_kind"]),
+            lease_until_ms=0 if lease is None else _ms_value(lease),
+            prepared_at_ms=0 if prepared is None else _ms_value(prepared),
+        )
+    paused_at = row["paused_at"]
+    updated_at = row["updated_at"]
+    return ProcessorControlState(
+        processor=str(row["processor"]),
+        paused=bool(row["paused"]),
+        paused_at_ms=None if paused_at is None else _ms_value(paused_at),
+        paused_by=None if row["paused_by"] is None else str(row["paused_by"]),
+        operation=operation,
+        replay=_decode_replay(row["replay"]),
+        updated_at_ms=None if updated_at is None else _ms_value(updated_at),
+    )
+
+
+def _encode_replay(ranges: Sequence[ReplayRange]) -> str:
+    stored: list[dict[str, str]] = []
+    for replay in ranges:
+        _check_optional_text("a replay range's source", replay.source, MAX_SOURCE)
+        _check_optional_text("a replay range's segment", replay.segment, MAX_SEGMENT)
+        _check_optional_text("a replay range's from position", replay.start, MAX_POSITION)
+        _check_optional_text("a replay range's until position", replay.until, MAX_POSITION)
+        stored.append({"source": replay.source, "segment": replay.segment, "from": replay.start, "until": replay.until})
+    return json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode_replay(text: Any) -> tuple[ReplayRange, ...]:
+    if text is None:
+        return ()
+    raw = str(text)
+    if not raw.strip() or raw.strip() == "null":
+        return ()
+    try:
+        stored: Any = json.loads(raw)
+    except ValueError as error:
+        raise MessageStoreFailed(f"the SQL message store cannot read a replay column: {error}") from error
+    if not isinstance(stored, list):
+        raise MessageStoreFailed("the SQL message store cannot read a replay column: not an array")
+    ranges: list[ReplayRange] = []
+    for item in stored:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("source")
+        segment = item.get("segment")
+        start = item.get("from")
+        until = item.get("until")
+        if not isinstance(source, str) or not isinstance(segment, str):
+            continue
+        if not isinstance(start, str) or not isinstance(until, str):
+            continue
+        ranges.append(ReplayRange(source=source, segment=segment, start=start, until=until))
+    return tuple(ranges)
+
+
 # ---- the ports this level does not implement ------------------------------------------------------
 
 
 def _unsupported(what: str) -> MessageStoreUnsupported:
     return MessageStoreUnsupported(f"{what} in the SQL message store (level 2)")
-
-
-class _UnsupportedDeadLetters:
-    async def park(self, letter: DeadLetter) -> Parked:
-        raise _unsupported("dead_letters")
-
-    async def head(self, processor: str, key: str) -> str | None:
-        raise _unsupported("dead_letters")
-
-    async def earlier(self, processor: str, key: str, position: str) -> str | None:
-        raise _unsupported("dead_letters")
-
-    async def parked_keys(self, processor: str, source: str, segments: Sequence[str]) -> set[str]:
-        raise _unsupported("dead_letters")
-
-    async def get(self, letter: str) -> DeadLetter | None:
-        raise _unsupported("dead_letters")
-
-    async def list(self, processor: str | None = None, limit: int | None = None) -> builtins.list[DeadLetter]:
-        raise _unsupported("dead_letters")
-
-    async def summaries(self, processor: str) -> builtins.list[DeadLetterSummary]:
-        raise _unsupported("dead_letters")
-
-    async def count(self, processor: str | None = None) -> int:
-        raise _unsupported("dead_letters")
-
-    async def delete(self, letter: str) -> bool:
-        raise _unsupported("dead_letters")
-
-    async def delete_in(self, letter: str, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("dead_letters")
-
-    async def record_failure(self, letter: str, error: DeadLetterError, now_ms: int) -> bool:
-        raise _unsupported("dead_letters")
-
-
-class _UnsupportedControl:
-    async def get(self, processor: str) -> ProcessorControlState:
-        raise _unsupported("processor control")
-
-    async def set_paused(self, processor: str, paused: bool, by: str, now_ms: int) -> None:
-        raise _unsupported("processor control")
-
-    async def lock(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> Locked:
-        raise _unsupported("processor control")
-
-    async def extend(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:
-        raise _unsupported("processor control")
-
-    async def release(self, processor: str, operation: str, now_ms: int) -> bool:
-        raise _unsupported("processor control")
-
-    async def expire(self, processor: str, operation: str, now_ms: int) -> bool:
-        raise _unsupported("processor control")
-
-    async def set_replay(self, processor: str, ranges: Sequence[ReplayRange], now_ms: int) -> None:
-        raise _unsupported("processor control")
-
-    async def remove_range(self, processor: str, replay_range: ReplayRange, now_ms: int) -> bool:
-        raise _unsupported("processor control")
 
 
 class _UnsupportedExternal:
@@ -1385,7 +1856,9 @@ class _MySQLTarget:
         )
 
     def kwargs(self) -> dict[str, Any]:
-        """The keyword arguments ``asyncmy.connect`` and ``asyncmy.create_pool`` take."""
+        """The keyword arguments ``asyncmy.connect`` and ``asyncmy.create_pool`` take. ``CLIENT_FOUND_ROWS`` makes an
+        update report the rows it matched, as the Kotlin and Rust drivers report them, so a renewal that writes the
+        values already there still counts."""
         return {
             "host": self.host,
             "port": self.port,
@@ -1393,6 +1866,7 @@ class _MySQLTarget:
             "password": self.password,
             "db": self.database,
             "charset": self.charset,
+            "client_flag": CLIENT.FOUND_ROWS,
             **self.options,
         }
 

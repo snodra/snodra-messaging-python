@@ -31,11 +31,20 @@ from typing import Final
 
 from snodra._store import (
     MAX_PAYLOAD_DEPTH,
+    ControlOperation,
+    DeadLetter,
+    DeadLetterError,
+    DeadLetterReason,
     InvalidMessage,
+    Locked,
     MessageStore,
     OutboxEntry,
     OutboxStore,
+    Parked,
     ProcessedMarker,
+    ProcessorControlState,
+    ReplayRange,
+    letter_id,
     now_ms,
 )
 
@@ -117,6 +126,42 @@ def _stage_one(processor: str, topic: str, partition: int, offset: int) -> Proce
         segment=str(partition),
         position=str(offset),
     )
+
+
+def _letter(
+    processor: str,
+    segment: str,
+    position: str,
+    key: str | None,
+    reason: DeadLetterReason,
+    parked_at_ms: int,
+) -> DeadLetter:
+    """A dead letter of the kit: the fixed event, headers and expiry the reference kit builds."""
+    return DeadLetter(
+        id=letter_id(processor, TOPIC, segment, position),
+        processor=processor,
+        source=TOPIC,
+        segment=segment,
+        position=position,
+        key=key,
+        event_id=str(uuid.uuid4()),
+        event_type=MARKER_TYPE,
+        headers={"type": MARKER_TYPE},
+        payload=b'{"x":1}',
+        reason=reason,
+        error=DeadLetterError.new("RemoteHandler", "boom"),
+        blocked_by=None,
+        attempts=3,
+        parked_at_ms=parked_at_ms,
+        last_attempt_at_ms=parked_at_ms,
+        expire_at_ms=parked_at_ms + 86_400_000,
+        replay=False,
+    )
+
+
+def _fresh_processor() -> str:
+    """A processor no other check has used."""
+    return f"conformance-{uuid.uuid4()}"
 
 
 def _nested(depth: int) -> bytes:
@@ -465,6 +510,291 @@ async def purge_removes_only_sent_before(store: MessageStore) -> None:
     assert await outbox.purge(now_ms() + 60_000) == 2, "the late and the pending entry once sent; never the failed one"
 
 
+async def delete_markers_removes_only_the_range(store: MessageStore) -> None:
+    """A reset deletes the stage-1 markers of its processor in its ranges and nothing else: no other position,
+    segment, source or processor, no marker without a position."""
+    processed = store.processed
+    processor = _fresh_processor()
+    other_processor = _fresh_processor()
+    in_range = [_stage_one(processor, TOPIC, 0, offset) for offset in (3, 4, 5)]
+    in_range.append(_stage_one(processor, TOPIC, 2, 7))
+    kept = [_stage_one(processor, TOPIC, 0, offset) for offset in (0, 1, 2, 6)]
+    kept.extend(
+        [
+            _stage_one(processor, TOPIC, 1, 4),
+            _stage_one(processor, "conformance.other", 0, 4),
+            _stage_one(other_processor, TOPIC, 0, 4),
+            _marker(now_ms()),
+            _marker(now_ms()),
+        ]
+    )
+    async with store.transaction():
+        for marker in (*in_range, *kept):
+            assert await processed.record(marker), f"recorded {marker.id}"
+
+    def range_of(segment: str, start: int, until: int) -> ReplayRange:
+        return ReplayRange(source=TOPIC, segment=segment, start=str(start), until=str(until))
+
+    assert await processed.delete_markers(processor, []) == 0, "no ranges"
+    assert await processed.delete_markers(processor, [range_of("0", 100, 200)]) == 0, "nothing there"
+    assert await processed.delete_markers(processor, [range_of("0", 3, 6), range_of("2", 7, 8)]) == 4
+    for marker in in_range:
+        assert not await processed.exists(marker.id), f"{marker.id} was not deleted"
+    for marker in kept:
+        assert await processed.exists(marker.id), f"{marker.id} was deleted"
+    assert await processed.delete_markers(processor, [range_of("0", 3, 6)]) == 0, "deleted once"
+
+
+async def dead_letters_sequence_per_key(store: MessageStore) -> None:
+    """Letters are sequenced per (processor, key): the head is the lowest position that is not ``INVALID``, an earlier
+    letter blocks a retry, a second park of a record finds the first letter, and a failed retry updates the letter in
+    place."""
+    letters = store.dead_letters
+    processor = _fresh_processor()
+    other_processor = _fresh_processor()
+    t0 = now_ms()
+    head = _letter(processor, "0", "5", "k", DeadLetterReason.HANDLER_FAILED, t0)
+    sequenced = _letter(processor, "0", "10", "k", DeadLetterReason.SEQUENCED, t0 + 1)
+    sequenced = replace(
+        sequenced,
+        blocked_by=head.id,
+        error=DeadLetterError.sequenced(head.id),
+    )
+    invalid = replace(
+        _letter(processor, "0", "3", "k", DeadLetterReason.INVALID, t0 + 2),
+        payload=b"\xff\xfe\x00\x01",
+        error=DeadLetterError.invalid("not a JSON object"),
+    )
+    other_key = _letter(processor, "1", "6", "k2", DeadLetterReason.HANDLER_FAILED, t0 + 3)
+    no_key = _letter(processor, "0", "9", None, DeadLetterReason.HANDLER_FAILED, t0 + 4)
+    elsewhere = _letter(other_processor, "0", "1", "k", DeadLetterReason.HANDLER_FAILED, t0)
+    for letter in (head, sequenced, invalid, other_key, no_key, elsewhere):
+        assert await letters.park(letter) is Parked.NEW, letter.id
+    assert await letters.park(head) is Parked.ALREADY, "a redelivery"
+
+    assert await letters.head(processor, "k") == head.id
+    assert await letters.earlier(processor, "k", "7") == head.id
+    assert await letters.earlier(processor, "k", "5") is None, "an INVALID letter blocks nothing"
+    assert await letters.parked_keys(processor, TOPIC, ("0", "1")) == {"k", "k2"}
+    assert await letters.parked_keys(processor, TOPIC, ("1",)) == {"k2"}
+    assert await letters.parked_keys(processor, TOPIC, ()) == set()
+
+    assert await letters.get(head.id) == head
+    found = await letters.get(invalid.id)
+    assert found is not None
+    assert found.payload == invalid.payload, "a payload that is not UTF-8 reads back byte for byte"
+
+    listed = await letters.list(processor)
+    assert [row.id for row in listed] == [head.id, sequenced.id, invalid.id, other_key.id, no_key.id], "by parked_at"
+    assert len(await letters.list(processor, 2)) == 2
+    assert await letters.count(processor) == 5
+    summaries = await letters.summaries(processor)
+    assert [(row.id, row.key, row.position, row.reason, row.parked_at_ms) for row in summaries] == [
+        (invalid.id, "k", "3", DeadLetterReason.INVALID, t0 + 2),
+        (head.id, "k", "5", DeadLetterReason.HANDLER_FAILED, t0),
+        (other_key.id, "k2", "6", DeadLetterReason.HANDLER_FAILED, t0 + 3),
+        (no_key.id, None, "9", DeadLetterReason.HANDLER_FAILED, t0 + 4),
+        (sequenced.id, "k", "10", DeadLetterReason.SEQUENCED, t0 + 1),
+    ], "by position (decimal ones by value), then id"
+
+    assert await letters.delete(head.id)
+    assert not await letters.delete(head.id), "gone already"
+    assert await letters.head(processor, "k") == sequenced.id, "the next letter of the key is the head"
+    error = DeadLetterError.new("RemoteHandler", "failed again")
+    assert await letters.record_failure(sequenced.id, error, t0 + 60_000)
+    failed = await letters.get(sequenced.id)
+    assert failed is not None
+    assert failed.attempts == sequenced.attempts + 1
+    assert failed.reason is DeadLetterReason.HANDLER_FAILED
+    assert failed.error == error
+    assert failed.last_attempt_at_ms == t0 + 60_000
+    assert failed.blocked_by is None
+    assert not await letters.record_failure(head.id, error, t0), "no letter"
+    for letter in (sequenced, invalid, other_key, no_key, elsewhere):
+        assert await letters.delete(letter.id), letter.id
+    assert await letters.count(processor) == 0
+
+
+async def dead_letter_parked_inside_rolled_back_transaction_is_kept(store: MessageStore) -> None:
+    """A dead letter commits on its own: parked, or its failure recorded, while a transaction that is then rolled
+    back is open, it stays."""
+    letters = store.dead_letters
+    processor = _fresh_processor()
+    t0 = now_ms()
+    parked = _letter(processor, "0", "1", "k1", DeadLetterReason.HANDLER_FAILED, t0)
+    try:
+        async with store.transaction():
+            assert await letters.park(parked) is Parked.NEW
+            raise _Rollback
+    except _Rollback:
+        pass
+    assert await letters.get(parked.id) == parked, "a dead letter commits on its own"
+    assert await letters.head(processor, "k1") == parked.id
+
+    error = DeadLetterError.new("Boom", "failed again")
+    try:
+        async with store.transaction():
+            assert await letters.record_failure(parked.id, error, t0 + 1_000)
+            raise _Rollback
+    except _Rollback:
+        pass
+    found = await letters.get(parked.id)
+    assert found is not None
+    assert found.error == error, "a retry's failure is recorded on its own too"
+    assert await letters.delete(parked.id)
+
+
+async def dead_letter_deleted_in_a_transaction_goes_with_it(store: MessageStore) -> None:
+    """A retry deletes its letter in the record's transaction: a rollback keeps the letter, a commit removes it."""
+    letters = store.dead_letters
+    processor = _fresh_processor()
+    parked = _letter(processor, "0", "7", "k1", DeadLetterReason.HANDLER_FAILED, now_ms())
+    assert await letters.park(parked) is Parked.NEW
+    try:
+        async with store.transaction():
+            assert await letters.delete_in(parked.id)
+            raise _Rollback
+    except _Rollback:
+        pass
+    assert await letters.get(parked.id) == parked, "rolled back: the letter stays"
+    async with store.transaction():
+        assert await letters.delete_in(parked.id)
+    assert await letters.get(parked.id) is None, "committed: gone"
+    try:
+        async with store.transaction():
+            assert not await letters.delete_in(parked.id), "no letter to delete"
+            raise _Rollback
+    except _Rollback:
+        pass
+
+
+async def control_lock_is_exclusive_until_lease_expires(store: MessageStore) -> None:
+    """A reset lock is held by one operation until its lease passes: another operation is refused with the holder,
+    the holder renews, and once the lease has passed another takes it. Only the holder releases it; an expiry clears
+    it only past the lease."""
+    control = store.control
+    processor = _fresh_processor()
+    t0 = 1_800_000_000_000
+    state = await control.get(processor)
+    assert state.processor == processor
+    assert not state.paused
+    assert state.operation is None
+    assert not state.replay, "absent: nothing held"
+
+    assert await control.lock(processor, "op-1", t0 + 5_000, t0) == Locked.was_taken()
+    held = ControlOperation(id="op-1", kind="reset", lease_until_ms=t0 + 5_000, prepared_at_ms=t0)
+    assert await control.lock(processor, "op-2", t0 + 6_000, t0 + 1_000) == Locked.held(held), (
+        "another operation is refused while the lease runs"
+    )
+    assert await control.lock(processor, "op-1", t0 + 8_000, t0 + 2_000) == Locked.was_taken(), "the holder renews"
+    renewed = (await control.get(processor)).operation
+    assert renewed is not None
+    assert renewed.lease_until_ms == t0 + 8_000
+    assert renewed.prepared_at_ms == t0, "a renewal keeps the first prepare's time"
+    assert await control.extend(processor, "op-1", t0 + 9_000, t0 + 3_000)
+    assert not await control.extend(processor, "op-2", t0 + 9_000, t0 + 3_000)
+    refused = await control.lock(processor, "op-2", t0 + 10_000, t0 + 8_999)
+    assert not refused.taken, "held until the lease passes"
+    assert not await control.expire(processor, "op-1", t0 + 8_999), "not past the lease"
+    assert await control.lock(processor, "op-2", t0 + 15_000, t0 + 9_000) == Locked.was_taken(), "the lease has passed"
+    assert not await control.release(processor, "op-1", t0 + 9_500), "not the holder"
+    assert await control.release(processor, "op-2", t0 + 9_500)
+    assert (await control.get(processor)).operation is None
+    assert await control.lock(processor, "op-3", t0 + 20_000, t0 + 10_000) == Locked.was_taken()
+    assert await control.expire(processor, "op-3", t0 + 20_000), "past the lease"
+    assert (await control.get(processor)).operation is None
+
+
+async def pause_state_round_trips(store: MessageStore) -> None:
+    """A pause round-trips with who paused and when, and is idempotent; a resume clears both. A pause leaves the reset
+    lock alone and the lock leaves the pause alone."""
+    control = store.control
+    processor = _fresh_processor()
+    t0 = 1_800_000_000_000
+    await control.set_paused(processor, True, "control-1", t0)
+    await control.set_paused(processor, True, "control-1", t0)
+    paused = await control.get(processor)
+    assert paused == ProcessorControlState(
+        processor,
+        paused=True,
+        paused_at_ms=t0,
+        paused_by="control-1",
+        updated_at_ms=t0,
+    ), "the paused state"
+    assert await control.lock(processor, "op-1", t0 + 30_000, t0 + 1_000) == Locked.was_taken()
+    assert (await control.get(processor)).paused, "a lock leaves the pause alone"
+    await control.set_paused(processor, False, "control-2", t0 + 2_000)
+    resumed = await control.get(processor)
+    assert not resumed.paused
+    assert (resumed.paused_at_ms, resumed.paused_by) == (None, None)
+    assert resumed.updated_at_ms == t0 + 2_000
+    assert resumed.operation is not None
+    assert resumed.operation.id == "op-1", "a resume leaves the lock alone"
+
+    fresh = _fresh_processor()
+    await control.set_paused(fresh, False, "local", t0)
+    state = await control.get(fresh)
+    assert state == ProcessorControlState(fresh, updated_at_ms=t0), (
+        "a resume of a processor the store did not know: not paused"
+    )
+
+
+async def replay_ranges_round_trip(store: MessageStore) -> None:
+    """The replay ranges round-trip in order; a removal takes exactly that range of that processor, once; a
+    replacement replaces them all. The ranges leave the lock alone."""
+    control = store.control
+    processor = _fresh_processor()
+    other_processor = _fresh_processor()
+    t0 = 1_800_000_000_000
+    r1 = ReplayRange(source=TOPIC, segment="0", start="10", until="20")
+    r2 = ReplayRange(source=TOPIC, segment="1", start="0", until="5")
+    r3 = ReplayRange(source="conformance.other", segment="0", start="10", until="20")
+    assert await control.lock(processor, "op-1", t0 + 30_000, t0) == Locked.was_taken()
+    await control.set_replay(processor, (r1, r2, r3), t0 + 1_000)
+    state = await control.get(processor)
+    assert state.replay == (r1, r2, r3), "the ranges, in order"
+    assert state.updated_at_ms == t0 + 1_000
+    assert state.operation is not None
+    assert state.operation.id == "op-1", "the lock is untouched"
+
+    assert await control.remove_range(processor, r2, t0 + 2_000)
+    assert not await control.remove_range(processor, r2, t0 + 2_000), "removed once"
+    assert not await control.remove_range(
+        processor, ReplayRange(source=r1.source, segment=r1.segment, start=r1.start, until="21"), t0 + 2_000
+    ), "exactly that range"
+    assert not await control.remove_range(other_processor, r1, t0 + 2_000), "another processor's"
+    assert (await control.get(processor)).replay == (r1, r3)
+
+    await control.set_replay(processor, (r2,), t0 + 3_000)
+    assert (await control.get(processor)).replay == (r2,), "set_replay replaces"
+    await control.set_replay(processor, (), t0 + 4_000)
+    assert (await control.get(processor)).replay == ()
+
+
+async def processor_control_write_inside_rolled_back_transaction_is_kept(store: MessageStore) -> None:
+    """A processor-control write commits on its own: made while a transaction is open that is then rolled back, it
+    stays."""
+    control = store.control
+    paused = _fresh_processor()
+    locked = _fresh_processor()
+    t0 = 1_800_000_000_000
+    replay = ReplayRange(source=TOPIC, segment="0", start="1", until="2")
+    try:
+        async with store.transaction():
+            await control.set_paused(paused, True, "control-1", t0)
+            assert await control.lock(locked, "op-1", t0 + 30_000, t0) == Locked.was_taken()
+            await control.set_replay(locked, (replay,), t0)
+            raise _Rollback
+    except _Rollback:
+        pass
+
+    assert (await control.get(paused)).paused, "a pause commits on its own"
+    state = await control.get(locked)
+    assert state.operation is not None
+    assert state.operation.id == "op-1", "a lock commits on its own"
+    assert state.replay == (replay,), "a replay range commits on its own"
+
+
 MESSAGE_STORE_CHECKS: tuple[StoreCheck, ...] = (
     appended_entry_is_claimed_in_created_seq_order,
     outbox_rejects_a_payload_that_is_not_a_json_object,
@@ -478,16 +808,55 @@ MESSAGE_STORE_CHECKS: tuple[StoreCheck, ...] = (
 )
 """Every level-2 check, in the reference kit's order."""
 
+MESSAGE_STORE_L3_CHECKS: tuple[StoreCheck, ...] = (
+    delete_markers_removes_only_the_range,
+    dead_letters_sequence_per_key,
+    dead_letter_parked_inside_rolled_back_transaction_is_kept,
+    dead_letter_deleted_in_a_transaction_goes_with_it,
+    control_lock_is_exclusive_until_lease_expires,
+    pause_state_round_trips,
+    replay_ranges_round_trip,
+    processor_control_write_inside_rolled_back_transaction_is_kept,
+)
+"""Every level-3 check, in the reference kit's order (``delete_markers`` is first: the Rust list places it among the
+level-2 checks)."""
 
-async def run_store_conformance(open_store: Callable[[], MessageStore]) -> None:
-    """Runs every check by name on the store ``open_store`` returns (called once); the first failing check raises
-    :class:`AssertionError` naming itself and the store. See the module docstring."""
+
+def _checks_for(level: int) -> tuple[StoreCheck, ...]:
+    """The checks a run of ``level`` uses, in the Rust kit's order."""
+    if level == 2:
+        return MESSAGE_STORE_CHECKS
+    # The Rust list places delete_markers among the level-2 checks, and the other seven level-3 checks at the end.
+    return (
+        *MESSAGE_STORE_CHECKS[:6],
+        MESSAGE_STORE_L3_CHECKS[0],
+        *MESSAGE_STORE_CHECKS[6:],
+        *MESSAGE_STORE_L3_CHECKS[1:],
+    )
+
+
+async def run_store_conformance(
+    open_store: Callable[[], MessageStore],
+    *,
+    level: int = 2,
+) -> None:
+    """Runs the checks of ``level`` by name on the store ``open_store`` returns (called once); the first failing check
+    raises :class:`AssertionError` naming itself and the store. ``level=2`` runs the nine level-2 checks; ``level=3``
+    runs them and the eight level-3 control and dead-letter checks. See the module docstring."""
+    if level not in (2, 3):
+        raise ValueError(f"the store kit runs level 2 or 3, not {level}")
     store = open_store()
     name = store.name
-    for check in MESSAGE_STORE_CHECKS:
+    for check in _checks_for(level):
         try:
             await check(store)
         except Exception as error:
             raise AssertionError(
                 f"store conformance check `{check.__name__}` failed on store `{name}`: {error}"
             ) from error
+
+
+async def run_store_l3_conformance(open_store: Callable[[], MessageStore]) -> None:
+    """The level-3 form of :func:`run_store_conformance` (the nine level-2 checks and the eight level-3 checks). Kept
+    as the named entry point; ``level=3`` is the same run."""
+    await run_store_conformance(open_store, level=3)

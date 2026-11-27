@@ -11,9 +11,9 @@ another Snodra library stay readable without a migration:
 - The schema is the indexes. :meth:`MongoStore.init_schema` creates every index and TTL index idempotently, which also
   creates the collections a transaction writes to before the first transaction does.
 
-The outbox and the processed-event markers are implemented. The dead-letter, processor-control, external-call and
-saga ports are part of the interface frozen at level 2 and report
-:class:`snodra.MessageStoreUnsupported` until this add-on implements them by level 4.
+The outbox, the processed-event markers, the dead letters and the processor control state are implemented, in the
+collections and document shapes the layout fixes. The external-call and saga ports are part of the interface frozen at
+level 2 and report :class:`snodra.MessageStoreUnsupported` until this add-on implements them by level 4.
 
 Every operation joins the transaction bound to the current context (``async with store.transaction()``) or runs in a
 write of its own, never in another operation's transaction. A service that already runs a MongoDB transaction binds
@@ -50,10 +50,13 @@ from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import DuplicateKeyError, OperationFailure, PyMongoError
 from snodra import (
+    RESET_KIND,
     AppendListener,
     Conflict,
+    ControlOperation,
     DeadLetter,
     DeadLetterError,
+    DeadLetterReason,
     DeadLetterStore,
     DeadLetterSummary,
     DeadlineDocument,
@@ -299,8 +302,8 @@ class MongoStore:
         self._processed_collection: AsyncCollection[Any] = self._database[PROCESSED_COLLECTION]
         self.outbox: OutboxStore = _MongoOutbox(self)
         self.processed: ProcessedStore = _MongoProcessed(self)
-        self.dead_letters: DeadLetterStore = _UnsupportedDeadLetters()
-        self.control: ProcessorControlStore = _UnsupportedControl()
+        self.dead_letters: DeadLetterStore = _MongoDeadLetters(self)
+        self.control: ProcessorControlStore = _MongoControl(self)
         self.external: ExternalCallStore = _UnsupportedExternal()
         self.sagas: SagaStores = SagaStores(
             sagas=_UnsupportedSagas(),
@@ -996,72 +999,422 @@ def _position_value(position: str) -> Int64 | str:
     return str(position)
 
 
+# ---- the dead letters -----------------------------------------------------------------------------
+
+
+class _MongoDeadLetters:
+    """The dead letters on ``dead_letters``. Every write but :meth:`delete_in` commits on its own, outside the
+    transaction bound to the context; MongoDB's TTL monitor removes an expired letter, as the layout documents."""
+
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
+
+    @property
+    def _collection(self) -> AsyncCollection[Any]:
+        return self._store.database[DEAD_LETTERS_COLLECTION]
+
+    async def park(self, letter: DeadLetter) -> Parked:
+        try:
+            await self._collection.insert_one(_dead_letter_document(letter))
+        except DuplicateKeyError:
+            return Parked.ALREADY
+        except Exception as error:
+            raise _failure(error) from error
+        return Parked.NEW
+
+    async def head(self, processor: str, key: str) -> str | None:
+        try:
+            document = await self._collection.find_one(
+                {
+                    "processor": processor,
+                    "key": key,
+                    "reason": {"$ne": DeadLetterReason.INVALID.value},
+                },
+                sort=[("offset", 1), ("_id", 1)],
+                projection={"_id": 1},
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else str(document["_id"])
+
+    async def earlier(self, processor: str, key: str, position: str) -> str | None:
+        try:
+            document = await self._collection.find_one(
+                {
+                    "processor": processor,
+                    "key": key,
+                    "reason": {"$ne": DeadLetterReason.INVALID.value},
+                    "offset": {"$lt": _position_value(position)},
+                },
+                sort=[("offset", 1), ("_id", 1)],
+                projection={"_id": 1},
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else str(document["_id"])
+
+    async def parked_keys(self, processor: str, source: str, segments: Sequence[str]) -> set[str]:
+        if not segments:
+            return set()
+        query = {
+            "processor": processor,
+            "topic": source,
+            "partition": {"$in": [_segment_value(segment) for segment in segments]},
+            "reason": {"$ne": DeadLetterReason.INVALID.value},
+            "key": {"$exists": True, "$ne": None},
+        }
+        try:
+            documents = await self._collection.find(query, projection={"key": 1}).to_list(length=None)
+        except Exception as error:
+            raise _failure(error) from error
+        return {str(document["key"]) for document in documents if document.get("key") is not None}
+
+    async def get(self, letter: str) -> DeadLetter | None:
+        try:
+            document = await self._collection.find_one({"_id": letter})
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _dead_letter_from_document(document)
+
+    async def list(self, processor: str | None = None, limit: int | None = None) -> builtins.list[DeadLetter]:
+        if limit is not None and int(limit) <= 0:
+            return []
+        query: dict[str, Any] = {} if processor is None else {"processor": processor}
+        try:
+            found = self._collection.find(query, sort=[("parkedAt", 1), ("_id", 1)])
+            if limit is not None:
+                found = found.limit(int(limit))
+            documents = await found.to_list(length=None)
+        except Exception as error:
+            raise _failure(error) from error
+        return [_dead_letter_from_document(document) for document in documents]
+
+    async def summaries(self, processor: str) -> builtins.list[DeadLetterSummary]:
+        try:
+            documents = await self._collection.find(
+                {"processor": processor},
+                projection={"key": 1, "offset": 1, "reason": 1, "parkedAt": 1},
+                sort=[("offset", 1), ("_id", 1)],
+            ).to_list(length=None)
+        except Exception as error:
+            raise _failure(error) from error
+        return [
+            DeadLetterSummary(
+                id=str(document["_id"]),
+                key=None if document.get("key") is None else str(document["key"]),
+                position=_stored_text(document.get("offset")),
+                reason=DeadLetterReason(str(document["reason"])),
+                parked_at_ms=_ms_value(document["parkedAt"]),
+            )
+            for document in documents
+        ]
+
+    async def count(self, processor: str | None = None) -> int:
+        query: dict[str, Any] = {} if processor is None else {"processor": processor}
+        try:
+            return int(await self._collection.count_documents(query))
+        except Exception as error:
+            raise _failure(error) from error
+
+    async def delete(self, letter: str) -> bool:
+        try:
+            result = await self._collection.delete_one({"_id": letter})
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.deleted_count) > 0
+
+    async def delete_in(self, letter: str, *, tx: Tx | None = None) -> bool:
+        session = self._store._session(tx)
+        try:
+            result = await self._collection.delete_one({"_id": letter}, session=session)
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.deleted_count) > 0
+
+    async def record_failure(self, letter: str, error: DeadLetterError, now_ms: int) -> bool:
+        try:
+            result = await self._collection.update_one(
+                {"_id": letter},
+                {
+                    "$inc": {"attempts": 1},
+                    "$set": {
+                        "reason": DeadLetterReason.HANDLER_FAILED.value,
+                        "error": {"type": error.type_name, "message": error.message},
+                        "lastAttemptAt": _datetime(now_ms),
+                    },
+                    "$unset": {"blockedBy": ""},
+                },
+            )
+        except Exception as cause:
+            raise _failure(cause) from cause
+        return int(result.matched_count) == 1
+
+
+def _dead_letter_document(letter: DeadLetter) -> dict[str, Any]:
+    """The layout's dead-letter document for ``letter``: optional fields absent, never null."""
+    payload = bytes(letter.payload)
+    document: dict[str, Any] = {
+        "_id": letter.id,
+        "processor": letter.processor,
+        "topic": letter.source,
+        "partition": _segment_value(letter.segment),
+        "offset": _position_value(letter.position),
+        "headers": _headers(letter.headers),
+        "reason": letter.reason.value,
+        "error": {"type": letter.error.type_name, "message": letter.error.message},
+        "attempts": int(letter.attempts),
+        "parkedAt": _datetime(letter.parked_at_ms),
+        "lastAttemptAt": _datetime(letter.last_attempt_at_ms),
+        "expireAt": _datetime(letter.expire_at_ms),
+    }
+    if letter.key is not None:
+        document["key"] = letter.key
+    if letter.event_id:
+        document["eventId"] = letter.event_id
+    if letter.event_type:
+        document["eventType"] = letter.event_type
+    if letter.blocked_by:
+        document["blockedBy"] = letter.blocked_by
+    if payload:
+        try:
+            document["payload"] = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            document["payloadBinary"] = payload
+    if letter.replay:
+        document["replay"] = True
+    return document
+
+
+def _dead_letter_from_document(document: Mapping[str, Any]) -> DeadLetter:
+    """A dead-letter document as the core's letter; a missing optional field is none, and a missing
+    ``lastAttemptAt`` reads as ``parkedAt``."""
+    payload = document.get("payload")
+    raw = str(payload).encode() if payload is not None else bytes(document.get("payloadBinary") or b"")
+    parked_at = _ms_value(document["parkedAt"])
+    last_attempt = document.get("lastAttemptAt")
+    return DeadLetter(
+        id=str(document["_id"]),
+        processor=str(document["processor"]),
+        source=str(document["topic"]),
+        segment=_stored_text(document.get("partition")),
+        position=_stored_text(document.get("offset")),
+        key=None if document.get("key") is None else str(document["key"]),
+        event_id=None if document.get("eventId") is None else str(document["eventId"]),
+        event_type=None if document.get("eventType") is None else str(document["eventType"]),
+        headers=_read_headers(document.get("headers")),
+        payload=raw,
+        reason=DeadLetterReason(str(document["reason"])),
+        error=DeadLetterError(
+            "" if (document.get("error") or {}).get("type") is None else str(document["error"]["type"]),
+            "" if (document.get("error") or {}).get("message") is None else str(document["error"]["message"]),
+        ),
+        blocked_by=None if document.get("blockedBy") is None else str(document["blockedBy"]),
+        attempts=int(document.get("attempts", 0)),
+        parked_at_ms=parked_at,
+        last_attempt_at_ms=parked_at if last_attempt is None else _ms_value(last_attempt),
+        expire_at_ms=_ms_value(document["expireAt"]),
+        replay=bool(document.get("replay", False)),
+    )
+
+
+# ---- the processor control ------------------------------------------------------------------------
+
+
+class _MongoControl:
+    """The processor control state on ``processor_control``: one document per processor, every field present. Every
+    write commits on its own, outside any transaction."""
+
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
+
+    @property
+    def _collection(self) -> AsyncCollection[Any]:
+        return self._store.database[CONTROL_COLLECTION]
+
+    async def get(self, processor: str) -> ProcessorControlState:
+        try:
+            document = await self._collection.find_one({"_id": processor})
+        except Exception as error:
+            raise _failure(error) from error
+        return _control_state(processor, document)
+
+    async def set_paused(self, processor: str, paused: bool, by: str, now_ms: int) -> None:
+        update = {
+            "$set": {
+                "paused": paused,
+                "pausedAt": _datetime(now_ms) if paused else None,
+                "pausedBy": by if paused else None,
+                "updatedAt": _datetime(now_ms),
+            },
+            "$setOnInsert": {"operation": None, "replay": []},
+        }
+        try:
+            await self._collection.update_one({"_id": processor}, update, upsert=True)
+        except Exception as error:
+            raise _failure(error) from error
+
+    async def lock(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> Locked:
+        renewed = await self._renew(processor, operation, lease_until_ms, now_ms)
+        if renewed:
+            return Locked.was_taken()
+        taken = {
+            "$set": {
+                "operation": {
+                    "id": operation,
+                    "kind": RESET_KIND,
+                    "leaseUntil": _datetime(lease_until_ms),
+                    "preparedAt": _datetime(now_ms),
+                },
+                "updatedAt": _datetime(now_ms),
+            },
+            "$setOnInsert": {"paused": False, "pausedAt": None, "pausedBy": None, "replay": []},
+        }
+        free = {
+            "_id": processor,
+            "$or": [
+                {"operation": None},
+                {"operation.leaseUntil": {"$lte": _datetime(now_ms)}},
+            ],
+        }
+        try:
+            result = await self._collection.update_one(free, taken, upsert=True)
+        except DuplicateKeyError:
+            state = await self.get(processor)
+            return Locked(False, state.operation)
+        except Exception as error:
+            raise _failure(error) from error
+        if int(result.matched_count) == 1 or result.upserted_id is not None:
+            return Locked.was_taken()
+        state = await self.get(processor)
+        return Locked(False, state.operation)
+
+    async def _renew(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:
+        try:
+            result = await self._collection.update_one(
+                {"_id": processor, "operation.id": operation},
+                {"$set": {"operation.leaseUntil": _datetime(lease_until_ms), "updatedAt": _datetime(now_ms)}},
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.matched_count) == 1
+
+    async def extend(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:
+        return await self._renew(processor, operation, lease_until_ms, now_ms)
+
+    async def release(self, processor: str, operation: str, now_ms: int) -> bool:
+        return await self._clear(processor, operation, now_ms, expired_only=False)
+
+    async def expire(self, processor: str, operation: str, now_ms: int) -> bool:
+        return await self._clear(processor, operation, now_ms, expired_only=True)
+
+    async def _clear(self, processor: str, operation: str, now_ms: int, *, expired_only: bool) -> bool:
+        query: dict[str, Any] = {"_id": processor, "operation.id": operation}
+        if expired_only:
+            query["operation.leaseUntil"] = {"$lte": _datetime(now_ms)}
+        try:
+            result = await self._collection.update_one(
+                query,
+                {"$set": {"operation": None, "updatedAt": _datetime(now_ms)}},
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.matched_count) == 1
+
+    async def set_replay(self, processor: str, ranges: Sequence[ReplayRange], now_ms: int) -> None:
+        update = {
+            "$set": {
+                "replay": [_replay_range_document(replay) for replay in ranges],
+                "updatedAt": _datetime(now_ms),
+            },
+            "$setOnInsert": {"paused": False, "pausedAt": None, "pausedBy": None, "operation": None},
+        }
+        try:
+            await self._collection.update_one({"_id": processor}, update, upsert=True)
+        except Exception as error:
+            raise _failure(error) from error
+
+    async def remove_range(self, processor: str, replay_range: ReplayRange, now_ms: int) -> bool:
+        document = _replay_range_document(replay_range)
+        try:
+            result = await self._collection.update_one(
+                {"_id": processor, "replay": {"$elemMatch": document}},
+                {"$pull": {"replay": document}, "$set": {"updatedAt": _datetime(now_ms)}},
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.modified_count) == 1
+
+
+def _replay_range_document(replay: ReplayRange) -> dict[str, Any]:
+    """A range as ``processor_control.replay`` keeps it: topic, partition, from and until, in that order."""
+    return {
+        "topic": replay.source,
+        "partition": _segment_value(replay.segment),
+        "from": _position_value(replay.start),
+        "until": _position_value(replay.until),
+    }
+
+
+def _control_state(processor: str, document: Mapping[str, Any] | None) -> ProcessorControlState:
+    if document is None:
+        return ProcessorControlState(processor)
+    operation: ControlOperation | None = None
+    stored_operation = document.get("operation")
+    if isinstance(stored_operation, Mapping):
+        lease = stored_operation.get("leaseUntil")
+        prepared = stored_operation.get("preparedAt")
+        identifier = stored_operation.get("id")
+        kind = stored_operation.get("kind")
+        operation = ControlOperation(
+            id="" if identifier is None else str(identifier),
+            kind=RESET_KIND if kind is None else str(kind),
+            lease_until_ms=0 if lease is None else _ms_value(lease),
+            prepared_at_ms=0 if prepared is None else _ms_value(prepared),
+        )
+    replay: list[ReplayRange] = []
+    for item in document.get("replay") or ():
+        if not isinstance(item, Mapping):
+            continue
+        source = item.get("topic")
+        if source is None:
+            continue
+        replay.append(
+            ReplayRange(
+                source=str(source),
+                segment=_stored_text(item.get("partition")),
+                start=_stored_text(item.get("from")),
+                until=_stored_text(item.get("until")),
+            )
+        )
+    paused_at = document.get("pausedAt")
+    updated_at = document.get("updatedAt")
+    return ProcessorControlState(
+        processor=str(document.get("_id", processor)),
+        paused=bool(document.get("paused", False)),
+        paused_at_ms=None if paused_at is None else _ms_value(paused_at),
+        paused_by=None if document.get("pausedBy") is None else str(document["pausedBy"]),
+        operation=operation,
+        replay=tuple(replay),
+        updated_at_ms=None if updated_at is None else _ms_value(updated_at),
+    )
+
+
+def _stored_text(value: object) -> str:
+    """A stored segment or position as text; an absent or unknown value reads as the empty one."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
+
+
 # ---- the ports this level does not implement ------------------------------------------------------
 
 
 def _unsupported(what: str) -> MessageStoreUnsupported:
     return MessageStoreUnsupported(f"{what} in the MongoDB message store (level 2)")
-
-
-class _UnsupportedDeadLetters:
-    async def park(self, letter: DeadLetter) -> Parked:
-        raise _unsupported("dead_letters")
-
-    async def head(self, processor: str, key: str) -> str | None:
-        raise _unsupported("dead_letters")
-
-    async def earlier(self, processor: str, key: str, position: str) -> str | None:
-        raise _unsupported("dead_letters")
-
-    async def parked_keys(self, processor: str, source: str, segments: Sequence[str]) -> set[str]:
-        raise _unsupported("dead_letters")
-
-    async def get(self, letter: str) -> DeadLetter | None:
-        raise _unsupported("dead_letters")
-
-    async def list(self, processor: str | None = None, limit: int | None = None) -> builtins.list[DeadLetter]:
-        raise _unsupported("dead_letters")
-
-    async def summaries(self, processor: str) -> builtins.list[DeadLetterSummary]:
-        raise _unsupported("dead_letters")
-
-    async def count(self, processor: str | None = None) -> int:
-        raise _unsupported("dead_letters")
-
-    async def delete(self, letter: str) -> bool:
-        raise _unsupported("dead_letters")
-
-    async def delete_in(self, letter: str, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("dead_letters")
-
-    async def record_failure(self, letter: str, error: DeadLetterError, now_ms: int) -> bool:
-        raise _unsupported("dead_letters")
-
-
-class _UnsupportedControl:
-    async def get(self, processor: str) -> ProcessorControlState:
-        raise _unsupported("processor control")
-
-    async def set_paused(self, processor: str, paused: bool, by: str, now_ms: int) -> None:
-        raise _unsupported("processor control")
-
-    async def lock(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> Locked:
-        raise _unsupported("processor control")
-
-    async def extend(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:
-        raise _unsupported("processor control")
-
-    async def release(self, processor: str, operation: str, now_ms: int) -> bool:
-        raise _unsupported("processor control")
-
-    async def expire(self, processor: str, operation: str, now_ms: int) -> bool:
-        raise _unsupported("processor control")
-
-    async def set_replay(self, processor: str, ranges: Sequence[ReplayRange], now_ms: int) -> None:
-        raise _unsupported("processor control")
-
-    async def remove_range(self, processor: str, replay_range: ReplayRange, now_ms: int) -> bool:
-        raise _unsupported("processor control")
 
 
 class _UnsupportedExternal:

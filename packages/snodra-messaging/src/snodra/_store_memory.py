@@ -48,6 +48,7 @@ from snodra._store import (
     ExternalCall,
     ExternalCallStore,
     Failed,
+    InvalidMessage,
     Locked,
     OutboxEntry,
     OutboxStore,
@@ -278,6 +279,9 @@ class MemoryStore:
 
     def claim(self, owner: str, lease: float, limit: int) -> list[OutboxEntry]:
         """Claims up to ``limit`` pending entries for ``owner``; see :meth:`OutboxStore.claim`."""
+        if not owner:
+            # TODO(spec-gap): SG-31
+            raise InvalidMessage("the in-memory message store needs a non-empty claim owner")
         now = self.now()
         until = now + int(lease * 1000)
         rows = [

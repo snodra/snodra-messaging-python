@@ -14,11 +14,14 @@ from bson import Int64
 from pymongo import AsyncMongoClient
 from snodra import (
     Conflict,
+    DeadLetter,
     DeadLetterError,
+    DeadLetterReason,
     InvalidMessage,
     MessageStoreFailed,
     MessageStoreUnsupported,
     OutboxEntry,
+    Parked,
     ProcessedMarker,
     ReplayRange,
     SagaFailureDocument,
@@ -32,6 +35,8 @@ pytestmark = pytest.mark.timeout(300)
 
 OUTBOX = "outbox"
 PROCESSED = "processed_events"
+DEAD_LETTERS = "dead_letters"
+CONTROL = "processor_control"
 
 
 class _Rollback(Exception):
@@ -369,12 +374,75 @@ async def test_delete_markers_removes_only_the_range(store: MongoStore) -> None:
         assert await store.processed.exists(marker_id) == exists, marker_id
 
 
+async def test_dead_letter_and_control_documents_write_the_layouts_shape(store: MongoStore) -> None:
+    """The raw BSON of a letter and a control document follows the published layout: absent optional fields, the
+    numeric segment and position, the binary payload, and the control's operation and replay ranges."""
+    t0 = 1_762_250_000_000
+    letter = DeadLetter(
+        id="orders:snodra.events:2:43",
+        processor="orders",
+        source="snodra.events",
+        segment="2",
+        position="43",
+        key=None,
+        event_id="evt-8",
+        event_type="orders.OrderShipped",
+        headers={"type": "orders.OrderShipped", "id": "evt-8"},
+        payload=b"\xff\xfe",
+        reason=DeadLetterReason.SEQUENCED,
+        error=DeadLetterError.new("Sequenced", "an earlier letter is parked"),
+        blocked_by="orders:snodra.events:2:42",
+        attempts=0,
+        parked_at_ms=t0,
+        last_attempt_at_ms=t0,
+        expire_at_ms=t0 + 86_400_000,
+        replay=True,
+    )
+    assert await store.dead_letters.park(letter) is Parked.NEW
+    document = await store.database[DEAD_LETTERS].find_one({"_id": letter.id})
+    assert document is not None
+    assert document["processor"] == "orders"
+    assert document["topic"] == "snodra.events"
+    assert document["partition"] == 2
+    assert document["offset"] == Int64(43)
+    assert "key" not in document, "an absent key is absent, not null"
+    assert "payload" not in document
+    assert document["payloadBinary"] == b"\xff\xfe"
+    assert document["blockedBy"] == letter.blocked_by
+    assert document["replay"] is True
+    assert document["parkedAt"] == _at(t0)
+    assert document["expireAt"] == _at(t0 + 86_400_000)
+
+    await store.control.set_paused("orders", True, "control-1", t0)
+    await store.control.lock("orders", "op-1", t0 + 30_000, t0 + 1_000)
+    await store.control.set_replay(
+        "orders",
+        [ReplayRange(source="snodra.events", segment="0", start="10", until="20")],
+        t0 + 2_000,
+    )
+    control = await store.database[CONTROL].find_one({"_id": "orders"})
+    assert control is not None
+    assert control["paused"] is True
+    assert control["pausedAt"] == _at(t0)
+    assert control["pausedBy"] == "control-1"
+    assert control["operation"] == {
+        "id": "op-1",
+        "kind": "reset",
+        "leaseUntil": _at(t0 + 30_000),
+        "preparedAt": _at(t0 + 1_000),
+    }
+    (stored_range,) = control["replay"]
+    assert stored_range["topic"] == "snodra.events"
+    assert stored_range["partition"] == 0
+    assert isinstance(stored_range["from"], Int64)
+    assert isinstance(stored_range["until"], Int64)
+    assert (stored_range["from"], stored_range["until"]) == (10, 20)
+    assert control["updatedAt"] == _at(t0 + 2_000)
+
+
 async def test_the_unsupported_ports_say_so(store: MongoStore) -> None:
     """The ports this level does not implement say so."""
     calls: list[Awaitable[object]] = [
-        store.dead_letters.count(),
-        store.dead_letters.record_failure("letter", DeadLetterError.new("Sequenced", "why"), 0),
-        store.control.set_paused("default", True, "local", 0),
         store.external.reset("key", "owner"),
         store.sagas.sagas.find_by_id("saga"),
         store.sagas.dispatch.clear_notice("id"),

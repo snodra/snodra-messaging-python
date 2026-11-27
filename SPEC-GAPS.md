@@ -798,4 +798,3 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** should prepare finish a record in hand within the hub's bound (and answer `ok` only then), as this
   library does, or leave it to the next subscription at once (a shorter wait, fewer odds of a late answer)?
 - **Wire change:** no.
-- **Wire change:** no.

@@ -31,15 +31,18 @@ retries and timeouts.
 - **Events through the outbox**: publish inside the same transaction as the service's own writes; a relay publishes what the
   outbox holds, at least once, and event handlers commit their processed-event marker with their work. Handlers run in named
   processors, one subscription per processor, with per-key ordering.
-- **Event and message stores**: Kafka or RabbitMQ Streams for events; MongoDB, PostgreSQL or MySQL for the outbox and the
-  processed-event markers. Each store is a separate package, selected when the service is built.
+- **Event and message stores**: Kafka or RabbitMQ Streams for events; MongoDB, PostgreSQL or MySQL for the outbox, the
+  processed-event markers, the dead letters and the processor control state. Each store is a separate package, selected
+  when the service is built.
 - **The hub connection**: registration, heartbeats, reconnects, flow control, several hubs and an ordered shutdown.
 - **Credentials and identity**: a token (static, or a file read again), an OAuth2 JWT (renewed) or a client
   certificate (rolled over to a renewed pair); the caller's token verified against the issuer's keys, and guards on
   handlers.
 - **Telemetry** behind an interface, with an OpenTelemetry implementation in the separate `snodra-messaging-observability` package.
 - **Feature level 2**, proved by the 33 level-1 checks of the conformance runner and by the level-2 event-store and
-  message-store kits. Processor control and dead letters land with feature level 3; sagas (level 4) are not in it yet.
+  message-store kits. Processor control, the three dead-letter modes and the level-3 store checks are implemented on
+  `main`; level 3 is not claimed publicly until the release that publishes them for every library. Sagas (level 4)
+  are not in it yet.
 
 ## Install
 

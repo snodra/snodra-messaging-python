@@ -128,10 +128,6 @@ def test_the_store_offers_the_lifecycle() -> None:
 async def test_the_unimplemented_ports_name_the_level() -> None:
     store = SqlStore(SqlConfig(url="postgres://u@h/db"))
     with pytest.raises(MessageStoreUnsupported, match="level 2"):
-        await store.dead_letters.get("letter")
-    with pytest.raises(MessageStoreUnsupported, match="level 2"):
-        await store.control.get("default")
-    with pytest.raises(MessageStoreUnsupported, match="level 2"):
         await store.external.find("key")
     with pytest.raises(MessageStoreUnsupported, match="level 2"):
         await store.sagas.sagas.find_by_id("id")

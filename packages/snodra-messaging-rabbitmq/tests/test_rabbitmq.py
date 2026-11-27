@@ -97,11 +97,25 @@ class Pump:
         await self.subscription.close()  # type: ignore[attr-defined]
 
 
-async def test_the_event_store_passes_the_nine_conformance_checks(
+async def test_the_event_store_passes_the_level_three_conformance_checks(
     create_source: CreateSource, make_store: MakeStore
 ) -> None:
     source = await create_source(4, prefix="snodra.conformance", dead_letter=True)
-    await run_event_store_conformance(source, lambda: make_store(), MemoryStore())
+    await run_event_store_conformance(source, lambda: make_store(), MemoryStore(), level=3)
+
+
+async def test_the_event_store_passes_the_level_three_kit_without_management(
+    create_source: CreateSource, make_store: MakeStore
+) -> None:
+    """Without the management API the store keeps ``lag`` and ``native-dead-letter`` but declares no ``replay``; the
+    kit proves ``admin_without_replay_is_unsupported`` in that form."""
+    source = await create_source(4, prefix="snodra.conformance-no-admin", dead_letter=True)
+    await run_event_store_conformance(
+        source,
+        lambda: make_store(management=False),
+        MemoryStore(),
+        level=3,
+    )
 
 
 async def test_a_key_lands_on_the_stream_clients_partition(
