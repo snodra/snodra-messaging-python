@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -19,7 +21,15 @@ from snodra_sql import DRIVER_MYSQL, DRIVER_POSTGRES, SqlConfig, SqlStore
 
 from store_interop.ledger import Ledger
 from store_interop.messages import (
+    Allow,
+    AllowReply,
+    ControlReply,
+    ControlSet,
+    DltEvent,
+    LetterBrief,
     OrderPlaced,
+    Poison,
+    PoisonReply,
     Publish,
     PublishRaw,
     PublishRawReply,
@@ -29,9 +39,13 @@ from store_interop.messages import (
     Who,
     WhoReply,
 )
+from store_interop.messages import (
+    ReplayRange as _ReplayRange,
+)
 from store_interop.observe import ObservedStore
 from store_interop.settings import (
     EVENT_TYPE,
+    RABBITMQ,
     SERVICE,
     Family,
     Settings,
@@ -64,11 +78,18 @@ class Probe:
                 hubs=(settings.hub,),
                 events_source=source_name(settings.run, family.name),
                 outbox_poll_interval=0.1,
+                status_interval=settings.status_interval,
+                dead_letter_mode="event-store" if family.name == RABBITMQ else "collection",
             ),
             store=self.store,
             event_store=self.event_store,
         )
         self._seq = itertools.count(1)
+        self._opted_out = 0
+        self._allowed: set[str] = set()
+        self._dlt: list[DltEvent] = []
+        self._dlt_sub: snodra.EventStoreSubscription | None = None
+        self._dlt_task: asyncio.Task[None] | None = None
         self._register()
 
     @property
@@ -170,6 +191,23 @@ class Probe:
                 event_id: await self.store.processed.exists(marker_id(self.family.name, event_id))
                 for event_id in command.markers
             }
+            control = await self.store.control.get(processor_name(self.family.name))
+            letters = await self.store.dead_letters.list(processor_name(self.family.name), limit=100)
+            operation = None if control.operation is None else control.operation.id
+            dead_letters = tuple(
+                LetterBrief(
+                    id=letter.id,
+                    reason=str(letter.reason),
+                    event_id=letter.event_id,
+                    attempts=letter.attempts,
+                )
+                for letter in letters
+            )
+            replay = tuple(
+                _ReplayRange(segment=open_range.segment, from_=open_range.start, until=open_range.until)
+                for open_range in control.replay
+            )
+            dlt = tuple(self._dlt)
             return StateReply(
                 instance=self.instance,
                 language=self.settings.language,
@@ -183,13 +221,95 @@ class Probe:
                 outbox_pending=await self.store.outbox.pending(),
                 handled=handled,
                 duplicates=duplicates,
+                opted_out=self._opted_out,
+                paused=control.paused,
+                paused_by=control.paused_by,
+                operation_id=operation,
+                replay=replay,
+                dead_letters=dead_letters,
+                dead_letter_total=len(dead_letters),
+                dlt=dlt,
+                dlt_total=len(dlt),
                 deliveries=tuple(deliveries),
                 markers=markers,
             )
 
+        @app.command_handler
+        async def control_set(command: ControlSet) -> ControlReply:
+            self._check(command.family, command.run)
+            if not command.by:
+                raise snodra.InvalidRequest("by is required")
+            await self.store.control.set_paused(
+                processor_name(self.family.name), command.paused, command.by, int(time.time() * 1000)
+            )
+            control = await self.store.control.get(processor_name(self.family.name))
+            return ControlReply(instance=self.instance, paused=control.paused, paused_by=control.paused_by)
+
+        @app.command_handler
+        async def poison(command: Poison) -> PoisonReply:
+            self._check(command.family, command.run)
+            if not command.id:
+                raise snodra.InvalidRequest("id is required")
+            if not command.key:
+                raise snodra.InvalidRequest("key is required")
+            event = OrderPlaced(
+                id=command.id,
+                run=self.settings.run,
+                publisher=command.publisher,
+                family=self.family.name,
+                key=command.key,
+                seq=1,
+                poison=True,
+            )
+            headers = {
+                EventHeaders.TYPE: EVENT_TYPE,
+                EventHeaders.ID: command.id,
+                EventHeaders.CORRELATION_ID: command.id,
+                EventHeaders.TIMESTAMP: _now_text(),
+                EventHeaders.SOURCE: SERVICE,
+                EventHeaders.USER_ID: "",
+            }
+            await self.event_store.publish(
+                OutgoingEvent(
+                    source=source_name(self.settings.run, self.family.name),
+                    id=command.id,
+                    type_name=EVENT_TYPE,
+                    key=command.key,
+                    headers=headers,
+                    payload=json.dumps(dataclasses.asdict(event)).encode(),
+                )
+            )
+            return PoisonReply(instance=self.instance, published=command.id)
+
+        @app.command_handler
+        async def allow(command: Allow) -> AllowReply:
+            self._check(command.family, command.run)
+            self._allowed.update(command.ids)
+            return AllowReply(instance=self.instance, allowed=len(self._allowed))
+
         @app.event_handler(processor=processor_name(self.family.name))
         async def on_placed(event: OrderPlaced) -> None:
+            self._fail_if_poison(event)
             self.ledger.observe_handled(event)
+
+        @app.event_handler(processor=processor_name(self.family.name), replay=False)
+        async def on_placed_opt_out(event: OrderPlaced) -> None:
+            self._fail_if_poison(event)
+            self._opted_out += 1
+
+        @app.reset_handler(processor_name(self.family.name))
+        async def on_reset(reset: snodra.ResetContext) -> None:
+            log.info(
+                "the probe ran its reset handler (family %s, operation %s, %d ranges)",
+                self.family.name,
+                reset.operation_id,
+                len(reset.ranges),
+            )
+
+    def _fail_if_poison(self, event: OrderPlaced) -> None:
+        """A poison event fails until the driver allows its id on this instance."""
+        if event.poison and event.id not in self._allowed:
+            raise RuntimeError(f"the poison event {event.id} is not allowed yet")
 
     def _check(self, family: str, run: str) -> None:
         if family and family != self.family.name:
@@ -202,12 +322,14 @@ class Probe:
 
     async def start(self) -> None:
         await self.app.start()
+        await self._start_dlt()
         log.info("the %s probe (instance %s) started", self.family.name, self.instance)
 
     async def stop(self) -> None:
         try:
             await self.app.shutdown(timeout=SHUTDOWN_BUDGET)
         finally:
+            await self._stop_dlt()
             await self.close()
 
     async def close(self) -> None:
@@ -216,6 +338,51 @@ class Probe:
             close = getattr(owned, "close", None)
             if close is not None:
                 await close()
+
+    async def _start_dlt(self) -> None:
+        """Subscribe to the family's dead-letter source when its processor uses the event-store mode."""
+        if self.family.name != RABBITMQ:
+            return
+        self._dlt_sub = await self.event_store.subscribe(
+            snodra.SubscriptionSpec(
+                name=f"{SERVICE}.interop-{self.family.name}-dlt-{self.settings.language}",
+                source=source_name(self.settings.run, self.family.name) + ".dlt",
+            )
+        )
+        self._dlt_task = asyncio.create_task(self._drain_dlt(), name=f"snodra:store-interop-dlt:{self.family.name}")
+
+    async def _drain_dlt(self) -> None:
+        sub = self._dlt_sub
+        if sub is None:  # pragma: no cover - started before the task
+            return
+        while True:
+            event = await sub.next()
+            if not isinstance(event, snodra.Delivery):
+                continue
+            self._dlt.append(
+                DltEvent(
+                    id=event.headers.get(EventHeaders.ID, ""),
+                    type=event.headers.get(EventHeaders.TYPE, ""),
+                    key=event.key,
+                    segment=event.segment,
+                    position=event.position,
+                    headers=dict(event.headers),
+                    payload=json.loads(event.payload) if event.payload else None,
+                )
+            )
+            await sub.ack(event.segment, event.position)
+
+    async def _stop_dlt(self) -> None:
+        task = self._dlt_task
+        sub = self._dlt_sub
+        self._dlt_task = None
+        self._dlt_sub = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if sub is not None:
+            await sub.close()
 
 
 def _build_stores(settings: Settings, family: Family) -> tuple[snodra.MessageStore, snodra.EventStore, str | None]:

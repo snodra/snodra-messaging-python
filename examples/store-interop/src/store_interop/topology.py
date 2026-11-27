@@ -79,12 +79,16 @@ async def main() -> int:
     last: Exception | None = None
     for _ in range(60):
         try:
-            await create_super_stream(source, host=host, port=port, username=username, password=password)
+            # The processor's source, and its dead-letter source: the RabbitMQ probe runs the
+            # event-store dead-letter mode and publishes what no handler can take to <source>.dlt
+            # (a library never creates a stream).
+            for stream in (source, source + ".dlt"):
+                await create_super_stream(stream, host=host, port=port, username=username, password=password)
             return 0
         except Exception as error:  # the broker's stream listener may still be starting
             last = error
             await asyncio.sleep(1.0)
-    log.error("the super stream %s could not be created: %s", source, last)
+    log.error("the super streams of %s could not be created: %s", source, last)
     return 1
 
 

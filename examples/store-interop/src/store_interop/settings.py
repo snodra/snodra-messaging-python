@@ -103,6 +103,8 @@ class Settings:
     mongo_uri: str
     mongo_database: str
     sql_database: str
+    status_interval: float = 5.0
+    """Seconds between two status reports: the hub picks a reset's executor by the freshest report."""
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> Settings:
@@ -156,6 +158,10 @@ class Settings:
                 raise ValueError(
                     f"the {family} URL names {_database_from_url(url)!r}, not the run's database {sql_database!r}"
                 )
+        report = get("SNODRA_SERVER_STATUS_INTERVAL_MS", "5000")
+        status_ms = int(report) if report.isdigit() else 0
+        if status_ms < 1:
+            raise ValueError(f"SNODRA_SERVER_STATUS_INTERVAL_MS {report!r} must be a positive number of milliseconds")
         return cls(
             language=language,
             run=run,
@@ -171,4 +177,5 @@ class Settings:
             mongo_uri=mongo_uri,
             mongo_database=get("INTEROP_MONGO_DATABASE", database_name(run)),
             sql_database=sql_database,
+            status_interval=status_ms / 1000,
         )

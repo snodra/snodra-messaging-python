@@ -69,6 +69,90 @@ class State:
     markers: tuple[str, ...] = field(default_factory=tuple)
 
 
+@snodra.message_type("orders.interop.ControlSet")
+@dataclass(frozen=True, slots=True)
+class ControlSet:
+    """Pause or resume this instance's processor by writing the message store's control state."""
+
+    family: str
+    run: str
+    paused: bool
+    by: str
+
+
+@dataclass(frozen=True, slots=True)
+class ControlReply:
+    instance: str
+    paused: bool
+    paused_by: str | None
+
+
+@snodra.message_type("orders.interop.Poison")
+@dataclass(frozen=True, slots=True)
+class Poison:
+    """Publish one event its handler rejects until the driver allows the event id."""
+
+    family: str
+    publisher: str
+    run: str
+    id: str
+    key: str
+
+
+@dataclass(frozen=True, slots=True)
+class PoisonReply:
+    instance: str
+    published: str
+
+
+@snodra.message_type("orders.interop.Allow")
+@dataclass(frozen=True, slots=True)
+class Allow:
+    """Let this instance's handlers take the poison events of ``ids``."""
+
+    family: str
+    run: str
+    ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AllowReply:
+    instance: str
+    allowed: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayRange:
+    """One open replay range of the processor's control state."""
+
+    segment: str
+    from_: str
+    until: str
+
+
+@dataclass(frozen=True, slots=True)
+class LetterBrief:
+    """One dead letter as this instance's store lists it."""
+
+    id: str
+    reason: str
+    event_id: str | None
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class DltEvent:
+    """One event the probe's dead-letter subscription received."""
+
+    id: str
+    type: str
+    key: str | None
+    segment: str
+    position: str
+    headers: dict[str, str]
+    payload: object
+
+
 @dataclass(frozen=True, slots=True)
 class Delivery:
     """One event delivery this instance's consumer recorded a stage-1 marker for: ``handled`` when
@@ -96,6 +180,15 @@ class StateReply:
     outbox_pending: int
     handled: int
     duplicates: int
+    opted_out: int
+    paused: bool
+    paused_by: str | None
+    operation_id: str | None
+    replay: tuple[ReplayRange, ...]
+    dead_letters: tuple[LetterBrief, ...]
+    dead_letter_total: int
+    dlt: tuple[DltEvent, ...]
+    dlt_total: int
     deliveries: tuple[Delivery, ...]
     markers: dict[str, bool]
 
@@ -111,3 +204,4 @@ class OrderPlaced:
     family: str
     key: str
     seq: int
+    poison: bool = False

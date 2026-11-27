@@ -40,6 +40,16 @@ def test_settings_from_env() -> None:
     assert settings.rabbitmq_port == 5552
     assert settings.sql_database == "snodra_interop_run42"
     assert settings.mongo_database == "snodra_interop_run42"
+    assert settings.status_interval == 5.0
+
+
+def test_the_status_interval_is_read_from_the_library_setting() -> None:
+    values = base_env()
+    values["SNODRA_SERVER_STATUS_INTERVAL_MS"] = "4000"
+    assert Settings.from_env(values).status_interval == 4.0
+    values["SNODRA_SERVER_STATUS_INTERVAL_MS"] = "0"
+    with pytest.raises(ValueError, match="SNODRA_SERVER_STATUS_INTERVAL_MS"):
+        Settings.from_env(values)
 
 
 def test_names_are_per_run() -> None:
