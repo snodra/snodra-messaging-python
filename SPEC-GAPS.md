@@ -720,9 +720,9 @@ library does there. Where an entry is settled, its behaviour is this library's r
 
 - **Specification:** [protocol.md, Processor status](https://snodra.damoreira.com/docs/library-authors/protocol/#processor-status)
   says the name is "`default` for the handlers without a processing group, else the group name
-  (`[a-z0-9][a-z0-9-]{0,47}`)", and the level-3 design says a named processor's name matches the pattern "and is not
-  `default`". Python's `App.event_handler(processor=...)` has `"default"` as the parameter's own default, so the call
-  cannot tell an omitted parameter from an explicit `"default"`.
+  (`[a-z0-9][a-z0-9-]{0,47}`)"; Kotlin and Rust read that as "a named processor's name is not `default`". Python's
+  `App.event_handler(processor=...)` has `"default"` as the parameter's own default, so the call cannot tell an omitted
+  parameter from an explicit `"default"`.
 - **Other Snodra libraries:** Kotlin refuses `@ProcessingGroup("default")`
   (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/handler/ProcessingGroup.kt:28`,
   the error built at `.../handler/HandlerRegistry.kt:110`); Rust's `event_in` refuses it
@@ -734,3 +734,49 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** should Python take a sentinel (or a separate `default_processor=True`) so that an explicit `default` is
   refused as the other libraries refuse it, or is the parameter's default the API's statement that `default` is the
   unnamed processor's valid spelling?
+- **Wire change:** no.
+
+
+### SG-44: a message store without the `processor_control` port
+
+- **Specification:** [protocol.md, Processor control](https://snodra.damoreira.com/docs/library-authors/protocol/#processor-control)
+  says the control state "lives in the service's message store, which every instance reads at start and every 5 s";
+  [message-store-add-ons.md](https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/) freezes the
+  ports and says a port not yet at its level reports `Unsupported`. No page says what an event processor does when its
+  message store's control port is the unsupported one.
+- **Other Snodra libraries:** Kotlin's control reads the documents before any consumer starts and, when the read fails,
+  starts nothing until a poll reads them
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/control/ProcessorControl.kt:124`,
+  the consumers started through `.../events/EventProcessors.kt:49`). Its message stores always implement the port, so
+  it has no `Unsupported` case; the same holds for Rust's store ports.
+- **This library:** `Processors._read_and_apply` treats `Unsupported` from `MessageStore.control.get` as "this store
+  cannot keep control documents": that processor starts unpaused (a level-2 store keeps consuming), is remembered and
+  is not polled again, with one INFO log. A pause requested for it fails at the store write (the control action
+  answers `FAILED`); a document cannot be honoured. An error other than `Unsupported` still leaves the processors as
+  they are and is retried at the next poll. Pinned by
+  `tests/test_processors.py::test_a_store_without_processor_control_starts_the_processors_unpaused`.
+- **Question:** should a store without the port be a startup error at level 3 (as a level claim requires every port),
+  or is the silent unpaused fallback the right one for a library used against a level-2 add-on?
+- **Wire change:** no.
+
+### SG-45: a message store without the dead-letter port in mode `collection`
+
+- **Specification:** [protocol.md, Dead letters](https://snodra.damoreira.com/docs/library-authors/protocol/#processor-control)
+  says a record that exhausts its attempts is "parked in `collection` (default) at
+  `<processor>:<source>:<segment>:<position>`"; [message-store-add-ons.md](https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/)
+  freezes the dead-letter port and says a port not yet at its level reports `Unsupported`. No page says what a
+  processor does when the store cannot park.
+- **Other Snodra libraries:** Kotlin parks through its `DeadLetterStore`; a sink failure leaves the record
+  unacknowledged and hands it out again after the backoff
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/EventConsumer.kt:489`,
+  the delivery path at `.../EventConsumer.kt:559`). Its stores implement the port, so it has no `Unsupported` case.
+- **This library:** `EventConsumer._park_work` catches `Unsupported` and treats it as "this store cannot keep dead
+  letters": it logs the store at error, records it as the processor's `last_error`, and acknowledges the record as
+  lost instead of redelivering it forever. A `head`/`get` that is `Unsupported` during sequencing means the same:
+  the record is handled without sequencing it. Any other store error still redelivers and retries in place (no
+  rebalance storm). Pinned by
+  `tests/test_deadletters.py::test_a_store_without_dead_letters_acknowledges_the_failed_record_as_lost` and
+  `::test_a_failing_parked_key_check_redelivers_in_place_without_resubscribing`.
+- **Question:** is "acknowledge as lost" acceptable for a level-2 store used in mode `collection`, or should the
+  library refuse the mode at startup when the port is unsupported (and how would it tell without a probe)?
+- **Wire change:** no.

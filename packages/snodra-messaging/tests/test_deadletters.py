@@ -11,16 +11,29 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
+import pytest
 from eventhelpers import (
     OrderPlaced,
     ScriptedEventStore,
     ScriptedSubscription,
+    assigned,
+    dead_letter,
     delivery,
 )
 from fakehub import FakeHub
 from helpers import SCALED, eventually, new_app, processors_of
-from snodra import App, DeadLetter, DeadLetterReason, MemoryStore, MessageStore
+from snodra import (
+    App,
+    Capability,
+    ConfigurationError,
+    DeadLetter,
+    DeadLetterReason,
+    MemoryStore,
+    MessageStore,
+    MessageStoreUnsupported,
+)
 from snodra._eventstore import EventHeaders, OutgoingEvent
+from snodra._hubpb import hub_pb2
 from snodra._timings import Timings
 
 
@@ -149,10 +162,8 @@ async def test_a_record_whose_own_letter_exists_is_acknowledged_without_running_
     sub.deliver(delivery(position="5", key="k1"))
     await _acked(sub, 1)
     assert calls == 1
-    # The instance died after parking and before the acknowledgement: the record comes again (the scripted
-    # subscription hands it out after a reassignment), and its own letter makes it a duplicate.
-    second = ScriptedEventStore()
-    second.subscriptions = events.subscriptions
+    # The instance died after parking and before the acknowledgement: the record comes again, and its own letter
+    # makes it a duplicate.
     sub.deliver(delivery(position="5", key="k1"))
     await _acked(sub, 2)
     assert calls == 1
@@ -173,6 +184,7 @@ async def test_invalid_records_are_parked_without_blocking_their_key(hub: FakeHu
     sub = await _started(hub, app, events)
     sub.deliver(delivery(type_=None, event_id=None, position="0", key="k1"))
     await _acked(sub, 1)
+    assert "k1" not in processors_of(app).consumer("default")._parked_keys, "an INVALID letter blocks no key"
     sub.deliver(delivery(payload=b"[]", event_id="e-2", position="1", key="k1"))
     await _acked(sub, 2)
     # The same key flows: INVALID never blocks.
@@ -193,6 +205,7 @@ async def test_invalid_records_are_parked_without_blocking_their_key(hub: FakeHu
 async def test_mode_event_store_publishes_to_source_dlt_with_the_six_headers(hub: FakeHub) -> None:
     store = MemoryStore()
     events = ScriptedEventStore()
+    events.capabilities = frozenset({Capability.REPLAY, Capability.NATIVE_DEAD_LETTER})
     app = new_app(
         hub,
         store=store,
@@ -289,9 +302,173 @@ async def test_a_park_that_fails_keeps_the_record_unacknowledged_and_parks_it_on
     sub.deliver(delivery(position="4", key="k1"))
     # Nothing is acknowledged while the sink fails; the redelivery goes straight to the sink, without the handler.
     await eventually(lambda: failures == 0)
-    await asyncio.sleep(0.05)
+    await eventually(lambda: sub.redeliveries == [("0", "4")])
     assert sub.acks == []
     sub.deliver(delivery(position="4", key="k1"))
     await _acked(sub)
     assert calls == 1
     assert len(await real.list("default", 10)) == 1
+
+
+async def test_a_store_without_dead_letters_acknowledges_the_failed_record_as_lost(hub: FakeHub) -> None:
+    store = MemoryStore()
+    real = store.dead_letters
+
+    class _UnsupportedPark:
+        async def park(self, letter):  # type: ignore[no-untyped-def]
+            raise MessageStoreUnsupported("dead letters in this store (level 3)")
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(real, name)
+
+    store.dead_letters = _UnsupportedPark()  # type: ignore[assignment]
+    events = ScriptedEventStore()
+    app = new_app(hub, store=store, event_store=events, outbox_enabled=False, consumer_max_attempts=1, _timings=_fast())
+    calls = 0
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("boom")
+
+    sub = await _started(hub, app, events)
+    sub.deliver(delivery(position="4", key="k1"))
+    await _acked(sub)
+    assert calls == 1
+    assert sub.redeliveries == [], "an unsupported dead-letter store does not redeliver"
+    assert await real.count() == 0
+    status = processors_of(app).statuses()[0]
+    assert status.failed_total == 1
+    assert "dead letters" in status.last_error
+
+
+async def test_mode_event_store_needs_the_native_dead_letter_capability(hub: FakeHub) -> None:
+    events = ScriptedEventStore()
+    assert not events.supports(Capability.NATIVE_DEAD_LETTER)
+    app = new_app(
+        hub,
+        store=MemoryStore(),
+        event_store=events,
+        outbox_enabled=False,
+        dead_letter_mode="event-store",
+        _timings=_fast(),
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    with pytest.raises(ConfigurationError, match="native-dead-letter"):
+        await app.start()
+
+
+async def test_the_dlt_error_header_is_cut_to_2000_code_points(hub: FakeHub) -> None:
+    store = MemoryStore()
+    events = ScriptedEventStore()
+    events.capabilities = frozenset({Capability.REPLAY, Capability.NATIVE_DEAD_LETTER})
+    published: list[OutgoingEvent] = []
+
+    async def publish(event: OutgoingEvent) -> None:
+        published.append(event)
+
+    events.publish = publish  # type: ignore[method-assign]
+    app = new_app(
+        hub,
+        store=store,
+        event_store=events,
+        outbox_enabled=False,
+        consumer_max_attempts=1,
+        dead_letter_mode="event-store",
+        _timings=_fast(),
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        raise RuntimeError("é" * 3000)
+
+    sub = await _started(hub, app, events)
+    sub.deliver(delivery())
+    await _acked(sub)
+    (event,) = published
+    header = event.headers["snodra-dlt-error"]
+    assert header.startswith("RuntimeError: ")
+    assert len(header) == 2000, "code points, not UTF-8 bytes"
+
+
+async def test_a_dlt_publish_is_bounded_and_leaves_the_record_unacknowledged(hub: FakeHub) -> None:
+    store = MemoryStore()
+    events = ScriptedEventStore()
+    events.capabilities = frozenset({Capability.REPLAY, Capability.NATIVE_DEAD_LETTER})
+    gate = asyncio.Event()
+
+    async def publish(event: OutgoingEvent) -> None:
+        await gate.wait()
+
+    events.publish = publish  # type: ignore[method-assign]
+    app = new_app(
+        hub,
+        store=store,
+        event_store=events,
+        outbox_enabled=False,
+        consumer_max_attempts=1,
+        dead_letter_mode="event-store",
+        _timings=_fast(dead_letter_publish_timeout=0.1),
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        raise RuntimeError("boom")
+
+    sub = await _started(hub, app, events)
+    sub.deliver(delivery())
+    await eventually(lambda: sub.redeliveries == [("0", "0")], within=1.5)
+    assert sub.acks == [], "the publish did not finish: the record is not acknowledged"
+    gate.set()
+    await app.shutdown(timeout=1.0)
+
+
+async def test_a_failing_parked_key_check_redelivers_in_place_without_resubscribing(hub: FakeHub) -> None:
+    store = MemoryStore()
+    real = store.dead_letters
+    await real.park(dead_letter("0", key="k1"))
+    failures = 1
+
+    class _FlakyHead:
+        async def head(self, processor: str, key: str) -> str | None:
+            nonlocal failures
+            if failures > 0:
+                failures -= 1
+                raise RuntimeError("the store is briefly down")
+            return await real.head(processor, key)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(real, name)
+
+    store.dead_letters = _FlakyHead()  # type: ignore[assignment]
+    events = ScriptedEventStore()
+    app = new_app(hub, store=store, event_store=events, outbox_enabled=False, consumer_max_attempts=1, _timings=_fast())
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        raise AssertionError("the sequenced record must not run its handler")
+
+    await app.start()
+    await asyncio.wait_for(events.subscribed.wait(), 1.0)
+    sub = events.subscriptions[0]
+    sub.queue.put_nowait(assigned("0"))
+    await eventually(lambda: processors_of(app).statuses()[0].state == hub_pb2.PROCESSOR_RUNNING)
+
+    sub.deliver(delivery(event_id="e-2", position="1", key="k1", payload=b'{"orderId":"o-2"}'))
+    await eventually(lambda: sub.redeliveries == [("0", "1")])
+    assert len(events.subscriptions) == 1, "the subscription was kept"
+    assert sub.closes == 0
+    assert sub.acks == []
+
+    sub.deliver(delivery(event_id="e-2", position="1", key="k1", payload=b'{"orderId":"o-2"}'))
+    await eventually(lambda: len(sub.acks) == 1)
+    letters = sorted(await real.list("default", 10), key=lambda row: row.position)
+    assert [(row.position, row.reason) for row in letters] == [
+        ("0", DeadLetterReason.HANDLER_FAILED),
+        ("1", DeadLetterReason.SEQUENCED),
+    ]

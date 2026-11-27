@@ -121,6 +121,7 @@ class ScriptedSubscription:
     queue: asyncio.Queue[SubscriptionEvent | BaseException] = field(default_factory=asyncio.Queue)
     acks: list[tuple[str, str]] = field(default_factory=list)
     redeliveries: list[tuple[str, str]] = field(default_factory=list)
+    errors: deque[str] = field(default_factory=deque)
     closes: int = 0
     pause_calls: int = 0
     resume_calls: int = 0
@@ -155,7 +156,7 @@ class ScriptedSubscription:
         return []
 
     def take_error(self) -> str | None:
-        return None
+        return self.errors.popleft() if self.errors else None
 
     async def close(self) -> None:
         self.closes += 1
@@ -247,6 +248,7 @@ def dead_letter(
     blocked_by: str | None = None,
     attempts: int = 1,
     parked_at_ms: int = 1_793_700_000_000,
+    replay: bool = False,
 ) -> DeadLetter:
     """A letter a test parks directly; its id is ``<processor>:<source>:<segment>:<position>``."""
     return DeadLetter(
@@ -272,7 +274,7 @@ def dead_letter(
         parked_at_ms=parked_at_ms,
         last_attempt_at_ms=parked_at_ms,
         expire_at_ms=parked_at_ms + 30 * 24 * 60 * 60 * 1000,
-        replay=False,
+        replay=replay,
     )
 
 
@@ -422,3 +424,13 @@ def unused_reset(target: ResetTarget) -> list[ReplayRange]:
 
 def assigned(*segments: str) -> Assigned:
     return Assigned(segments)
+
+
+async def no_subscription(events: ScriptedEventStore, within: float = 0.1) -> None:
+    """Fails if the event store is subscribed within ``within`` (an absence assertion, never a fixed sleep)."""
+    try:
+        async with asyncio.timeout(within):
+            await events.subscribed.wait()
+    except TimeoutError:
+        return
+    raise AssertionError(f"the event store was subscribed within {within} s")

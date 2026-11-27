@@ -64,7 +64,15 @@ from snodra._eventstore import (
     segment_order,
 )
 from snodra._hubpb import hub_pb2
-from snodra._status import StatusView, build_status, state_of, utf8_cut
+from snodra._status import (
+    MAX_DEAD_LETTER_ERROR_CHARS,
+    StatusView,
+    build_status,
+    clean_text,
+    code_point_cut,
+    state_of,
+    utf8_cut,
+)
 from snodra._store import (
     DeadLetter,
     DeadLetterError,
@@ -72,7 +80,9 @@ from snodra._store import (
     DeadLetterStore,
     MessageStore,
     Parked,
+    Unsupported,
     letter_id,
+    now_ms,
 )
 
 log = logging.getLogger(__name__)
@@ -127,8 +137,8 @@ class EventConsumer:
         resubscribe_stable: float,
         dead_letter_mode: str = COLLECTION,
         dead_letter_retention_ms: int = 30 * 24 * 60 * 60 * 1000,
+        dead_letter_publish_timeout: float = 30.0,
         clock: Callable[[], int] | None = None,
-        failing_window_ms: int = 60_000,
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"the event handler attempts must be at least 1, got {max_attempts}")
@@ -145,8 +155,8 @@ class EventConsumer:
         self._resubscribe_stable = resubscribe_stable
         self._mode = dead_letter_mode
         self._retention_ms = dead_letter_retention_ms
-        self._clock: Callable[[], int] = time.time_ns if clock is None else clock
-        self._failing_window_ms = failing_window_ms
+        self._publish_timeout = dead_letter_publish_timeout
+        self._clock: Callable[[], int] = now_ms if clock is None else clock
         self._spec = SubscriptionSpec(
             name=processor_subscription(service, processor),
             source=source,
@@ -540,9 +550,37 @@ class EventConsumer:
             head = await letters.head(self._processor, key)
         except asyncio.CancelledError:
             raise
+        except Unsupported as error:
+            # TODO(spec-gap): SG-45
+            self._failing_text(
+                f"the message store {self._store.name} does not keep dead letters ({error}); "
+                "handling the record without sequencing it"
+            )
+            log.error(
+                "The message store %s does not keep dead letters (%s): handling the record %s-%s@%s of processor %s "
+                "without sequencing it",
+                self._store.name,
+                error,
+                self._source,
+                segment,
+                delivery.position,
+                self._processor,
+            )
+            return False
         except Exception as error:
             self._failing(error)
-            raise
+            log.warning(
+                "the event processor %s could not check the parked key %s of %s-%s@%s, redelivering it: %s",
+                self._processor,
+                key,
+                self._source,
+                segment,
+                delivery.position,
+                error,
+            )
+            await self._redeliver(subscription, delivery)
+            await asyncio.sleep(self._backoff)
+            return True
         if head is None:
             self._parked_keys.discard(key)  # retried, discarded or expired, here or on another instance
             return False
@@ -576,8 +614,24 @@ class EventConsumer:
         async def work() -> None:
             letters = self._letters
             assert letters is not None
-            result = await letters.park(letter)
-            if letter.key is not None:
+            try:
+                result = await letters.park(letter)
+            except Unsupported as error:
+                # TODO(spec-gap): SG-45
+                self._failing_text(
+                    f"the message store {self._store.name} does not keep dead letters ({error}); "
+                    "the record is acknowledged as lost"
+                )
+                log.error(
+                    "The message store %s does not keep dead letters (%s): acknowledging the record %s of processor "
+                    "%s as lost instead of redelivering it forever",
+                    self._store.name,
+                    error,
+                    letter.id,
+                    self._processor,
+                )
+                return
+            if letter.key is not None and letter.reason is not DeadLetterReason.INVALID:
                 self._parked_keys.add(letter.key)
             if result is Parked.NEW:
                 self._parked_since_sample = True
@@ -596,20 +650,22 @@ class EventConsumer:
             headers = {name: value for name, value in delivery.headers.items() if name not in _DLT_HEADERS}
             headers[DLT_PROCESSOR] = self._processor
             headers[DLT_REASON] = reason.value
-            headers[DLT_ERROR] = utf8_cut(f"{error.type_name}: {error.message}", 2000)
+            error_text = f"{error.type_name}: {error.message}"
+            headers[DLT_ERROR] = code_point_cut(error_text, MAX_DEAD_LETTER_ERROR_CHARS)
             headers[DLT_ORIGINAL_TOPIC] = self._source
             headers[DLT_ORIGINAL_PARTITION] = delivery.segment
             headers[DLT_ORIGINAL_OFFSET] = delivery.position
-            await self._events.publish(
-                OutgoingEvent(
-                    source=dead_letter_source(self._source),
-                    id=self._event_id(delivery),
-                    type_name=delivery.headers.get(EventHeaders.TYPE, ""),
-                    key=delivery.key,
-                    headers=headers,
-                    payload=delivery.payload,
+            async with asyncio.timeout(self._publish_timeout):
+                await self._events.publish(
+                    OutgoingEvent(
+                        source=dead_letter_source(self._source),
+                        id=self._event_id(delivery),
+                        type_name=delivery.headers.get(EventHeaders.TYPE, ""),
+                        key=delivery.key,
+                        headers=headers,
+                        payload=delivery.payload,
+                    )
                 )
-            )
 
         return work
 
@@ -757,6 +813,10 @@ class EventConsumer:
 
     def status(self) -> hub_pb2.ProcessorStatus:
         """This processor's status, from memory only: never blocks."""
+        if self._subscription is not None:
+            trouble = self._subscription.take_error()
+            if trouble is not None:
+                self._failing_text(trouble)
         now = self._clock()
         segments: list[SegmentStatus] = []
         replay_until: dict[str, str] = {}
@@ -846,10 +906,6 @@ class EventConsumer:
             self._parked_since_sample = True
             raise
 
-    def clear_parked(self) -> None:
-        """Forgets that a letter was parked (its count was sampled)."""
-        self._parked_since_sample = False
-
     def _failing(self, error: BaseException) -> None:
         self._failing_text(f"{type(error).__name__}: {error}")
 
@@ -884,7 +940,7 @@ def _stage_marker(
 def _error_of(failure: BaseException | None) -> DeadLetterError:
     if failure is None:
         return DeadLetterError.new("Error", "the handler failed without an error")
-    return DeadLetterError.new(type(failure).__name__, str(failure))
+    return DeadLetterError.new(type(failure).__name__, clean_text(str(failure)))
 
 
 def _header_or_none(headers: Mapping[str, str], name: str) -> str | None:

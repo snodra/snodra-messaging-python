@@ -12,7 +12,7 @@ import asyncio
 import time
 from dataclasses import replace
 
-from eventhelpers import Clock, OrderPlaced, ScriptedEventStore, assigned, dead_letter
+from eventhelpers import Clock, OrderPlaced, ScriptedEventStore, assigned, dead_letter, delivery
 from fakehub import FakeHub
 from helpers import SCALED, eventually, new_app, processors_of
 from snodra import DeadLetterReason, MemoryEventStore, MemoryStore
@@ -244,3 +244,50 @@ def test_the_hub_bounds_of_a_status_are_kept() -> None:
     assert status.source == "n" * 256
     assert len(status.event_types[0].encode()) <= 256
     assert status.event_types[0].startswith("orders.")
+
+
+async def test_a_recovered_reader_error_reaches_the_status_without_a_record(hub: FakeHub) -> None:
+    events = ScriptedEventStore()
+    app = new_app(hub, store=MemoryStore(), event_store=events, outbox_enabled=False, _timings=_timings())
+
+    @app.event_handler
+    async def in_default(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await asyncio.wait_for(events.subscribed.wait(), 1.0)
+    sub = events.subscriptions[0]
+    sub.queue.put_nowait(assigned("0"))
+    await eventually(lambda: processors_of(app).statuses()[0].state == hub_pb2.PROCESSOR_RUNNING)
+    sub.errors.append("the event store recovered from a read error")
+    status = processors_of(app).statuses()[0]
+    assert status.state == hub_pb2.PROCESSOR_FAILING
+    assert status.last_error == "the event store recovered from a read error"
+    assert status.last_error_at_ms > 0
+    assert not sub.errors, "the status took the error"
+
+
+async def test_a_handler_error_with_a_lone_surrogate_is_sanitised_for_the_status(hub: FakeHub) -> None:
+    store = MemoryStore()
+    events = ScriptedEventStore()
+    app = new_app(
+        hub, store=store, event_store=events, outbox_enabled=False, consumer_max_attempts=1, _timings=_timings()
+    )
+
+    @app.event_handler
+    async def in_default(event: OrderPlaced) -> None:
+        raise RuntimeError("\ud800 boom")
+
+    await app.start()
+    await asyncio.wait_for(events.subscribed.wait(), 1.0)
+    sub = events.subscriptions[0]
+    sub.queue.put_nowait(assigned("0"))
+    await eventually(lambda: processors_of(app).statuses()[0].state == hub_pb2.PROCESSOR_RUNNING)
+    sub.deliver(delivery())
+    await eventually(lambda: len(sub.acks) == 1)
+    status = processors_of(app).statuses()[0]
+    assert "\ud800" not in status.last_error
+    assert "boom" in status.last_error
+    status.last_error.encode("utf-8")  # never a lone surrogate
+    letter = (await store.dead_letters.list("default", 10))[0]
+    assert "\ud800" not in letter.error.message

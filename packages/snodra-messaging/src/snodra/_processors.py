@@ -24,12 +24,13 @@ from collections.abc import Callable
 
 from snodra._codec import Codec
 from snodra._consumer import EventConsumer
-from snodra._deadletters import COLLECTION, DeadLetters
+from snodra._deadletters import COLLECTION, EVENT_STORE, DeadLetters
+from snodra._errors import ConfigurationError
 from snodra._events import EventRegistry
-from snodra._eventstore import EventStore
+from snodra._eventstore import Capability, EventStore
 from snodra._hubpb import hub_pb2
 from snodra._settings import Settings
-from snodra._store import MessageStore, ProcessorControlState
+from snodra._store import MessageStore, ProcessorControlState, Unsupported
 from snodra._timings import Timings
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,12 @@ class Processors:
         self._timings = timings
         self._names: tuple[str, ...] = tuple(registry.processors())
         mode = settings.dead_letter_mode
+        if mode == EVENT_STORE and not events.supports(Capability.NATIVE_DEAD_LETTER):
+            raise ConfigurationError(
+                "dead_letter_mode (SNODRA_EVENTS_DEAD_LETTER_MODE) is event-store, but the event store "
+                f"{events.name} does not declare the capability {Capability.NATIVE_DEAD_LETTER.value}: configure "
+                "collection or log, or an event store that keeps its own dead letters"
+            )
         self._letters = DeadLetters(
             mode,
             store if mode == COLLECTION else None,
@@ -83,12 +90,14 @@ class Processors:
                 resubscribe_stable=timings.event_resubscribe_stable,
                 dead_letter_mode=mode,
                 dead_letter_retention_ms=int(settings.dead_letter_retention * 1000),
+                dead_letter_publish_timeout=timings.dead_letter_publish_timeout,
                 clock=clock,
             )
             for name in self._names
         }
         self._versions: dict[str, int] = {name: 0 for name in self._names}
         self._held: dict[str, str] = {}  # the reset operations this instance holds (level 3's reset state machine)
+        self._unsupported: set[str] = set()  # processors whose message store has no processor_control
         self._consumer_tasks: dict[str, asyncio.Task[None]] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._poll_interval = timings.processor_control_poll
@@ -96,6 +105,7 @@ class Processors:
         self._last_sample_ms = 0
         self._sample_wake = asyncio.Event()
         self._running = False
+        self._polls = 0  # completed poll passes (the tests use it to wait for a poll without sleeping)
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -110,10 +120,6 @@ class Processors:
     def consumer(self, processor: str) -> EventConsumer:
         """The consumer of ``processor``."""
         return self._consumers[processor]
-
-    def runs(self, processor: str) -> bool:
-        """Whether this instance runs ``processor``."""
-        return processor in self._consumers
 
     async def start(self) -> None:
         """Reads the control documents, starts the processors they let run, then polls and samples."""
@@ -207,6 +213,7 @@ class Processors:
             await asyncio.sleep(self._poll_interval)
             if not self._running:
                 return
+            self._polls += 1
             try:
                 await self._read_and_apply(initial=False)
             except asyncio.CancelledError:
@@ -217,12 +224,24 @@ class Processors:
                 )
 
     async def _read_and_apply(self, *, initial: bool) -> None:
-        """Reads every processor's document, then applies those no change of this instance overtook meanwhile."""
+        """Reads every processor's document, then applies those no change of this instance overtook meanwhile.
+
+        A message store that does not implement ``processor_control`` (``Unsupported``) leaves its processor running
+        unpaused and is remembered so it is not asked again: a level-2 store keeps its processors, never a missing
+        document silently stopping consumption.
+        """
         versions = dict(self._versions)
         documents: dict[str, ProcessorControlState] = {}
+        unsupported: list[str] = []
         try:
             for name in self._names:
-                documents[name] = await self._store.control.get(name)
+                if name in self._unsupported:
+                    continue
+                try:
+                    documents[name] = await self._store.control.get(name)
+                except Unsupported:
+                    # TODO(spec-gap): SG-44
+                    unsupported.append(name)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -233,7 +252,18 @@ class Processors:
             else:
                 log.warning("could not read the processor control documents, keeping the processors as they are")
             return
+        for name in unsupported:
+            self._unsupported.add(name)
+            log.info(
+                "Processor %s: the message store %s does not implement processor_control; it runs unpaused and is not "
+                "polled for a document",
+                name,
+                self._store.name,
+            )
+            await self._set_running(name, True, initial=initial)
         for name in self._names:
+            if name in self._unsupported or name not in documents:
+                continue
             if self._versions[name] != versions[name]:
                 continue  # read before a change made here: it would undo it
             await self._apply(name, documents[name], initial=initial)
@@ -247,10 +277,15 @@ class Processors:
             log.info("Processor %s %s (processor_control)", processor, "paused" if document.paused else "resumed")
         held = self._held.get(processor)
         operation = document.operation
+        if held is not None and (operation is None or operation.id != held):
+            # The document no longer names the operation this instance held (it was finished or taken over).
+            # TODO(L3-5): remember the ended operation so a late renewal is refused NOT_PREPARED, as the base does.
+            del self._held[processor]
+            held = None
         foreign = operation if operation is not None and operation.holds_at(now) and operation.id != held else None
         consumer.operation_id = held or ("" if foreign is None else foreign.id)
         consumer.set_replay(document.replay)
-        await self._set_running(processor, foreign is None, initial=initial)
+        await self._set_running(processor, held is None and foreign is None, initial=initial)
 
     async def _set_running(self, processor: str, run: bool, *, initial: bool) -> None:
         """Starts or stops one consumer, as the documents say (a stopped one stays in no subscription)."""

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from snodra._codec import Codec
 from snodra._events import EventRegistry, event_handling, event_message, processor_marker
 from snodra._eventstore import EventHeaders, ProcessedMarker
+from snodra._status import clean_text
 from snodra._store import (
     DeadLetter,
     DeadLetterError,
@@ -38,9 +39,6 @@ log = logging.getLogger(__name__)
 COLLECTION: str = "collection"
 EVENT_STORE: str = "event-store"
 LOG: str = "log"
-
-MODES: tuple[str, ...] = (COLLECTION, EVENT_STORE, LOG)
-"""Where a record goes once its attempts are exhausted."""
 
 MAX_LIST: int = 100
 """The most letters a ``DeadLetterList`` may ask for (the hub clamps to this too)."""
@@ -105,10 +103,6 @@ class DeadLetters:
         """Where an exhausted record goes: ``collection``, ``event-store`` or ``log``."""
         return self._mode
 
-    def runs(self, processor: str) -> bool:
-        """Whether this instance runs ``processor`` (a control request may only work on one it runs)."""
-        return processor in self._processors
-
     def _available(self) -> MessageStore:
         if self._mode != COLLECTION or self._store is None:
             raise ValueError(
@@ -131,8 +125,12 @@ class DeadLetters:
         return await store.dead_letters.list(processor, limit)
 
     async def get(self, letter: str) -> DeadLetter | None:
-        """The letter, or ``None``."""
-        return await self._available().dead_letters.get(letter)
+        """The letter, or ``None``; a letter of a processor that does not run here is refused."""
+        found = await self._available().dead_letters.get(letter)
+        if found is None:
+            return None
+        self._require_runs(found.processor)
+        return found
 
     async def count(self, processor: str) -> int:
         """How many letters ``processor`` has, over all instances."""
@@ -224,6 +222,9 @@ class DeadLetters:
         if not handlers:
             error = DeadLetterError.new("NoHandler", f"no handler for {type_name} in processor {letter.processor}")
             return await self._failed(store, letter, error)
+        # A letter parked while its processor replayed is retried as a replay: the handlers marked for no replay are
+        # skipped (the marker is still written, so the letter is deleted with it).
+        active = tuple(handler for handler in handlers if not letter.replay or handler.replay)
         info = event_message(dedupe_id, type_name, letter.headers)
         user_id = letter.headers.get(EventHeaders.USER_ID, "")
         marker = ProcessedMarker(
@@ -240,7 +241,7 @@ class DeadLetters:
                 async with store.transaction():
                     if not await store.processed.record(marker):
                         raise _Duplicate
-                    for handler in handlers:
+                    for handler in active:
                         message: object = self._codec.decode(letter.payload, handler.message)
                         await handler.fn(message)
                     if not await store.dead_letters.delete_in(letter.id):
@@ -254,7 +255,8 @@ class DeadLetters:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            return await self._failed(store, letter, DeadLetterError.new(type(error).__name__, str(error)))
+            letter_error = DeadLetterError.new(type(error).__name__, clean_text(str(error)))
+            return await self._failed(store, letter, letter_error)
         log.info("Retried dead letter %s", letter.id)
         return RetryOutcome("Retried")
 

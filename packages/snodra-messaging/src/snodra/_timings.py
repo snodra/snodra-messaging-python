@@ -87,6 +87,8 @@ class Timings:
     """How often every instance reads its processors' ``processor_control`` documents (a pause converges within it)."""
     dead_letter_sample: float
     """How often a processor's dead-letter count is sampled for its status (and after a letter is parked)."""
+    dead_letter_publish_timeout: float
+    """Mode ``event-store``: the longest a dead letter's publish may take before the record is redelivered."""
     dns_refresh: float
     """How often a ``dns:///`` target is resolved again."""
     dns_drain_limit: float
@@ -131,6 +133,7 @@ DEFAULT_TIMINGS: Final = Timings(
     event_resubscribe_stable=30.0,
     processor_control_poll=5.0,
     dead_letter_sample=30.0,
+    dead_letter_publish_timeout=30.0,
     dns_refresh=30.0,
     dns_drain_limit=65.0,
 )

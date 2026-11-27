@@ -42,10 +42,19 @@ MAX_TEXT_BYTES: Final = 512
 """A control answer's texts are cut to this many UTF-8 bytes (``ControlOk.detail``, ``ControlRefused.message``,
 ``DeadLetterSummary.error_message``)."""
 
+MAX_DEAD_LETTER_ERROR_CHARS: Final = 2000
+"""The most code points of a dead letter's error message (the ``snodra-dlt-error`` header and the stored letter)."""
+
+
+def clean_text(text: str) -> str:
+    """``text`` with every lone surrogate replaced: a Python error message may carry one, UTF-8 cannot."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
 
 def utf8_cut(text: str, max_bytes: int) -> str:
-    """``text`` cut to at most ``max_bytes`` UTF-8 bytes, never inside one character."""
-    if len(text.encode("utf-8", "replace")) <= max_bytes:
+    """``text`` cut to at most ``max_bytes`` UTF-8 bytes, never inside one character; a lone surrogate becomes ``?``."""
+    text = clean_text(text)
+    if len(text.encode()) <= max_bytes:
         return text
     kept: list[str] = []
     used = 0
@@ -58,10 +67,18 @@ def utf8_cut(text: str, max_bytes: int) -> str:
     return "".join(kept)
 
 
+def code_point_cut(text: str, max_chars: int) -> str:
+    """``text`` cut to at most ``max_chars`` code points (the dead-letter error's unit), surrogates replaced."""
+    return clean_text(text)[:max_chars]
+
+
 def bounded_position(position: str | None) -> str:
     """A position as the status carries it: ``""`` when unknown or longer than :data:`MAX_POSITION_BYTES` (never cut: a
     cut position is wrong)."""
-    if position is None or len(position.encode("utf-8", "replace")) > MAX_POSITION_BYTES:
+    if position is None:
+        return ""
+    position = clean_text(position)
+    if len(position.encode()) > MAX_POSITION_BYTES:
         return ""
     return position
 

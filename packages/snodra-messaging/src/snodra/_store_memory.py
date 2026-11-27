@@ -626,7 +626,8 @@ class _DeadLetters:
         }
 
     async def get(self, letter: str) -> DeadLetter | None:
-        return self._rows().get(letter)
+        row = self._rows().get(letter)
+        return None if row is None else _copy_letter(row)
 
     async def list(self, processor: str | None = None, limit: int | None = None) -> builtins.list[DeadLetter]:
         rows = [row for row in self._rows().values() if processor is None or row.processor == processor]

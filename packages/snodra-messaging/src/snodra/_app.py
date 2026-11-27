@@ -786,8 +786,9 @@ class App:
         instance serves (so their subscribers hear them end before the stream is gone), then the handlers in flight
         drained (awaited for at most 5 s, then cancelled and never awaited again), then each stream half-closed and its
         end awaited (at most 2 s). After that order — the empty ``Register``, the subscription ends, the handler drain
-        and the stream closes — the event phase cancels the outbox relay, the consumers and the message store's
-        background work and awaits them for at most ``timeout``; a task that ignores its cancellation is left behind
+        and the stream closes — the event phase cancels the outbox relay, the event processors, the control workers
+        and the message store's background work and awaits them for at most ``timeout``; a task that ignores its
+        cancellation is left behind
         with a warning. That bound is the event phase's own, in addition to the hub leave's, so the call can spend up
         to about twice ``timeout`` before the connection close phases. A handler still running when ``timeout`` is
         reached is cancelled and left behind: one warning names it. A second call returns at once. The handlers being

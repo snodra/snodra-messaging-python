@@ -149,7 +149,9 @@ class ControlPlane:
             if action == "dead_letter_discard":
                 return await self._discard(processor, request)
             if action in ("reset_prepare", "reset_execute", "reset_finish"):
-                # TODO(L3-5): the leased reset state machine (prepare/execute/finish, replay ranges).
+                # TODO(L3-5): the leased reset state machine (prepare/execute/finish, replay ranges). Every reset
+                # action must bump its processor's version in Processors, like pause and resume do, so a poll that
+                # read an older document cannot undo it.
                 return _refused(
                     request.control_id,
                     hub_pb2.CONTROL_REFUSAL_UNSUPPORTED,
@@ -188,7 +190,10 @@ class ControlPlane:
             return _refused(request.control_id, hub_pb2.CONTROL_REFUSAL_INVALID, "no letter id")
         owner = self._owner
         assert owner is not None
-        found = await owner.dead_letters.get(letter_id)
+        try:
+            found = await owner.dead_letters.get(letter_id)
+        except KeyError:
+            found = None  # a letter of a processor this instance does not run
         if found is None or found.processor != processor:
             outcome = RetryOutcome("NotFound")
         else:
@@ -221,7 +226,10 @@ class ControlPlane:
             return _refused(request.control_id, hub_pb2.CONTROL_REFUSAL_INVALID, "no letter id")
         owner = self._owner
         assert owner is not None
-        found = await owner.dead_letters.get(letter_id)
+        try:
+            found = await owner.dead_letters.get(letter_id)
+        except KeyError:
+            found = None  # a letter of a processor this instance does not run
         if found is None or found.processor != processor:
             return _refused(
                 request.control_id,

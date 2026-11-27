@@ -11,7 +11,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
-from eventhelpers import OrderPlaced, ScriptedEventStore, ScriptedSubscription, assigned, delivery
+from eventhelpers import (
+    OrderPlaced,
+    ScriptedEventStore,
+    ScriptedSubscription,
+    assigned,
+    delivery,
+    no_subscription,
+)
 from fakehub import FakeHub
 from helpers import SCALED, eventually, new_app, processors_of
 from snodra import App, MemoryStore
@@ -137,7 +144,7 @@ async def test_a_pause_does_not_touch_the_reset_lock(hub: FakeHub) -> None:
         pass
 
     await app.start()
-    await asyncio.sleep(0.05)
+    await no_subscription(events)
     # Under the lock the processor does not join; a pause persists without touching the operation.
     assert events.subscriptions == []
     await processors_of(app).pause("default")

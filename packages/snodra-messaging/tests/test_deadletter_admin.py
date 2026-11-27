@@ -287,3 +287,43 @@ async def test_a_retry_whose_letter_vanishes_meanwhile_commits_nothing() -> None
     assert (outcome.result, calls) == ("NotFound", 1)
     assert await store.processed.exists("processor:default:e-9") is False
     assert await store.dead_letters.get(letter.id) is None
+
+
+async def test_a_replay_letter_skips_the_handlers_marked_for_no_replay() -> None:
+    hubless = await _app_with(lambda app: None)
+    store = MemoryStore()
+    calls: list[str] = []
+
+    @hubless.event_handler
+    async def every_time(event: OrderPlaced) -> None:
+        calls.append("every")
+
+    @hubless.event_handler(replay=False)
+    async def once(event: OrderPlaced) -> None:
+        calls.append("once")
+
+    admin = _admin(hubless, store, processors=("default",))
+    replay_letter = dead_letter("1", replay=True)
+    await store.dead_letters.park(replay_letter)
+    assert (await admin.retry(replay_letter.id)).result == "Retried"
+    assert calls == ["every"], "a replayed letter runs only its replayable handlers"
+    assert await store.processed.exists("processor:default:e-1") is True
+
+    calls.clear()
+    live_letter = dead_letter("2", event_id="e-2", replay=False)
+    await store.dead_letters.park(live_letter)
+    assert (await admin.retry(live_letter.id)).result == "Retried"
+    assert calls == ["every", "once"], "a letter parked outside a replay runs every handler"
+
+
+async def test_get_refuses_a_letter_of_a_processor_that_does_not_run_here() -> None:
+    hubless = await _app_with(lambda app: None)
+    store = MemoryStore()
+    admin = _admin(hubless, store, processors=("default", "mail"))
+    asked = dead_letter("1", processor="default")
+    other = dead_letter("2", processor="audit")
+    await store.dead_letters.park(asked)
+    await store.dead_letters.park(other)
+    assert await admin.get(asked.id) is not None
+    with pytest.raises(KeyError, match="does not run"):
+        await admin.get(other.id)

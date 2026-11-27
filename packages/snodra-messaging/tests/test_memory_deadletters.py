@@ -237,3 +237,15 @@ async def test_delete_markers_removes_only_the_processors_stage_one_in_the_range
     assert await store.processed.exists("processor:mail:e-1") is False
     for kept in ("processor:mail:e-2", "processor:mail:e-3", "processor:default:e-4", "processor:mail:e-5"):
         assert await store.processed.exists(kept) is True, kept
+
+
+async def test_get_returns_a_copy_the_caller_cannot_change_behind_the_store() -> None:
+    store = MemoryStore()
+    letter = _letter("6")
+    await store.dead_letters.park(letter)
+    found = await store.dead_letters.get(letter.id)
+    assert found is not None
+    found.headers["mutated"] = "yes"
+    kept = await store.dead_letters.get(letter.id)
+    assert kept is not None
+    assert "mutated" not in kept.headers

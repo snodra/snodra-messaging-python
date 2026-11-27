@@ -12,10 +12,10 @@ import asyncio
 from dataclasses import replace
 
 import pytest
-from eventhelpers import OrderPlaced, ScriptedEventStore, assigned
+from eventhelpers import OrderPlaced, ScriptedEventStore, assigned, delivery
 from fakehub import FakeHub
 from helpers import SCALED, eventually, new_app, processors_of
-from snodra import MemoryEventStore, MemoryStore
+from snodra import MemoryEventStore, MemoryStore, MessageStoreUnsupported
 from snodra._eventstore import SubscriptionSpec
 from snodra._hubpb import hub_pb2
 from snodra._store import DeadLetter
@@ -219,3 +219,82 @@ async def test_a_processor_started_under_a_reset_lock_does_not_join_and_reports_
     operation = (await store.control.get("default")).operation
     assert operation is not None
     assert (operation.id, operation.kind, operation.lease_until_ms) == ("op-1", "reset", now + 60_000)
+
+
+class _UnsupportedControl:
+    """A processor control port that the store does not implement (the level-2 add-ons' state)."""
+
+    def __init__(self) -> None:
+        self.get_calls = 0
+
+    async def get(self, processor: str) -> object:
+        self.get_calls += 1
+        raise MessageStoreUnsupported("processor control in this store (level 3)")
+
+    def __getattr__(self, name: str) -> object:
+        async def refuse(*args: object, **kwargs: object) -> object:
+            raise MessageStoreUnsupported(f"processor control in this store (level 3): {name}")
+
+        return refuse
+
+
+async def test_a_store_without_processor_control_starts_the_processors_unpaused(hub: FakeHub) -> None:
+    store = MemoryStore()
+    control = _UnsupportedControl()
+    store.control = control  # type: ignore[assignment]
+    events = ScriptedEventStore()
+    app = new_app(hub, store=store, event_store=events, outbox_enabled=False, _timings=_timings())
+    calls = 0
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        nonlocal calls
+        calls += 1
+
+    await app.start()
+    await asyncio.wait_for(events.subscribed.wait(), 1.0)
+    sub = events.subscriptions[0]
+    sub.queue.put_nowait(assigned("0"))
+    await eventually(lambda: processors_of(app).statuses()[0].state == hub_pb2.PROCESSOR_RUNNING)
+    assert processors_of(app).consumer("default").paused is False
+    await eventually(lambda: processors_of(app)._polls >= 3)
+    assert control.get_calls == 1, "the unsupported control port is tried once, not on every poll"
+    sub.deliver(delivery())
+    await eventually(lambda: len(sub.acks) == 1)
+    assert calls == 1
+
+
+async def test_a_lock_this_instance_holds_keeps_its_processor_out_of_the_subscription(hub: FakeHub) -> None:
+    store = MemoryStore()
+    now = 1_793_700_000_000
+    await store.control.lock("default", "op-1", now + 60_000, now)
+    app = new_app(
+        hub,
+        store=store,
+        event_store=MemoryEventStore(),
+        outbox_enabled=False,
+        _timings=_timings(),
+        _clock=lambda: now,
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    processors = processors_of(app)
+    assert processors.statuses()[0].operation_id == "op-1"
+    assert processors.consumer("default").running is False
+
+    # The reset state machine (level 3) marks the operation held here: the document names it, so it stays stopped.
+    processors._held["default"] = "op-1"
+    await processors._read_and_apply(initial=False)
+    assert processors.consumer("default").running is False
+    assert processors.statuses()[0].operation_id == "op-1"
+
+    # The document no longer names it (finished elsewhere): the processor consumes again and reports no operation.
+    await store.control.release("default", "op-1", now)
+    await processors._read_and_apply(initial=False)
+    assert processors.consumer("default").running is True
+    assert processors.statuses()[0].operation_id == ""
+    assert "default" not in processors._held
