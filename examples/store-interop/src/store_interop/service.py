@@ -193,6 +193,7 @@ class Probe:
             }
             control = await self.store.control.get(processor_name(self.family.name))
             letters = await self.store.dead_letters.list(processor_name(self.family.name), limit=100)
+            dead_letter_total = await self.store.dead_letters.count(processor_name(self.family.name))
             operation = None if control.operation is None else control.operation.id
             dead_letters = tuple(
                 LetterBrief(
@@ -227,7 +228,7 @@ class Probe:
                 operation_id=operation,
                 replay=replay,
                 dead_letters=dead_letters,
-                dead_letter_total=len(dead_letters),
+                dead_letter_total=dead_letter_total,
                 dlt=dlt,
                 dlt_total=len(dlt),
                 deliveries=tuple(deliveries),
