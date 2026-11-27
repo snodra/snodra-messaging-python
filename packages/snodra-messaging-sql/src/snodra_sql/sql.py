@@ -38,7 +38,7 @@ import inspect
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -338,6 +338,8 @@ class SqlStore:
         self._listener_task: asyncio.Task[None] | None = None
         self._listener_conn: Any = None
         self._listens = 0
+        self._lock_step: Callable[[str], Awaitable[None]] | None = None
+        """A test hook around :meth:`_SqlControl.lock`'s renew/take sequence; ``None`` in production."""
         self.outbox: OutboxStore = _SqlOutbox(self)
         self.processed: ProcessedStore = _SqlProcessed(self)
         self.dead_letters: DeadLetterStore = _SqlDeadLetters(self)
@@ -1505,6 +1507,8 @@ class _SqlControl:
             )
             if renewed == 1:
                 return Locked.was_taken()
+            if store._lock_step is not None:
+                await store._lock_step("renewed")
             taken = await store._exec(
                 conn,
                 "UPDATE snodra_processor_control SET op_id = ?, op_kind = ?, op_lease_until = ?, "
@@ -1521,6 +1525,10 @@ class _SqlControl:
                 ),
             )
             if taken == 1:
+                # The take matched: hold the transaction (and its row lock) here when a test asks,
+                # so another instance's take queues behind this commit.
+                if store._lock_step is not None:
+                    await store._lock_step("taken")
                 return Locked.was_taken()
             state = await self._get_on(conn, processor)
             if state.operation is not None and state.operation.id == operation:

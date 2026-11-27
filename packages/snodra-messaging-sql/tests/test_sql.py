@@ -435,7 +435,12 @@ async def test_a_renewal_that_writes_the_same_values_is_still_taken(store: SqlSt
 
 async def test_two_instances_preparing_one_operation_both_hold_the_lock(store: SqlStore) -> None:
     """The hub prepares every instance with the same operation; a prepare that loses the race to the other
-    instance's commit must be recognised as a renewal of the same operation, not as another holder."""
+    instance's commit must be recognised as a renewal of the same operation, not as another holder.
+
+    On MySQL the store's no-op ON DUPLICATE KEY UPDATE locks the control row in ``_ensure``, so two ``lock``
+    calls serialise before the renew; this stress run is defensive there. PostgreSQL's INSERT ... ON CONFLICT DO
+    NOTHING leaves the row free, so the deterministic test below forces the interleaving.
+    """
     now = 1_800_000_000_000
     for _ in range(30):
         processor = f"conformance-{uuid.uuid4()}"
@@ -445,6 +450,54 @@ async def test_two_instances_preparing_one_operation_both_hold_the_lock(store: S
         )
         assert all(outcome == Locked.was_taken() for outcome in outcomes), outcomes
         assert await store.control.release(processor, "op-1", now)
+
+
+async def test_a_concurrent_preparation_on_postgres_is_a_renewal(store: SqlStore) -> None:
+    """Force the PostgreSQL interleaving: the second instance's renew misses the first instance's uncommitted
+    take, its take queues behind the row lock and matches nothing after the commit, and the store must see that
+    the holder is its own operation and renew it. The same test fails when the recovery renewal is removed."""
+    if store.name != "postgres":
+        pytest.skip(
+            "MySQL's ensureControl locks the control row before the renew; the race is not reachable through lock"
+        )
+    other = SqlStore(store.config)
+    try:
+        await other.open()
+        now = 1_800_000_000_000
+        processor = f"conformance-{uuid.uuid4()}"
+        await store.control.set_paused(processor, False, "test", now)
+
+        a_renewed, b_renewed, a_took = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        allow_a_take, allow_b_take, allow_a_commit = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def first_step(step: str) -> None:
+            if step == "renewed":
+                a_renewed.set()
+                await allow_a_take.wait()
+            elif step == "taken":
+                a_took.set()
+                await allow_a_commit.wait()
+
+        async def second_step(step: str) -> None:
+            if step == "renewed":
+                b_renewed.set()
+                await allow_b_take.wait()
+
+        store._lock_step = first_step
+        other._lock_step = second_step
+        first = asyncio.create_task(store.control.lock(processor, "op-1", now + 30_000, now))
+        await asyncio.wait_for(a_renewed.wait(), 10)
+        second = asyncio.create_task(other.control.lock(processor, "op-1", now + 30_000, now))
+        await asyncio.wait_for(b_renewed.wait(), 10)
+        allow_a_take.set()
+        await asyncio.wait_for(a_took.wait(), 10)
+        allow_b_take.set()
+        await asyncio.sleep(0.2)  # let B's take queue behind A's row lock
+        allow_a_commit.set()
+        outcomes = await asyncio.wait_for(asyncio.gather(first, second), 10)
+        assert all(outcome == Locked.was_taken() for outcome in outcomes), outcomes
+    finally:
+        await other.close()
 
 
 async def test_notify_false_on_postgres_registers_no_listener(store: SqlStore) -> None:
