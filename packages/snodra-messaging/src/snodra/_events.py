@@ -183,7 +183,11 @@ class EventRegistry:
         wants_context = False
         if parameters:
             parameter = parameters[0]
-            if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            if parameter.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
                 raise TypeError(f"reset handler {label} must take a ResetContext or nothing")
             try:
                 annotation: object = get_type_hints(fn).get(parameter.name, parameter.annotation)

@@ -20,7 +20,6 @@ from snodra._eventstore import (
     EventStoreSubscription,
     OutgoingEvent,
     ReplayRange,
-    ResetTarget,
     SegmentStatus,
     SubscriptionEvent,
     SubscriptionSpec,
@@ -412,14 +411,6 @@ class FailingProcessed:
 
     async def purge(self, before_ms: int) -> int:
         return await self._inner.purge(before_ms)
-
-
-def unused_admin(spec: SubscriptionSpec) -> EventStoreAdmin:
-    raise AssertionError("the event store's admin is not used")
-
-
-def unused_reset(target: ResetTarget) -> list[ReplayRange]:
-    raise AssertionError("the event store's admin is not used")
 
 
 def assigned(*segments: str) -> Assigned:

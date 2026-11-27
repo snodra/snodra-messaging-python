@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,11 +14,14 @@ from snodra._eventstore import (
     FIRST_ASSIGNMENT_WITHIN,
     Assigned,
     Capability,
+    Earliest,
     EventStoreAdmin,
     EventStoreSubscription,
     OutgoingEvent,
     ProcessedMarker,
     Rejected,
+    ReplayRange,
+    ResetTarget,
     SegmentStatus,
     SubscriptionEvent,
     SubscriptionSpec,
@@ -29,8 +33,8 @@ from snodra.testing import (
     EVENT_STORE_L3_CHECKS,
     Check,
     EventStoreKit,
+    replay_from_earliest_redelivers_history,
     run_event_store_conformance,
-    run_event_store_l3_conformance,
 )
 
 KIT = Path(__file__).resolve().parents[1] / "src" / "snodra" / "testing"
@@ -233,9 +237,74 @@ class _CapabilityStore:
         return self._inner.compare(a, b)
 
 
-async def test_the_l3_runner_passes_on_the_memory_store() -> None:
+async def test_level_three_runs_the_l2_and_l3_checks_on_the_memory_store() -> None:
     store = MemoryEventStore()
-    await run_event_store_l3_conformance("conformance.events", lambda: store, MarkerStoreStub())
+    await run_event_store_conformance("conformance.events", lambda: store, MarkerStoreStub(), level=3)
+
+
+async def test_the_runner_refuses_a_level_it_does_not_know() -> None:
+    store = MemoryEventStore()
+    with pytest.raises(ValueError, match="level 2 or 3"):
+        await run_event_store_conformance("conformance.events", lambda: store, MarkerStoreStub(), level=4)
+
+
+class _WrongSegmentAdmin:
+    """A reset side whose earliest plan names the wrong segment (a broken store for the kit's own test)."""
+
+    def __init__(self, inner: EventStoreAdmin) -> None:
+        self._inner = inner
+        self.calls = 0
+
+    async def plan(self, target: ResetTarget) -> list[ReplayRange]:
+        ranges = await self._inner.plan(target)
+        if isinstance(target, Earliest):
+            self.calls += 1
+            if self.calls >= 2 and ranges:
+                return [replace(replay, segment="conformance-wrong-segment") for replay in ranges]
+        return ranges
+
+    async def members(self) -> list[str]:
+        return await self._inner.members()
+
+    async def apply(self, ranges: Sequence[ReplayRange]) -> None:
+        await self._inner.apply(ranges)
+
+
+class _WrongSegmentStore:
+    def __init__(self, inner: MemoryEventStore) -> None:
+        self._inner = inner
+
+    @property
+    def name(self) -> str:
+        return "wrong-segment"
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self._inner.capabilities
+
+    def supports(self, capability: Capability) -> bool:
+        return self._inner.supports(capability)
+
+    async def publish(self, event: OutgoingEvent) -> None:
+        await self._inner.publish(event)
+
+    async def subscribe(self, spec: SubscriptionSpec) -> EventStoreSubscription:
+        return await self._inner.subscribe(spec)
+
+    def admin(self, spec: SubscriptionSpec) -> EventStoreAdmin:
+        return _WrongSegmentAdmin(self._inner.admin(spec))
+
+    def compare(self, a: str, b: str) -> int:
+        return self._inner.compare(a, b)
+
+
+async def test_the_replay_check_fails_on_a_plan_of_the_wrong_segment() -> None:
+    inner = MemoryEventStore()
+    store = _WrongSegmentStore(inner)
+    with pytest.raises(AssertionError, match="earliest replays"):
+        await replay_from_earliest_redelivers_history(
+            EventStoreKit("conformance.events", lambda: store, MarkerStoreStub())
+        )
 
 
 @pytest.mark.parametrize(

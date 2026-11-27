@@ -9,7 +9,7 @@ https://snodra.damoreira.com/docs/server/processor-control/.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 
 from eventhelpers import Clock, OrderPlaced
@@ -24,7 +24,10 @@ from snodra import (
     MemoryEventStore,
     MemoryStore,
     Positions,
+    ProcessorControlState,
+    ProcessorControlStore,
     ResetContext,
+    Timestamp,
     Unsupported,
 )
 from snodra._eventstore import (
@@ -32,6 +35,7 @@ from snodra._eventstore import (
     EventStoreSubscription,
     OutgoingEvent,
     ReplayRange,
+    ResetTarget,
     SubscriptionSpec,
 )
 from snodra._hubpb import hub_pb2
@@ -56,16 +60,23 @@ def _timings(**changes: object) -> Timings:
 
 
 async def _app(
-    hub: FakeHub, *, clock: Callable[[], int] | None = None, segments: int = 2
+    hub: FakeHub,
+    *,
+    clock: Callable[[], int] | None = None,
+    event_clock: Callable[[], int] | None = None,
+    segments: int = 2,
+    instance: str = "i-1",
+    timings: Timings | None = None,
 ) -> tuple[App, MemoryStore, MemoryEventStore]:
     store = MemoryStore()
-    events = MemoryEventStore(segments=segments)
+    events = MemoryEventStore(segments=segments, clock=event_clock)
     app = new_app(
         hub,
+        instance=instance,
         store=store,
         event_store=events,
         outbox_poll_interval=0.01,
-        _timings=_timings(),
+        _timings=_timings() if timings is None else timings,
         _clock=clock,
     )
     return app, store, events
@@ -620,3 +631,555 @@ async def test_a_renewal_and_a_dead_letter_list_are_answered_beside_a_running_ex
         )
     )
     assert (await s.recv_control_reply()).WhichOneof("result") == "ok"
+
+
+async def _await_state(
+    store: MemoryStore,
+    processor: str,
+    predicate: Callable[[ProcessorControlState], bool],
+    within: float = 3.0,
+) -> ProcessorControlState:
+    deadline = asyncio.get_running_loop().time() + within
+    while True:
+        state = await store.control.get(processor)
+        if predicate(state):
+            return state
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"the control state of {processor} did not match within {within} s: {state}")
+        await asyncio.sleep(0.005)
+
+
+class _GetFailing:
+    """A control store whose reads fail while ``fail`` is set."""
+
+    def __init__(self, inner: ProcessorControlStore) -> None:
+        self._inner = inner
+        self.fail = False
+
+    async def get(self, processor: str) -> ProcessorControlState:
+        if self.fail:
+            raise RuntimeError("the control store is down")
+        return await self._inner.get(processor)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class _DelayedExpire:
+    """A control store whose expire reports after the caller releases it, so a prepare can land meanwhile."""
+
+    def __init__(self, inner: ProcessorControlStore) -> None:
+        self._inner = inner
+        self.expiring = asyncio.Event()
+        self.go = asyncio.Event()
+
+    async def expire(self, processor: str, operation: str, now_ms: int) -> bool:
+        expired = await self._inner.expire(processor, operation, now_ms)
+        if expired:
+            self.expiring.set()
+            await self.go.wait()
+        return expired
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+async def test_finish_after_a_takeover_is_not_prepared_and_names_the_new_holder(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    app, store, _ = await _app(hub, clock=clock, timings=_timings(processor_control_poll=5.0))
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    assert await store.control.release("default", "op-1", NOW)
+    assert (await store.control.lock("default", "op-2", NOW + 30_000, NOW)).taken
+    refused = await processors.reset.finish("default", "op-1")
+    assert isinstance(refused, ResetRefused), refused
+    assert refused.code == "NOT_PREPARED"
+    assert "op-2" in refused.message
+    await eventually(lambda: processors.statuses()[0].operation_id == "op-2")
+    assert processors.consumer("default").running is False
+    assert isinstance(await processors.reset.finish("default", "op-2"), ResetOk)
+    await _running(app)
+
+
+async def test_finish_whose_lock_cannot_be_read_says_it_resumes_once_read_back(hub: FakeHub) -> None:
+    store = MemoryStore()
+    control = _GetFailing(store.control)
+    store.control = control  # type: ignore[assignment]
+    events = MemoryEventStore(segments=2)
+    app = new_app(
+        hub,
+        store=store,
+        event_store=events,
+        outbox_poll_interval=0.01,
+        _timings=_timings(),
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    control.fail = True
+    released = await processors.reset.finish("default", "op-1")
+    assert isinstance(released, ResetOk), released
+    assert released.detail == "released; consuming once the lock is read back"
+    assert processors.consumer("default").running is False
+    control.fail = False
+    await eventually(lambda: processors.consumer("default").running, within=3.0)
+    await _running(app)
+
+
+async def test_a_stale_poll_does_not_undo_a_prepare_that_landed_meanwhile(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    inner = MemoryStore()
+    control = _DelayedExpire(inner.control)
+    inner.control = control  # type: ignore[assignment]
+    events = MemoryEventStore(segments=2)
+    app = new_app(
+        hub,
+        store=inner,
+        event_store=events,
+        outbox_poll_interval=0.01,
+        _timings=_timings(processor_control_poll=5.0),
+        _clock=lambda: clock.now_ms,
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 1_000), ResetOk)
+    clock.advance(1.5)  # op-1's lease passed: the poll expires it
+    poll = asyncio.create_task(processors._read_and_apply(initial=False))
+    await asyncio.wait_for(control.expiring.wait(), 3.0)
+    # A prepare takes op-2 while the poll still waits on the expired op-1's expiry.
+    assert isinstance(await processors.reset.prepare("default", "op-2", 30_000), ResetOk)
+    control.go.set()
+    await asyncio.wait_for(poll, 3.0)
+    assert processors.reset.held("default") == "op-2", "the stale poll dropped the new operation"
+    assert processors.consumer("default").running is False, "the stale poll started the consumer under op-2"
+    await eventually(lambda: processors.statuses()[0].operation_id == "op-2")
+    assert processors.statuses()[0].state == hub_pb2.PROCESSOR_STOPPED
+    assert isinstance(await processors.reset.finish("default", "op-2"), ResetOk)
+    await _running(app)
+
+
+async def test_an_execute_that_outlives_its_limit_loses_the_lease_before_the_markers(hub: FakeHub) -> None:
+    app, store, _ = await _app(hub, timings=_timings(reset_execute_limit=0.05))
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    @app.reset_handler
+    async def slow(context: ResetContext) -> None:
+        entered.set()
+        await gate.wait()
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await _publish(app, "o-1")
+    await eventually(lambda: bool(store._data.outbox.rows))
+    event_id = next(iter(store._data.outbox.rows.values())).entry.id
+    await _await_marker(store, event_id)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 1_000), ResetOk)
+    execute = asyncio.create_task(processors.reset.execute("default", "op-1", Earliest()))
+    await asyncio.wait_for(entered.wait(), 3.0)
+    await asyncio.sleep(0.1)  # past the 50 ms execute limit, and several polls
+    assert processors.consumer("default").running is False, "a poll restarted the consumer while the execute ran"
+    gate.set()
+    refused = await asyncio.wait_for(execute, 3.0)
+    assert isinstance(refused, ResetRefused), refused
+    assert refused.code == "FAILED"
+    assert "ran longer than" in refused.message
+    assert "reset handlers ran (1)" in refused.message
+    assert "positions not moved" in refused.message
+    assert await store.processed.exists(f"processor:default:{event_id}"), "the marker moved"
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+
+
+async def test_the_execute_extends_its_lease_while_it_runs(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    app, store, _ = await _app(
+        hub, clock=clock, timings=_timings(reset_lease_extension=0.01, processor_control_poll=5.0)
+    )
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    @app.reset_handler
+    async def slow(context: ResetContext) -> None:
+        entered.set()
+        await gate.wait()
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await _publish(app, "o-1")
+    await eventually(lambda: bool(store._data.outbox.rows))
+    event_id = next(iter(store._data.outbox.rows.values())).entry.id
+    await _await_marker(store, event_id)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 1_000), ResetOk)
+    initial = (await store.control.get("default")).operation
+    assert initial is not None
+    clock.advance(0.5)
+    execute = asyncio.create_task(processors.reset.execute("default", "op-1", Earliest()))
+    await asyncio.wait_for(entered.wait(), 3.0)
+    await _await_state(
+        store,
+        "default",
+        lambda state: state.operation is not None and state.operation.lease_until_ms > initial.lease_until_ms,
+    )
+    gate.set()
+    assert isinstance(await asyncio.wait_for(execute, 3.0), ResetDone)
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+
+
+async def test_a_lease_lost_after_the_reset_handlers_stops_before_the_markers(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    app, store, _ = await _app(hub, clock=clock, timings=_timings())
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    @app.reset_handler
+    async def lose(context: ResetContext) -> None:
+        await store.control.release("default", context.operation_id, clock.now_ms)
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await _publish(app, "o-1")
+    await eventually(lambda: bool(store._data.outbox.rows))
+    event_id = next(iter(store._data.outbox.rows.values())).entry.id
+    await _await_marker(store, event_id)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    refused = await processors.reset.execute("default", "op-1", Earliest())
+    assert isinstance(refused, ResetRefused), refused
+    assert refused.code == "FAILED"
+    assert "lease lost" in refused.message
+    assert "reset handlers ran (1)" in refused.message
+    assert "positions not moved" in refused.message
+    assert await store.processed.exists(f"processor:default:{event_id}"), "a lost lease deleted the marker"
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+
+
+async def test_a_timestamp_reset_replays_only_from_its_time(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    event_clock = Clock(NOW)
+    app, store, _ = await _app(hub, clock=clock, event_clock=event_clock, segments=1)
+    seen: list[str] = []
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        seen.append(event.order_id)
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await _publish(app, "o-1")
+    await _handle_until(seen, 1)
+    event_clock.advance(1.0)
+    await _publish(app, "o-2")
+    await _handle_until(seen, 2)
+    ids = [row.entry.id for row in store._data.outbox.rows.values()]
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    done = await processors.reset.execute("default", "op-1", Timestamp(NOW + 1_000))
+    assert isinstance(done, ResetDone), done
+    assert [(r.segment, r.start, r.until) for r in done.ranges] == [("0", "1", "2")]
+    assert done.markers_deleted == 1
+    assert not await store.processed.exists(f"processor:default:{ids[1]}")
+    assert await store.processed.exists(f"processor:default:{ids[0]}"), "before the time: its marker stays"
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+    await _handle_until(seen, 3)
+    assert seen == ["o-1", "o-2", "o-2"], "only the record at or after the time replayed"
+
+
+async def test_a_named_processor_reset_leaves_the_default_processor_alone(hub: FakeHub) -> None:
+    app, store, _ = await _app(hub, segments=1)
+    seen: list[str] = []
+
+    @app.event_handler
+    async def in_default(event: OrderPlaced) -> None:
+        seen.append("default")
+
+    @app.event_handler(processor="mail")
+    async def in_mail(event: OrderPlaced) -> None:
+        seen.append("mail")
+
+    await app.start()
+    await _publish(app, "o-1")
+    await eventually(lambda: len(seen) == 2)
+    processors = processors_of(app)
+    event_id = next(iter(store._data.outbox.rows.values())).entry.id
+    await _await_marker(store, event_id)
+    default_marker = await store.processed.exists(f"processor:default:{event_id}")
+    assert default_marker
+    assert isinstance(await processors.reset.prepare("mail", "op-1", 30_000), ResetOk)
+    done = await processors.reset.execute("mail", "op-1", Earliest())
+    assert isinstance(done, ResetDone), done
+    assert await store.processed.exists(f"processor:default:{event_id}"), "the default processor's marker was deleted"
+    assert not await store.processed.exists(f"processor:mail:{event_id}")
+    assert isinstance(await processors.reset.finish("mail", "op-1"), ResetOk)
+    await eventually(lambda: len(seen) == 3, within=3.0)
+    assert sorted(seen) == ["default", "mail", "mail"], "only the mail processor replayed"
+
+
+async def test_a_prepare_that_cannot_finish_the_record_cancels_it_and_the_record_comes_again(hub: FakeHub) -> None:
+    app, store, _ = await _app(hub, timings=_timings(handler_drain=0.05))
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    block = True
+    handled: list[str] = []
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        nonlocal block
+        entered.set()
+        if block:
+            await gate.wait()
+        handled.append(event.order_id)
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await _publish(app, "o-1")
+    await asyncio.wait_for(entered.wait(), 3.0)
+    reply = await asyncio.wait_for(processors.reset.prepare("default", "op-1", 30_000), 3.0)
+    assert isinstance(reply, ResetOk)
+    assert handled == [], "the record in hand was cancelled before its handler finished"
+    event_id = next(iter(store._data.outbox.rows.values())).entry.id
+    assert not await store.processed.exists(f"processor:default:{event_id}"), "a cancelled record left its marker"
+    block = False
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+    await eventually(lambda: handled == ["o-1"], within=3.0)
+
+
+async def test_two_instances_share_a_reset_and_the_non_executor_applies_it_paused(hub: FakeHub) -> None:
+    store = MemoryStore()
+    events = MemoryEventStore(segments=1)
+    normal: list[str] = []
+    no_replay: list[str] = []
+    timings = _timings(processor_control_poll=5.0)
+
+    def build(instance: str, *, with_no_replay: bool) -> App:
+        app = new_app(
+            hub,
+            instance=instance,
+            store=store,
+            event_store=events,
+            outbox_poll_interval=0.01,
+            _timings=timings,
+        )
+
+        @app.event_handler
+        async def every(event: OrderPlaced) -> None:
+            normal.append(f"{instance}:{event.order_id}")
+
+        if with_no_replay:
+
+            @app.event_handler(replay=False)
+            async def once(event: OrderPlaced) -> None:
+                no_replay.append(f"{instance}:{event.order_id}")
+
+        return app
+
+    app2 = build("i-2", with_no_replay=True)
+    app1 = build("i-1", with_no_replay=False)
+    await app2.start()
+    await _running(app2)
+    await app1.start()
+    await _running(app1)
+    await _publish(app2, "o-1", "o-2")
+    await eventually(lambda: len(normal) == 2, within=3.0)
+    assert sorted(normal) == ["i-2:o-1", "i-2:o-2"], "the non-executor holds the single segment"
+    assert no_replay == ["i-2:o-1", "i-2:o-2"]
+
+    reset2 = processors_of(app2).reset
+    reset1 = processors_of(app1).reset
+    assert isinstance(await reset2.prepare("default", "op-1", 30_000), ResetOk)
+    assert isinstance(await reset1.prepare("default", "op-1", 30_000), ResetOk)
+    done = await reset1.execute("default", "op-1", Earliest())
+    assert isinstance(done, ResetDone), done
+    assert done.markers_deleted == 2
+    await app1.shutdown(timeout=2.0)
+    await store.control.set_paused("default", True, "test", 1_793_700_000_000)
+    assert isinstance(await reset2.finish("default", "op-1"), ResetOk)
+    processors2 = processors_of(app2)
+    await eventually(
+        lambda: (
+            processors2.statuses()[0].state == hub_pb2.PROCESSOR_PAUSED and processors2.statuses()[0].operation_id == ""
+        ),
+        within=3.0,
+    )
+    assert processors2.consumer("default").paused is True
+    assert processors2.consumer("default").replay_ranges, "the persisted replay ranges reached the non-executor"
+    assert len(normal) == 2, "nothing replayed before the resume"
+    await processors2.resume("default")
+    await eventually(lambda: len(normal) == 4, within=3.0)
+    assert no_replay == ["i-2:o-1", "i-2:o-2"], "the replay skipped the replay=False handler"
+
+
+async def test_finish_releases_an_expired_document_entry(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    app, store, _ = await _app(hub, clock=clock)
+    await store.control.lock("default", "op-1", NOW + 1_000, NOW)
+    clock.advance(2.0)
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    assert processors.reset.held("default") is None
+    assert (await store.control.get("default")).operation is not None, "the expired entry is still stored"
+    reply = await processors.reset.finish("default", "op-1")
+    assert isinstance(reply, ResetOk)
+    assert reply.detail == "no operation holds the lock"
+    assert (await store.control.get("default")).operation is None, "the expired entry was released"
+    await _running(app)
+
+
+async def test_a_prepare_trims_the_operation_id(hub: FakeHub) -> None:
+    app, store, _ = await _app(hub)
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    assert isinstance(await processors.reset.prepare("default", "  op-1  ", 30_000), ResetOk)
+    state = await store.control.get("default")
+    assert state.operation is not None
+    assert state.operation.id == "op-1"
+    assert processors.reset.held("default") == "op-1"
+    assert isinstance(await processors.reset.finish("default", " op-1 "), ResetOk)
+
+
+async def test_a_renewal_stops_a_consumer_that_started_meanwhile(hub: FakeHub) -> None:
+    app, _, _ = await _app(hub)
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    await processors.set_running("default", True)  # a stale start, as a poll that read the old document
+    assert processors.consumer("default").running is True
+    renewed = await processors.reset.prepare("default", "op-1", 30_000)
+    assert isinstance(renewed, ResetOk)
+    await eventually(lambda: processors.consumer("default").running is False)
+    assert processors.statuses()[0].operation_id == "op-1"
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+
+
+class _FlipMembersAdmin:
+    """A reset side whose first members check is empty and whose second names a reader that rejoined."""
+
+    def __init__(self, inner: EventStoreAdmin) -> None:
+        self._inner = inner
+        self.calls = 0
+        self.applied = 0
+
+    async def plan(self, target: ResetTarget) -> list[ReplayRange]:
+        return await self._inner.plan(target)
+
+    async def members(self) -> list[str]:
+        self.calls += 1
+        if self.calls >= 2:
+            return ["a-reader"]
+        return list(await self._inner.members())
+
+    async def apply(self, ranges: Sequence[ReplayRange]) -> None:
+        self.applied += 1
+        await self._inner.apply(ranges)
+
+
+class _FlipMembersStore:
+    def __init__(self, inner: MemoryEventStore) -> None:
+        self._inner = inner
+        self.admin_instance: _FlipMembersAdmin | None = None
+
+    @property
+    def name(self) -> str:
+        return self._inner.name
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self._inner.capabilities
+
+    def supports(self, capability: Capability) -> bool:
+        return self._inner.supports(capability)
+
+    async def publish(self, event: OutgoingEvent) -> None:
+        await self._inner.publish(event)
+
+    async def subscribe(self, spec: SubscriptionSpec) -> EventStoreSubscription:
+        return await self._inner.subscribe(spec)
+
+    def admin(self, spec: SubscriptionSpec) -> EventStoreAdmin:
+        self.admin_instance = _FlipMembersAdmin(self._inner.admin(spec))
+        return self.admin_instance
+
+    def compare(self, a: str, b: str) -> int:
+        return self._inner.compare(a, b)
+
+
+async def test_a_reader_that_rejoins_between_the_plan_and_the_move_stops_the_reset(hub: FakeHub) -> None:
+    store = MemoryStore()
+    events = _FlipMembersStore(MemoryEventStore(segments=1))
+    app = new_app(
+        hub,
+        store=store,
+        event_store=events,
+        outbox_poll_interval=0.01,
+        _timings=_timings(),
+    )
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await _publish(app, "o-1")
+    await eventually(lambda: bool(store._data.outbox.rows))
+    event_id = next(iter(store._data.outbox.rows.values())).entry.id
+    await _await_marker(store, event_id)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    refused = await processors.reset.execute("default", "op-1", Earliest())
+    assert isinstance(refused, ResetRefused), refused
+    assert refused.code == "SUBSCRIBERS_ACTIVE"
+    assert "rejoined" in refused.message or "a-reader" in refused.message
+    assert "positions not moved" in refused.message
+    assert events.admin_instance is not None
+    assert events.admin_instance.applied == 0, "the positions moved while a reader was back"
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)

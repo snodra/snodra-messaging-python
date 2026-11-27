@@ -14,14 +14,18 @@ For every record the event store delivers:
 - **A parked key** (mode ``collection``): a record whose key has a letter already waiting is parked ``SEQUENCED``
   without running the handlers, so the key keeps its order; when its own letter exists already (parked before a crash),
   the delivery is a duplicate and is acknowledged.
+- **A replay** (a record inside a reset's range) records its stage-1 marker but runs only the handlers not registered
+  with ``replay=False``; a failure parks a dead letter marked as a replay. The range closes once the committed position
+  reaches its end, and the reset's poll removes it from ``processor_control``.
 
 A record is never acknowledged before its handling committed or its letter was written: a crash in between leaves the
 record to the next subscription of the same name, whose marker skips what was handled already. A subscription that fails
 is closed and joined again after a backoff (1 s doubling to 30 s), which starts over after a subscription delivered a
 record or lived 30 s before it failed.
 
-Pause and status are driven from :mod:`snodra._processors`: a pause pauses the subscription without leaving it, and the
-status is built from the counters and the subscription's own non-blocking reads.
+Pause, reset and status are driven from :mod:`snodra._processors`: a pause pauses the subscription without leaving it,
+a reset prepare finishes the record in hand (up to the handler drain) before leaving the subscription, and the status
+is built from the counters and the subscription's own non-blocking reads.
 
 See https://snodra.damoreira.com/docs/library-authors/writing-a-library/#level-3-processors (Processors) and
 https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/#the-rule.
@@ -232,7 +236,13 @@ class EventConsumer:
         self._started = True
         self._running = True
         self._stop_requested = False
-        return asyncio.create_task(self.run(), name=f"snodra:consumer:{self._processor}")
+        task = asyncio.create_task(self.run(), name=f"snodra:consumer:{self._processor}")
+        task.add_done_callback(self._ended)
+        return task
+
+    def _ended(self, task: asyncio.Task[None]) -> None:
+        """A task cancelled before its first step never runs its ``finally``: the status must still say stopped."""
+        self._running = False
 
     @property
     def handling(self) -> bool:

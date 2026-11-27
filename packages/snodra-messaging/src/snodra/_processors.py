@@ -98,7 +98,16 @@ class Processors:
         }
         self._versions: dict[str, int] = {name: 0 for name in self._names}
         self._unsupported: set[str] = set()  # processors whose message store has no processor_control
-        self.reset = ResetMachine(self, store, events, registry, clock)
+        self.reset = ResetMachine(
+            self,
+            store,
+            events,
+            registry,
+            clock,
+            execute_limit=timings.reset_execute_limit,
+            lease_extension=timings.reset_lease_extension,
+            finished_kept=timings.reset_finished_kept,
+        )
         self._consumer_tasks: dict[str, asyncio.Task[None]] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._poll_interval = timings.processor_control_poll
@@ -285,11 +294,16 @@ class Processors:
     async def _apply(self, processor: str, document: ProcessorControlState, *, initial: bool) -> None:
         """Applies one document: the pause, the lock that keeps the processor out of its subscription, its ranges."""
         consumer = self._consumers[processor]
+        version = self._versions[processor]
         now = self._clock()
+        held = await self.reset.converge_held(processor, document, now)
+        if self._versions[processor] != version:
+            # A reset action (or another change here) landed while the document was applied: its own fresh state wins,
+            # and this possibly stale document must not start the consumer under a new lock.
+            return
         if document.paused != consumer.paused:
             consumer.pause() if document.paused else consumer.resume()
             log.info("Processor %s %s (processor_control)", processor, "paused" if document.paused else "resumed")
-        held = await self.reset.converge_held(processor, document, now)
         operation = document.operation
         foreign = operation if operation is not None and operation.holds_at(now) and operation.id != held else None
         consumer.operation_id = held or ("" if foreign is None else foreign.id)
@@ -330,7 +344,8 @@ class Processors:
             else:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-            self._consumer_tasks.pop(processor, None)
+            if self._consumer_tasks.get(processor) is task:
+                self._consumer_tasks.pop(processor, None)
         elif not run and initial:
             # Started under a held lock: it never joins (and reports STOPPED with the operation).
             log.info(
@@ -339,8 +354,9 @@ class Processors:
                 self._consumers[processor].operation_id,
             )
 
-    async def converge(self, processor: str, *, initial: bool = False) -> None:
-        """Reads one processor's control document again and applies it, unless a change here overtook the read."""
+    async def converge(self, processor: str, *, initial: bool = False) -> bool:
+        """Reads one processor's control document again and applies it; whether it could (a failed read or a change
+        here that overtook it answers false)."""
         before = self._versions[processor]
         try:
             document = await self._store.control.get(processor)
@@ -348,10 +364,11 @@ class Processors:
             raise
         except Exception:
             log.warning("could not read the processor control document of %s", processor)
-            return
+            return False
         if self._versions[processor] != before:
-            return
+            return False
         await self._apply(processor, document, initial=initial)
+        return True
 
     async def _remove_passed(self, processor: str, now: int) -> None:
         """Removes the replay ranges this instance's subscription consumed past from its control document."""

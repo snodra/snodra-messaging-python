@@ -14,7 +14,7 @@ from dataclasses import replace
 from eventhelpers import OrderPlaced, delivery
 from fakehub import FakeHub
 from helpers import SCALED, eventually, new_app, processors_of
-from snodra import App, Earliest, MemoryEventStore, MemoryStore
+from snodra import App, Earliest, MemoryEventStore, MemoryStore, ProcessorControlStore
 from snodra._eventstore import ReplayRange, SegmentStatus
 from snodra._hubpb import hub_pb2
 from snodra._replay import in_replay, open_until, passed_ranges
@@ -241,3 +241,43 @@ async def _await_no_replay(store: MemoryStore) -> None:
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("the closed range was not removed from the control document")
         await asyncio.sleep(0.005)
+
+
+class _NoRemove:
+    """A control store that reports another instance removed the range (so the local drop must still happen)."""
+
+    def __init__(self, inner: ProcessorControlStore) -> None:
+        self._inner = inner
+
+    async def remove_range(self, processor: str, replay_range: ReplayRange, now_ms: int) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+async def test_a_range_removed_elsewhere_is_dropped_locally_too(hub: FakeHub) -> None:
+    app, store, _ = await _app(hub)
+    store.control = _NoRemove(store.control)  # type: ignore[assignment]
+    calls = 0
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        nonlocal calls
+        calls += 1
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await app.publish(OrderPlaced(order_id="o-1"), key="o-1")
+    await eventually(lambda: calls == 1)
+    event_id = await _event_id(store)
+    await _await_marker(store, event_id)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    assert isinstance(await processors.reset.execute("default", "op-1", Earliest()), ResetDone)
+    assert processors.consumer("default").replay_ranges
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+    await eventually(lambda: calls == 2)
+    await eventually(lambda: processors.consumer("default").replay_ranges == (), within=3.0)
+    assert processors.statuses()[0].replaying is False
+    assert (await store.control.get("default")).replay, "the document still names the range another instance removed"

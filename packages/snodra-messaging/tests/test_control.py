@@ -94,6 +94,16 @@ async def test_an_unknown_processor_a_missing_action_and_a_reset_are_refused(hub
     assert reply.refused.code == hub_pb2.CONTROL_REFUSAL_UNKNOWN_PROCESSOR
     assert "does not run" in reply.refused.message
 
+    # A blank operation id is checked by the machine, after the processor: an unknown processor is UNKNOWN_PROCESSOR
+    # (a too-short lease, checked first, would be INVALID).
+    await s.send(
+        hub_pb2.ServerMessage(
+            control=_control("reset_prepare", processor="audit", control_id="u-3", operation_id="", lease_ms=30_000)
+        )
+    )
+    reply = await s.recv_control_reply()
+    assert (reply.control_id, reply.refused.code) == ("u-3", hub_pb2.CONTROL_REFUSAL_UNKNOWN_PROCESSOR)
+
     # A malformed prepare is checked before the processor: INVALID even for one that does not run here.
     await s.send(
         hub_pb2.ServerMessage(

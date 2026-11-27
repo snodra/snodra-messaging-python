@@ -1,11 +1,13 @@
 """The hub's processor control: each ``ControlRequest`` acted on off the read loop, one per processor at a time.
 
-The hub asks an instance to pause or resume a processor or to work its dead letters (and, once the reset state machine
-lands, to reset or replay it). Every request is answered with exactly one ``ControlReply`` carrying the request's
-``control_id`` on the stream the request arrived on; the hub gives up after 10 s and drops a late reply. Handling never
-runs on the read loop: :meth:`ControlPlane.handle` only puts the request on its processor's queue and returns, so
-heartbeats and request dispatch keep flowing while an action waits on the message store. One worker per processor takes
-the actions one at a time, in arrival order, and every action is logged at INFO.
+The hub asks an instance to pause or resume a processor, to work its dead letters, or to run a reset (prepare, execute
+or finish, the leased state machine in :mod:`snodra._reset`). Every request is answered with exactly one
+``ControlReply`` carrying the request's ``control_id`` on the stream the request arrived on; the hub gives up after
+10 s (120 s for a reset execute) and drops a late reply. Handling never runs on the read loop:
+:meth:`ControlPlane.handle` only puts the request on its processor's queue and returns, so heartbeats and request
+dispatch keep flowing while an action waits on the message store. One worker per processor takes the actions one at a
+time, in arrival order, and every action is logged at INFO; a renewal of the operation an execute holds and a
+dead-letter list are answered beside the execute, and a dead-letter change during one is refused LOCKED at once.
 
 See https://snodra.damoreira.com/docs/library-authors/protocol/ ("Processor control").
 """
@@ -91,11 +93,10 @@ class ControlPlane:
     def handle(self, request: hub_pb2.ControlRequest, put: Put) -> None:
         """Hands a request to its processor's worker and returns at once (the work never runs on the read loop)."""
         processor = request.processor
-        if request.WhichOneof("action") == "reset_prepare" and (
-            not request.reset_prepare.operation_id.strip() or request.reset_prepare.lease_ms < MIN_LEASE_MS
-        ):
-            # The lease is checked before the processor, as the base does: a malformed prepare is INVALID even for a
-            # processor that does not run here.
+        if request.WhichOneof("action") == "reset_prepare" and request.reset_prepare.lease_ms < MIN_LEASE_MS:
+            # The lease is checked before the processor, as the base does: a too-short lease is INVALID even for a
+            # processor that does not run here. A blank operation id is checked by the machine (UNKNOWN_PROCESSOR for
+            # an unknown processor first, then INVALID).
             reply = _refused(
                 request.control_id,
                 hub_pb2.CONTROL_REFUSAL_INVALID,

@@ -251,7 +251,12 @@ class ResetMachine:
             return None
         if current.holds_at(now_ms) or self._executing.get(processor) == operation:
             return operation
-        if await self._store.control.expire(processor, operation, now_ms):
+        expired = await self._store.control.expire(processor, operation, now_ms)
+        if self._held.get(processor) != held:
+            # A prepare landed while the expiry was checked: the new operation owns the lock now, and this poll must
+            # neither drop it nor start the consumer under it.
+            return self.held(processor)
+        if expired:
             log.warning(
                 "The lease of reset operation %s on processor %s passed without a renewal: released it, "
                 "consuming again",
@@ -267,6 +272,7 @@ class ResetMachine:
 
     async def prepare(self, processor: str, operation: str, lease_ms: int) -> ResetReply:
         """Takes the processor's lock for ``operation`` and leaves its subscription (a renewal of the held one)."""
+        operation = operation.strip()
         if not processor or not self._processors.runs(processor):
             return ResetRefused("UNKNOWN_PROCESSOR", f"processor {processor} does not run on this instance")
         if not operation.strip() or lease_ms < MIN_LEASE_MS:
@@ -275,13 +281,15 @@ class ResetMachine:
             return self._unsupported(processor)
         if self.ended_recently(processor, operation):
             return ResetRefused("NOT_PREPARED", f"operation {operation} already finished on this instance")
+        self._processors.bump(processor)
         now = self._clock()
         held = self._held.get(processor)
         if held is not None and held[0] == operation:
             # A renewal: the lock must still be this operation's; a late renewal never takes a free lock again.
             if await self._store.control.extend(processor, operation, now + lease_ms, now):
                 self._held[processor] = (operation, lease_ms)
-                self._processors.bump(processor)
+                self._processors.consumer(processor).operation_id = operation
+                await self._processors.set_running(processor, False, why=f"reset operation {operation} holds its lock")
                 return ResetOk("lease renewed")
             self._held.pop(processor, None)
             self._remember_ended(processor, operation, held[1])
@@ -315,6 +323,7 @@ class ResetMachine:
 
     async def execute(self, processor: str, operation: str, target: ResetTarget) -> ResetReply:
         """Plans and applies the reset of ``operation``, its reset handlers first and its positions last."""
+        operation = operation.strip()
         if not processor or not self._processors.runs(processor):
             return ResetRefused("UNKNOWN_PROCESSOR", f"processor {processor} does not run on this instance")
         if not operation.strip():
@@ -324,6 +333,7 @@ class ResetMachine:
         held = self._held.get(processor)
         if held is None or held[0] != operation:
             return await self._not_prepared(processor, operation)
+        self._processors.bump(processor)
         listed = target.positions if isinstance(target, Positions) else ()
         if isinstance(target, Positions) and (not listed or len({segment for segment, _ in listed}) != len(listed)):
             return ResetRefused("INVALID", "the positions target lists no segment or names one twice")
@@ -438,6 +448,15 @@ class ResetMachine:
             if lost is not None:
                 return changed.told(ResetRefused("FAILED", lost))
             try:
+                # A reader may have rejoined since the plan: check again immediately before the positions move.
+                members = await admin.members()
+                if members:
+                    return changed.told(
+                        ResetRefused(
+                            "SUBSCRIBERS_ACTIVE",
+                            f"subscription {spec.name} still has {len(members)} subscriber(s): {', '.join(members)}",
+                        )
+                    )
                 await admin.apply(plan)
             except Unsupported as error:
                 return changed.told(self._unsupported(processor, error))
@@ -509,31 +528,58 @@ class ResetMachine:
     # ---- finish -----------------------------------------------------------------------------------------------
 
     async def finish(self, processor: str, operation: str) -> ResetReply:
-        """Releases ``operation``'s lock and consumes again (still paused if the document says so)."""
+        """Releases ``operation``'s lock and consumes again (still paused if the document says so). A finish for an
+        operation this instance held that another operation took over is ``NOT_PREPARED``, never "consuming again"."""
+        operation = operation.strip()
         if not processor or not self._processors.runs(processor):
             return ResetRefused("UNKNOWN_PROCESSOR", f"processor {processor} does not run on this instance")
-        if not operation.strip():
+        if not operation:
             return ResetRefused("INVALID", "a finish needs an operation id")
+        self._processors.bump(processor)
         held = self._held.get(processor)
         lease_ms = 0 if held is None or held[0] != operation else held[1]
         self._remember_ended(processor, operation, lease_ms)
         if held is not None and held[0] == operation:
-            await self._store.control.release(processor, operation, self._clock())
-            self._held.pop(processor, None)
-            self._processors.bump(processor)
-            await self._processors.converge(processor, initial=False)
-            log.info("Processor %s finished reset operation %s: released, consuming again", processor, operation)
-            return ResetOk("released, consuming again")
+            released = await self._store.control.release(processor, operation, self._clock())
+            if self._held.get(processor) == held:
+                self._held.pop(processor, None)
+            if not released:
+                takeover = await self._takeover(processor, operation)
+                if takeover is not None:
+                    return takeover
+            applied = await self._processors.converge(processor, initial=False)
+            log.info("Processor %s finished reset operation %s: released", processor, operation)
+            return ResetOk("released, consuming again" if applied else "released; consuming once the lock is read back")
         document = await self._store.control.get(processor)
         current = document.operation
-        if current is None or not current.holds_at(self._clock()):
+        now = self._clock()
+        if current is None or not current.holds_at(now):
+            if current is not None and current.id == operation:
+                # The document kept an expired entry of this operation: release it, as the base does.
+                await self._store.control.release(processor, operation, now)
             await self._processors.converge(processor, initial=False)
             return ResetOk("no operation holds the lock")
         if current.id == operation:
-            await self._store.control.release(processor, operation, self._clock())
-            self._processors.bump(processor)
-            await self._processors.converge(processor, initial=False)
-            return ResetOk("released, consuming again")
+            released = await self._store.control.release(processor, operation, self._clock())
+            if not released:
+                takeover = await self._takeover(processor, operation)
+                if takeover is not None:
+                    return takeover
+            applied = await self._processors.converge(processor, initial=False)
+            return ResetOk("released, consuming again" if applied else "released; consuming once the lock is read back")
+        return ResetRefused(
+            "NOT_PREPARED",
+            f"operation {current.id} holds the lock of processor {processor}, not {operation}",
+        )
+
+    async def _takeover(self, processor: str, operation: str) -> ResetRefused | None:
+        """The refusal naming the operation that took the lock when this finish's release found another one; ``None``
+        when nothing (unexpired) holds it."""
+        document = await self._store.control.get(processor)
+        current = document.operation
+        if current is None or not current.holds_at(self._clock()) or current.id == operation:
+            return None
+        await self._processors.converge(processor, initial=False)
         return ResetRefused(
             "NOT_PREPARED",
             f"operation {current.id} holds the lock of processor {processor}, not {operation}",

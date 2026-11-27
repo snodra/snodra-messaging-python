@@ -437,12 +437,15 @@ async def _wait_members(admin: EventStoreAdmin, reader: Reader | None, want: int
             await asyncio.sleep(SLICE)
 
 
-def _in_range(events: EventStore, replay: ReplayRange, position: str) -> bool:
-    """Whether ``position`` is inside ``replay``'s ``[start, until)`` by the event store's order."""
+def _in_range(events: EventStore, replay: ReplayRange, delivery: Delivery, source: str) -> bool:
+    """Whether ``delivery`` (its segment and position) is inside ``replay``'s ``[start, until)`` of ``source`` by the
+    event store's order."""
     return (
-        bool(replay.until)
-        and events.compare(replay.start, position) <= 0
-        and events.compare(position, replay.until) < 0
+        replay.source == source
+        and replay.segment == delivery.segment
+        and bool(replay.until)
+        and events.compare(replay.start, delivery.position) <= 0
+        and events.compare(delivery.position, replay.until) < 0
     )
 
 
@@ -461,9 +464,9 @@ async def replay_from_earliest_redelivers_history(kit: EventStoreKit) -> None:
         await first.until("the events delivered", lambda r: r.has_all(all_ids))
         delivered = first.mine(all_ids)
         await _wait_members(admin, first, 1)
-        earliest = await _bounded("plan earliest", admin.plan(Earliest()))
+        reading = await _bounded("plan earliest", admin.plan(Earliest()))
         try:
-            await _bounded("apply with a subscriber", admin.apply(earliest))
+            await _bounded("apply with a subscriber", admin.apply(reading))
         except SubscribersActive:
             pass
         else:
@@ -471,8 +474,10 @@ async def replay_from_earliest_redelivers_history(kit: EventStoreKit) -> None:
     finally:
         await first.close()
     await _wait_members(admin, None, 0)
+    # The plan the reset moves with is taken after the reader left: a plan made while it read is stale.
+    earliest = await _bounded("plan earliest after the reader left", admin.plan(Earliest()))
     for delivery in delivered:
-        assert any(_in_range(events, replay, delivery.position) for replay in earliest), (
+        assert any(_in_range(events, replay, delivery, kit.source) for replay in earliest), (
             f"earliest replays {delivery.position} of segment {delivery.segment}: {earliest}"
         )
     latest = await _bounded("plan latest", admin.plan(Latest()))
@@ -512,7 +517,8 @@ async def replay_from_earliest_redelivers_history(kit: EventStoreKit) -> None:
         else:
             raise AssertionError(f"{target!r} is invalid")
     await _bounded("apply earliest", admin.apply(earliest))
-    second = await Reader.join(events, spec)
+    # A fresh instance, not the one the plan was made with: a reset that only an in-process cache carries must fail.
+    second = await Reader.join(kit.instance(), spec)
     try:
         await second.until("the acknowledged events replayed", lambda r: r.has_all(all_ids))
     finally:

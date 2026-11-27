@@ -41,3 +41,4 @@ def test_the_event_timings() -> None:
     assert (t.event_handler_backoff, t.event_resubscribe_min, t.event_resubscribe_max) == (1.0, 1.0, 30.0)
     assert t.event_resubscribe_stable == 30.0
     assert (t.processor_control_poll, t.dead_letter_sample, t.dead_letter_publish_timeout) == (5.0, 30.0, 30.0)
+    assert (t.reset_execute_limit, t.reset_lease_extension, t.reset_finished_kept) == (120.0, 10.0, 60.0)

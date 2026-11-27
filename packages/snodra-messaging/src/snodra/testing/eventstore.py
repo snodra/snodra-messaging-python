@@ -17,6 +17,9 @@ a message store (for the at-least-once check)::
 - The checks run one after the other, each on subscription names of its own; a new name starts at the earliest
   position, so each check reads what the earlier ones appended and looks only at its own events (by their ``id``
   header). Every check is public, so a failing one can be run by itself on an :class:`EventStoreKit`.
+- ``level=2`` runs the nine level-2 checks; ``level=3`` runs them and the six level-3 capability checks in the form the
+  store declares. A level-3 store passes ``level=3``; the level-3 form is also exported as
+  :func:`~snodra.testing.eventstore.run_event_store_l3_conformance`.
 - The kit waits at most a minute for what the event store does in the background (an assignment, a delivery), and a
   publish, subscribe, close or admin call that does not answer fails the check naming the step.
 
@@ -385,9 +388,14 @@ async def run_event_store_l3_conformance(
     open_store: Callable[[], EventStore],
     store: MarkerStore,
 ) -> None:
-    """Runs the level-3 capability checks by name (the form each capability declares); the first failing check raises
-    :class:`AssertionError` naming itself and the event store. See :func:`run_event_store_conformance` for the
-    arguments."""
+    """The level-3 form of :func:`run_event_store_conformance` (the nine level-2 checks and the six capability checks
+    in the form each store declares). Kept as the named entry point; ``level=3`` is the same run."""
+    await run_event_store_conformance(source, open_store, store, level=3)
+
+
+def _l3_checks(events: EventStore) -> list[Callable[[EventStoreKit], Awaitable[None]]]:
+    """The level-3 checks one run uses: each capability's positive form when the store declares it, its
+    absent-capability form otherwise (and the browser difference always)."""
     from snodra._eventstore import Capability
     from snodra.testing.checks import (
         admin_without_replay_is_unsupported,
@@ -398,10 +406,7 @@ async def run_event_store_l3_conformance(
         replay_from_earliest_redelivers_history,
     )
 
-    kit = EventStoreKit(source, open_store, store)
-    events = open_store()
-    name = events.name
-    checks = []
+    checks: list[Callable[[EventStoreKit], Awaitable[None]]] = []
     if events.supports(Capability.REPLAY):
         checks.append(replay_from_earliest_redelivers_history)
     else:
@@ -413,27 +418,31 @@ async def run_event_store_l3_conformance(
     if events.supports(Capability.NATIVE_DEAD_LETTER):
         checks.append(dead_letter_source_receives)
     checks.append(no_browser_without_capability)
-    for check in checks:
-        try:
-            await check(kit)
-        except Exception as error:
-            raise AssertionError(
-                f"event store conformance check `{check.__name__}` failed on event store `{name}`: {error}"
-            ) from error
+    return checks
 
 
 async def run_event_store_conformance(
     source: str,
     open_store: Callable[[], EventStore],
     store: MarkerStore,
+    *,
+    level: int = 2,
 ) -> None:
-    """Runs every check by name; the first failing check raises :class:`AssertionError` naming itself and the event
-    store. See the module docstring for ``source``, ``open_store`` and ``store``."""
+    """Runs the checks by name; the first failing check raises :class:`AssertionError` naming itself and the event
+    store. ``level=2`` runs the nine level-2 checks; ``level=3`` runs them and the six level-3 capability checks in the
+    form the store declares (a level-3 store must pass both). See the module docstring for ``source``, ``open_store``
+    and ``store``."""
+    if level not in (2, 3):
+        raise ValueError(f"the event-store kit runs level 2 or 3, not {level}")
     kit = EventStoreKit(source, open_store, store)
-    name = open_store().name
+    events = open_store()
+    name = events.name
     from snodra.testing.checks import EVENT_STORE_CHECKS
 
-    for check in EVENT_STORE_CHECKS:
+    checks: list[Callable[[EventStoreKit], Awaitable[None]]] = list(EVENT_STORE_CHECKS)
+    if level >= 3:
+        checks += _l3_checks(events)
+    for check in checks:
         try:
             await check(kit)
         except Exception as error:

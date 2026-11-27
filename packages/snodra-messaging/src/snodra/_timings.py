@@ -89,6 +89,12 @@ class Timings:
     """How often a processor's dead-letter count is sampled for its status (and after a letter is parked)."""
     dead_letter_publish_timeout: float
     """Mode ``event-store``: the longest a dead letter's publish may take before the record is redelivered."""
+    reset_execute_limit: float
+    """A reset's execute stops its own lease after this long without a renewal (the hub's reset timeout)."""
+    reset_lease_extension: float
+    """An executing reset renews its lease at least this often (and at most a third of the lease)."""
+    reset_finished_kept: float
+    """An ended reset operation is remembered at least this long (twice its lease when longer)."""
     dns_refresh: float
     """How often a ``dns:///`` target is resolved again."""
     dns_drain_limit: float
@@ -134,6 +140,9 @@ DEFAULT_TIMINGS: Final = Timings(
     processor_control_poll=5.0,
     dead_letter_sample=30.0,
     dead_letter_publish_timeout=30.0,
+    reset_execute_limit=120.0,
+    reset_lease_extension=10.0,
+    reset_finished_kept=60.0,
     dns_refresh=30.0,
     dns_drain_limit=65.0,
 )

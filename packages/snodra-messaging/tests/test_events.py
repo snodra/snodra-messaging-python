@@ -331,6 +331,12 @@ async def test_reset_handlers_run_per_processor_and_are_checked(hub: FakeHub) ->
         async def two(first: ResetContext, second: ResetContext) -> None:
             pass
 
+    with pytest.raises(TypeError, match="ResetContext or nothing"):
+
+        @app.reset_handler
+        async def keyword_only(*, context: ResetContext) -> None:
+            pass
+
     with pytest.raises(TypeError, match="async def"):
 
         @app.reset_handler  # type: ignore[type-var]
