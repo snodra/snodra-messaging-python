@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fakehub import FakeHub, FakeStream, ack
 from snodra import App, Codec, Settings, Telemetry, message_type
 from snodra._hubpb import hub_pb2
+from snodra._processors import Processors
 from snodra._timings import DEFAULT_TIMINGS, Timings
 
 SCALED: Final = replace(
@@ -35,6 +36,8 @@ SCALED: Final = replace(
     handler_drain=1.0,
     close_wait=0.2,
     status_interval=300.0,
+    processor_control_poll=0.05,
+    dead_letter_sample=0.1,
     dns_refresh=300.0,
 )
 """The shipped timings, shortened for the tests. The status reports and a DNS re-resolution are pushed far away: a test
@@ -111,6 +114,12 @@ async def stop_apps() -> None:
     finally:
         _apps.clear()
     assert_no_library_tasks()
+
+
+def processors_of(app: App) -> Processors:
+    """The app's event processors (asserting it built them)."""
+    assert app._processors is not None, "the app runs no event processor"
+    return app._processors
 
 
 def library_tasks() -> set[str]:

@@ -100,6 +100,14 @@ class Settings:
     """Every instance reads its event processors' subscriptions (``SNODRA_CONSUMER_ENABLED``)."""
     consumer_max_attempts: int = 5
     """Event handler invocations per delivered record in all (``SNODRA_CONSUMER_MAX_ATTEMPTS``)."""
+    dead_letter_mode: str = "collection"
+    """Where an event processor puts a record that exhausted its attempts
+    (``SNODRA_EVENTS_DEAD_LETTER_MODE``): ``collection`` (the message store's dead letters, the default),
+    ``event-store`` (the event store's ``<source>.dlt``, needing the capability ``native-dead-letter``) or ``log`` (log
+    it and skip)."""
+    dead_letter_retention: float = 30 * 24 * 60 * 60.0
+    """How long a dead letter is kept, in seconds (``SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS``, 30 days by default, at
+    least 1 s): a letter's ``expire_at_ms``; the store's retention removes it."""
     store_init_schema: bool = True
     """The app prepares the message store's schema at start (``SNODRA_STORE_INIT_SCHEMA``, true by default); when
     false it checks the schema the service applies itself instead."""
@@ -213,6 +221,17 @@ class Settings:
             value = getattr(self, name)
             if not _is_number(value) or not math.isfinite(value) or value <= 0:
                 raise ConfigurationError(f"{name} ({variable}) must be a positive number of seconds, got {value!r}")
+        if self.dead_letter_mode not in ("collection", "event-store", "log"):
+            raise ConfigurationError(
+                "dead_letter_mode (SNODRA_EVENTS_DEAD_LETTER_MODE) must be collection, event-store or log, "
+                f"got {self.dead_letter_mode!r}"
+            )
+        retention = self.dead_letter_retention
+        if not _is_number(retention) or not math.isfinite(retention) or retention < 1:
+            raise ConfigurationError(
+                "dead_letter_retention (SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS) must be at least 1 s, "
+                f"got {retention!r}"
+            )
         if self.outbox_lease <= OUTBOX_SEND_TIMEOUT:
             raise ConfigurationError(
                 f"outbox_lease (SNODRA_OUTBOX_LEASE_MS) must be longer than a send ({OUTBOX_SEND_TIMEOUT:g} s), "
@@ -371,6 +390,10 @@ class Settings:
             values["consumer_enabled"] = _env_bool("SNODRA_CONSUMER_ENABLED", v)
         if (v := get("SNODRA_CONSUMER_MAX_ATTEMPTS")) is not None:
             values["consumer_max_attempts"] = _env_positive_int("SNODRA_CONSUMER_MAX_ATTEMPTS", v)
+        if (v := get("SNODRA_EVENTS_DEAD_LETTER_MODE")) is not None:
+            values["dead_letter_mode"] = v.lower()
+        if (v := get("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS")) is not None:
+            values["dead_letter_retention"] = _env_positive_int("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", v) / 1000
         if (v := get("SNODRA_STORE_INIT_SCHEMA")) is not None:
             values["store_init_schema"] = _env_bool("SNODRA_STORE_INIT_SCHEMA", v)
         grant = _env_credentials(get, values)

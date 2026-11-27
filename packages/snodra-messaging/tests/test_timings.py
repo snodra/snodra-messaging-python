@@ -40,3 +40,4 @@ def test_the_event_timings() -> None:
     t = DEFAULT_TIMINGS
     assert (t.event_handler_backoff, t.event_resubscribe_min, t.event_resubscribe_max) == (1.0, 1.0, 30.0)
     assert t.event_resubscribe_stable == 30.0
+    assert (t.processor_control_poll, t.dead_letter_sample) == (5.0, 30.0)

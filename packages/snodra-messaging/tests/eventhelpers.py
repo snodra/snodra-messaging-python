@@ -25,7 +25,16 @@ from snodra._eventstore import (
     SubscriptionEvent,
     SubscriptionSpec,
 )
-from snodra._store import OutboxEntry, OutboxStore, ProcessedMarker, ProcessedStore, Tx
+from snodra._store import (
+    DeadLetter,
+    DeadLetterError,
+    DeadLetterReason,
+    OutboxEntry,
+    OutboxStore,
+    ProcessedMarker,
+    ProcessedStore,
+    Tx,
+)
 
 
 @message_type("orders.OrderPlaced")
@@ -111,7 +120,10 @@ class ScriptedSubscription:
 
     queue: asyncio.Queue[SubscriptionEvent | BaseException] = field(default_factory=asyncio.Queue)
     acks: list[tuple[str, str]] = field(default_factory=list)
+    redeliveries: list[tuple[str, str]] = field(default_factory=list)
     closes: int = 0
+    pause_calls: int = 0
+    resume_calls: int = 0
     on_ack: Callable[[ScriptedSubscription, str, str], Any] | None = None
     _paused: bool = False
 
@@ -129,12 +141,14 @@ class ScriptedSubscription:
                 await outcome
 
     async def redeliver(self, segment: str, position: str) -> None:
-        pass
+        self.redeliveries.append((segment, position))
 
     def pause(self) -> None:
+        self.pause_calls += 1
         self._paused = True
 
     def resume(self) -> None:
+        self.resume_calls += 1
         self._paused = False
 
     def segments(self) -> list[SegmentStatus]:
@@ -215,6 +229,50 @@ def delivery(
         headers={name: value for name, value in all_headers.items() if value is not None},
         payload=payload,
         timestamp_ms=0,
+    )
+
+
+def dead_letter(
+    position: str,
+    *,
+    processor: str = "default",
+    source: str = "snodra.events",
+    segment: str = "0",
+    key: str | None = "k1",
+    event_id: str | None = None,
+    event_type: str | None = "orders.OrderPlaced",
+    reason: DeadLetterReason = DeadLetterReason.HANDLER_FAILED,
+    payload: bytes = b'{"orderId":"o-1"}',
+    error: DeadLetterError | None = None,
+    blocked_by: str | None = None,
+    attempts: int = 1,
+    parked_at_ms: int = 1_793_700_000_000,
+) -> DeadLetter:
+    """A letter a test parks directly; its id is ``<processor>:<source>:<segment>:<position>``."""
+    return DeadLetter(
+        id=f"{processor}:{source}:{segment}:{position}",
+        processor=processor,
+        source=source,
+        segment=segment,
+        position=position,
+        key=key,
+        event_id=event_id if event_id is not None else f"e-{position}",
+        event_type=event_type,
+        headers={
+            "type": event_type or "",
+            "id": event_id if event_id is not None else f"e-{position}",
+            "correlationId": "c-1",
+            "userId": "u-1",
+        },
+        payload=payload,
+        reason=reason,
+        error=error or DeadLetterError.new("RuntimeError", "boom"),
+        blocked_by=blocked_by,
+        attempts=attempts,
+        parked_at_ms=parked_at_ms,
+        last_attempt_at_ms=parked_at_ms,
+        expire_at_ms=parked_at_ms + 30 * 24 * 60 * 60 * 1000,
+        replay=False,
     )
 
 

@@ -11,8 +11,9 @@ runs and single-process demos, with no database.
 - **The outbox and the processed events** implement their level-2 contract: atomic claims under a lease in
   ``(created_at_ms, seq)`` order, pending counts, purge of what was sent, payload refusal and one marker per id, plus
   the wake-up of the relay after every committed append.
-- **The level-3 and level-4 ports** (dead letters, processor control, external calls, sagas) are present and report
-  :class:`~snodra._store.Unsupported`; an official add-on implements them by level 4.
+- **The level-3 ports** (dead letters and processor control) are implemented here (mode ``collection``); the level-4
+  ports (external calls and sagas) are present and report :class:`~snodra._store.Unsupported`; an official add-on
+  implements them by level 4. A retry's letter deletion joins the record's transaction.
 - **Times** the store stamps itself (a send, a lease) are the application's clock (the wall clock until
   :meth:`~snodra._store.MessageStore.use_clock` is called), so tests can advance it.
 - **Not durable and one process only**: everything is lost when the process ends.
@@ -33,10 +34,13 @@ from typing import Final
 
 from snodra._eventstore import ProcessedMarker, ReplayRange
 from snodra._store import (
+    RESET_KIND,
     AppendListener,
     Conflict,
+    ControlOperation,
     DeadLetter,
     DeadLetterError,
+    DeadLetterReason,
     DeadLetterStore,
     DeadLetterSummary,
     DeadlineDocument,
@@ -121,6 +125,7 @@ class _Data:
 
     outbox: _Table[_OutboxRow] = field(default_factory=_Table)
     processed: _Table[_ProcessedRow] = field(default_factory=_Table)
+    dead: _Table[DeadLetter] = field(default_factory=_Table)
     reserved: dict[tuple[str, str], int] = field(default_factory=dict)
     version: int = 0
     next_tx: int = 1
@@ -138,6 +143,7 @@ class _MemoryTx:
     reserved: list[tuple[str, str]] = field(default_factory=list)
     outbox: _Overlay[_OutboxRow] = field(default_factory=_Overlay)
     processed: _Overlay[_ProcessedRow] = field(default_factory=_Overlay)
+    dead: _Overlay[DeadLetter] = field(default_factory=_Overlay)
 
     def __del__(self) -> None:
         """A transaction dropped without a commit releases its reservations, as a database's connection does."""
@@ -166,7 +172,7 @@ class MemoryStore:
         self._next_listener = 0
         self.outbox: OutboxStore = _MemoryOutbox(self)
         self.processed: ProcessedStore = _MemoryProcessed(self)
-        self.dead_letters: DeadLetterStore = _DeadLetters()
+        self.dead_letters: DeadLetterStore = _DeadLetters(self)
         self.control: ProcessorControlStore = _Control()
         self.external: ExternalCallStore = _External()
         self.sagas = SagaStores(
@@ -207,6 +213,7 @@ class MemoryStore:
                 raise Conflict("write conflict: the transaction met a record another transaction is writing")
             self._check_stale("outbox", self._data.outbox, inner.outbox)
             self._check_stale("processed", self._data.processed, inner.processed)
+            self._check_stale("dead", self._data.dead, inner.dead)
             self._apply(inner)
             committed = True
         finally:
@@ -224,6 +231,7 @@ class MemoryStore:
         inner.ended = True
         inner.outbox.writes.clear()
         inner.processed.writes.clear()
+        inner.dead.writes.clear()
         self._release(inner)
 
     # ---- what the stores use -------------------------------------------------------------------
@@ -362,6 +370,7 @@ class MemoryStore:
         tx.ended = True
         tx.outbox.writes.clear()
         tx.processed.writes.clear()
+        tx.dead.writes.clear()
         self._release(tx)
 
     # ---- transactions --------------------------------------------------------------------------
@@ -382,12 +391,15 @@ class MemoryStore:
         overlay: _Overlay[T] | None,
         tx: _MemoryTx | None,
         key: str,
-        value: T,
+        value: T | None,
     ) -> None:
         """Writes ``value`` as ``key``, committed at once or in ``tx`` (reserving the record)."""
         if tx is None or overlay is None:
             self._data.version += 1
-            table.rows[key] = value
+            if value is None:
+                table.rows.pop(key, None)
+            else:
+                table.rows[key] = value
             table.versions[key] = self._data.version
             return
         self._reserve(tx, kind, key)
@@ -418,6 +430,7 @@ class MemoryStore:
         """Commits ``tx``'s writes, assigning each a fresh version."""
         self._apply_table(self._data.outbox, tx.outbox)
         self._apply_table(self._data.processed, tx.processed)
+        self._apply_table(self._data.dead, tx.dead)
 
     def _apply_table[T](self, table: _Table[T], overlay: _Overlay[T]) -> None:
         for key, write in overlay.writes.items():
@@ -505,7 +518,26 @@ class _MemoryProcessed:
         return self._store.processed_exists(marker_id)
 
     async def delete_markers(self, processor: str, ranges: Sequence[ReplayRange]) -> int:
-        raise _refuse("delete_markers", 3)
+        """Deletes the stage-1 markers of ``processor`` in ``ranges`` (positions by value, then text)."""
+
+        def in_range(marker_id: str, marker: _ProcessedRow, replay_range: ReplayRange) -> bool:
+            found = marker.marker
+            position = found.position
+            if position is None or found.processor != processor:
+                return False
+            if found.source != replay_range.source or found.segment != replay_range.segment:
+                return False
+            return _position_key(replay_range.start) <= _position_key(position) < _position_key(replay_range.until)
+
+        gone = [
+            marker_id
+            for marker_id, row in self._store._data.processed.rows.items()
+            if any(in_range(marker_id, row, replay_range) for replay_range in ranges)
+        ]
+        for marker_id in gone:
+            del self._store._data.processed.rows[marker_id]
+            self._store._bump(self._store._data.processed, marker_id)
+        return len(gone)
 
     async def purge(self, before_ms: int) -> int:
         return self._store.purge_processed(before_ms)
@@ -515,69 +547,231 @@ def _refuse(feature: str, level: int) -> Unsupported:
     return Unsupported(f"{feature} in the in-memory message store (level {level})")
 
 
+def _position_key(position: str) -> tuple[int, int | str]:
+    """A position's order in the in-memory store: canonical decimal positions by value, then every other by text (as the
+    event stores of the suite name their positions)."""
+    if (
+        position
+        and all("0" <= char <= "9" for char in position)
+        and (len(position) == 1 or not position.startswith("0"))
+    ):
+        return (0, int(position))
+    return (1, position)
+
+
+def _copy_letter(letter: DeadLetter) -> DeadLetter:
+    """A letter copy the caller cannot change behind the store's back."""
+    return replace(letter, headers=dict(letter.headers), payload=bytes(letter.payload))
+
+
 class _DeadLetters:
-    """The dead letters, implemented from level 3."""
+    """The dead letters (mode ``collection``) of :class:`MemoryStore`: every write is its own, except a retry's
+    :meth:`delete_in`, which joins the message store's transaction."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    def _rows(self) -> dict[str, DeadLetter]:
+        return self._store._data.dead.rows
+
+    def _current(self, letter: str, tx: _MemoryTx | None) -> DeadLetter | None:
+        """The letter as ``tx`` sees it (a delete in its overlay counts as gone)."""
+        if tx is None:
+            return self._rows().get(letter)
+        write = tx.dead.writes.get(letter)
+        if write is not None:
+            return write.value
+        return self._rows().get(letter)
 
     async def park(self, letter: DeadLetter) -> Parked:
-        raise _refuse("dead_letters", 3)
+        if letter.id in self._rows():
+            return Parked.ALREADY
+        self._store._write("dead", self._store._data.dead, None, None, letter.id, _copy_letter(letter))
+        return Parked.NEW
 
     async def head(self, processor: str, key: str) -> str | None:
-        raise _refuse("dead_letters", 3)
+        candidates = [
+            row
+            for row in self._rows().values()
+            if row.processor == processor and row.key == key and row.reason is not DeadLetterReason.INVALID
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda row: (_position_key(row.position), row.id)).id
 
     async def earlier(self, processor: str, key: str, position: str) -> str | None:
-        raise _refuse("dead_letters", 3)
+        here = _position_key(position)
+        candidates = [
+            row
+            for row in self._rows().values()
+            if row.processor == processor
+            and row.key == key
+            and row.reason is not DeadLetterReason.INVALID
+            and _position_key(row.position) < here
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda row: (_position_key(row.position), row.id)).id
 
     async def parked_keys(self, processor: str, source: str, segments: Sequence[str]) -> set[str]:
-        raise _refuse("dead_letters", 3)
+        wanted = set(segments)
+        return {
+            row.key
+            for row in self._rows().values()
+            if row.processor == processor
+            and row.source == source
+            and row.segment in wanted
+            and row.key is not None
+            and row.reason is not DeadLetterReason.INVALID
+        }
 
     async def get(self, letter: str) -> DeadLetter | None:
-        raise _refuse("dead_letters", 3)
+        return self._rows().get(letter)
 
     async def list(self, processor: str | None = None, limit: int | None = None) -> builtins.list[DeadLetter]:
-        raise _refuse("dead_letters", 3)
+        rows = [row for row in self._rows().values() if processor is None or row.processor == processor]
+        rows.sort(key=lambda row: (row.parked_at_ms, row.id))
+        if limit is not None:
+            rows = rows[: max(0, limit)]
+        return [_copy_letter(row) for row in rows]
 
     async def summaries(self, processor: str) -> builtins.list[DeadLetterSummary]:
-        raise _refuse("dead_letters", 3)
+        rows = [row for row in self._rows().values() if row.processor == processor]
+        rows.sort(key=lambda row: (_position_key(row.position), row.id))
+        return [
+            DeadLetterSummary(
+                id=row.id,
+                key=row.key,
+                position=row.position,
+                reason=row.reason,
+                parked_at_ms=row.parked_at_ms,
+            )
+            for row in rows
+        ]
 
     async def count(self, processor: str | None = None) -> int:
-        raise _refuse("dead_letters", 3)
+        return sum(1 for row in self._rows().values() if processor is None or row.processor == processor)
 
     async def delete(self, letter: str) -> bool:
-        raise _refuse("dead_letters", 3)
+        if letter not in self._rows():
+            return False
+        self._store._write("dead", self._store._data.dead, None, None, letter, None)
+        return True
 
     async def delete_in(self, letter: str, *, tx: Tx | None = None) -> bool:
-        raise _refuse("dead_letters", 3)
+        inner = self._store.resolve(tx)
+        if self._current(letter, inner) is None:
+            return False
+        self._store._write("dead", self._store._data.dead, None if inner is None else inner.dead, inner, letter, None)
+        return True
 
     async def record_failure(self, letter: str, error: DeadLetterError, now_ms: int) -> bool:
-        raise _refuse("dead_letters", 3)
+        row = self._rows().get(letter)
+        if row is None:
+            return False
+        self._store._write(
+            "dead",
+            self._store._data.dead,
+            None,
+            None,
+            letter,
+            replace(
+                row,
+                attempts=row.attempts + 1,
+                error=error,
+                last_attempt_at_ms=now_ms,
+                reason=DeadLetterReason.HANDLER_FAILED,
+                blocked_by=None,
+            ),
+        )
+        return True
 
 
 class _Control:
-    """The processor control state, implemented from level 3."""
+    """The processor control state of :class:`MemoryStore`: one document per processor, every write its own."""
+
+    def __init__(self) -> None:
+        self._states: dict[str, ProcessorControlState] = {}
+
+    def _get(self, processor: str) -> ProcessorControlState:
+        return self._states.get(processor, ProcessorControlState(processor))
+
+    def _put(self, state: ProcessorControlState) -> None:
+        self._states[state.processor] = state
 
     async def get(self, processor: str) -> ProcessorControlState:
-        raise _refuse("processor control", 3)
+        return self._get(processor)
 
     async def set_paused(self, processor: str, paused: bool, by: str, now_ms: int) -> None:
-        raise _refuse("processor control", 3)
+        state = self._get(processor)
+        self._put(
+            replace(
+                state,
+                paused=paused,
+                paused_at_ms=now_ms if paused else None,
+                paused_by=by if paused else None,
+                updated_at_ms=now_ms,
+            )
+        )
 
     async def lock(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> Locked:
-        raise _refuse("processor control", 3)
+        state = self._get(processor)
+        held = state.operation
+        if held is not None and held.id == operation:
+            self._put(replace(state, operation=replace(held, lease_until_ms=lease_until_ms), updated_at_ms=now_ms))
+            return Locked.was_taken()
+        if held is not None and held.holds_at(now_ms):
+            return Locked.held(held)
+        prepared = now_ms if held is None or held.id != operation else held.prepared_at_ms
+        self._put(
+            replace(
+                state,
+                operation=ControlOperation(operation, RESET_KIND, lease_until_ms, prepared),
+                updated_at_ms=now_ms,
+            )
+        )
+        return Locked.was_taken()
 
     async def extend(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:
-        raise _refuse("processor control", 3)
+        state = self._get(processor)
+        held = state.operation
+        if held is None or held.id != operation:
+            return False
+        self._put(replace(state, operation=replace(held, lease_until_ms=lease_until_ms), updated_at_ms=now_ms))
+        return True
 
     async def release(self, processor: str, operation: str, now_ms: int) -> bool:
-        raise _refuse("processor control", 3)
+        state = self._get(processor)
+        held = state.operation
+        if held is None or held.id != operation:
+            return False
+        self._put(replace(state, operation=None, updated_at_ms=now_ms))
+        return True
 
     async def expire(self, processor: str, operation: str, now_ms: int) -> bool:
-        raise _refuse("processor control", 3)
+        state = self._get(processor)
+        held = state.operation
+        if held is None or held.id != operation or held.holds_at(now_ms):
+            return False
+        self._put(replace(state, operation=None, updated_at_ms=now_ms))
+        return True
 
     async def set_replay(self, processor: str, ranges: Sequence[ReplayRange], now_ms: int) -> None:
-        raise _refuse("processor control", 3)
+        state = self._get(processor)
+        self._put(replace(state, replay=tuple(ranges), updated_at_ms=now_ms))
 
     async def remove_range(self, processor: str, replay_range: ReplayRange, now_ms: int) -> bool:
-        raise _refuse("processor control", 3)
+        state = self._get(processor)
+        if replay_range not in state.replay:
+            return False
+        self._put(
+            replace(
+                state,
+                replay=tuple(item for item in state.replay if item != replay_range),
+                updated_at_ms=now_ms,
+            )
+        )
+        return True
 
 
 class _External:

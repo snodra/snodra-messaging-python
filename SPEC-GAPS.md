@@ -715,3 +715,22 @@ library does there. Where an entry is settled, its behaviour is this library's r
   assignment. A publish to a missing source is `Failed` too, never `Rejected`: the relay retries it.
 - **Question:** should subscribe wait for the source (making the 10 s first-assignment promise unprovable for a source
   that never appears), or refuse it as this library does?
+
+### SG-43: an explicit `processor="default"`
+
+- **Specification:** [protocol.md, Processor status](https://snodra.damoreira.com/docs/library-authors/protocol/#processor-status)
+  says the name is "`default` for the handlers without a processing group, else the group name
+  (`[a-z0-9][a-z0-9-]{0,47}`)", and the level-3 design says a named processor's name matches the pattern "and is not
+  `default`". Python's `App.event_handler(processor=...)` has `"default"` as the parameter's own default, so the call
+  cannot tell an omitted parameter from an explicit `"default"`.
+- **Other Snodra libraries:** Kotlin refuses `@ProcessingGroup("default")`
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/handler/ProcessingGroup.kt:28`,
+  the error built at `.../handler/HandlerRegistry.kt:110`); Rust's `event_in` refuses it
+  (`snodra-messaging-rs@4d63802:src/processors/mod.rs:83`). Both have a separate `event()`/bare annotation for the
+  unnamed processor.
+- **This library:** `App.event_handler(processor="default")` registers in `default`, exactly as omitting the parameter
+  does; `tests/test_processors.py::test_the_processor_name_is_checked_and_default_is_the_unnamed_one` pins it. Every
+  other name is checked against the pattern and the 48-character bound.
+- **Question:** should Python take a sentinel (or a separate `default_processor=True`) so that an explicit `default` is
+  refused as the other libraries refuse it, or is the parameter's default the API's statement that `default` is the
+  unnamed processor's valid spelling?

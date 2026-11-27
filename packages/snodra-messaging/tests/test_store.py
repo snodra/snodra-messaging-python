@@ -361,14 +361,11 @@ async def test_a_foreign_transaction_rolls_back_without_failing() -> None:
     await other.rollback(tx)
 
 
-async def test_the_level_3_and_level_4_ports_are_unsupported() -> None:
+async def test_the_level_4_ports_are_unsupported_with_the_level_3_ones_in_place() -> None:
     store = MemoryStore()
-    with pytest.raises(Unsupported):
-        await store.processed.delete_markers("processor", [])
-    with pytest.raises(Unsupported):
-        await store.dead_letters.count()
-    with pytest.raises(Unsupported):
-        await store.control.get("processor")
+    assert await store.processed.delete_markers("processor", []) == 0
+    assert await store.dead_letters.count() == 0
+    assert (await store.control.get("processor")).paused is False
     with pytest.raises(Unsupported):
         await store.external.find("key")
     with pytest.raises(Unsupported):

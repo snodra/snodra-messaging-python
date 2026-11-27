@@ -359,6 +359,10 @@ class FakeStream:
     async def recv_credentials(self, within: float = BOUND) -> hub_pb2.Credentials:
         return (await self._recv_kind("credentials", within)).credentials
 
+    async def recv_control_reply(self, within: float = BOUND) -> hub_pb2.ControlReply:
+        """The next ``ControlReply``, skipping heartbeats, statuses and the control frames of other calls."""
+        return (await self._recv_kind("control_reply", within)).control_reply
+
     async def nothing(self, seconds: float, *kinds: str) -> None:
         """Fails if a frame of one of kinds arrives within seconds, or if the client's frames ended before or meanwhile
         (an absence on an ended stream proves nothing): at once when the end comes, a half-close or a client that left

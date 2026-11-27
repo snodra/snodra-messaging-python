@@ -46,6 +46,10 @@ async def test_settings_refuse_bad_values() -> None:
     _refused("SNODRA_SERVER_ADDRESS", hubs=("dns:///hubs.internal",))
     _refused("SNODRA_SERVER_ADDRESS", hubs=("dns:///hubs.internal:0",))
     _refused("SNODRA_SERVER_ADDRESS", hubs=("dns://resolver/hubs.internal:7000",))
+    _refused("SNODRA_EVENTS_DEAD_LETTER_MODE", dead_letter_mode="topic")
+    _refused("SNODRA_EVENTS_DEAD_LETTER_MODE", dead_letter_mode="Collection")
+    _refused("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", dead_letter_retention=0.5)
+    _refused("SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS", dead_letter_retention=float("inf"))
 
 
 @pytest.mark.parametrize("address", ["http://h:7000", "https://h:7000", "static://https://h:7000", "grpc://h:7000"])
@@ -71,6 +75,24 @@ def test_settings_defaults() -> None:
     assert (s.max_concurrent, s.reconnect_backoff, s.load_factor, dict(s.tags)) == (256, (0.5, 5.0), 100, {})
     assert uuid.UUID(s.instance).version == 4
     assert Settings(service="orders-service").instance != s.instance  # a fresh one each time
+
+
+def test_the_dead_letter_settings_default_to_a_collection_kept_30_days() -> None:
+    s = Settings(service="orders-service")
+    assert s.dead_letter_mode == "collection"
+    assert s.dead_letter_retention == 30 * 24 * 60 * 60
+    other = Settings(service="orders-service", dead_letter_mode="log", dead_letter_retention=1.0)
+    assert other.dead_letter_mode == "log"
+
+
+def test_the_dead_letter_settings_from_env() -> None:
+    base = {"SNODRA_SERVICE_NAME": "orders-service"}
+    s = Settings.from_env(base | {"SNODRA_EVENTS_DEAD_LETTER_MODE": "event-store"})
+    assert s.dead_letter_mode == "event-store"
+    s = Settings.from_env(
+        base | {"SNODRA_EVENTS_DEAD_LETTER_MODE": "LOG", "SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS": "1500"}
+    )
+    assert (s.dead_letter_mode, s.dead_letter_retention) == ("log", 1.5)
 
 
 def test_from_env() -> None:

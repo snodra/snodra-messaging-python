@@ -13,7 +13,7 @@ from typing import Any, Literal, TypeVar, overload
 from snodra import _credentials, _tls
 from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
-from snodra._consumer import EventConsumer
+from snodra._control import ControlPlane
 from snodra._dispatch import Dispatcher
 from snodra._errors import ConfigurationError, SnodraError
 from snodra._events import (
@@ -24,11 +24,13 @@ from snodra._events import (
 )
 from snodra._eventstore import EventStore
 from snodra._gather import Gathered, gather
+from snodra._hubpb import hub_pb2
 from snodra._identity import Guard, IdentityResolver
 from snodra._jwt import JwksVerifier
 from snodra._local import LocalCalls
 from snodra._outbox import OutboxRelay, OutboxSettings
 from snodra._pool import Pool
+from snodra._processors import Processors
 from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
 from snodra._send import Sender
@@ -130,6 +132,8 @@ class App:
         )
         self._sender = Sender(self._codec, settings, self._timings, telemetry=self._telemetry)
         self._cert_seen: set[str] = set()
+        self._processors: Processors | None = None
+        self._control = ControlPlane(None)
         self._pool = Pool(
             settings,
             self._timings,
@@ -139,6 +143,8 @@ class App:
             certificates=certificates,
             telemetry=self._telemetry,
             on_cert_presented=self._cert_presented,
+            on_control=self._control.handle,
+            processors=self._processor_statuses,
         )
         self._sender.pool = self._pool
         self._sender.local = LocalCalls(self._registry, self._dispatcher, self._codec, settings)
@@ -602,6 +608,10 @@ class App:
         self._events.close()
         self._check_event_startup()
         await self._prepare_store()
+        self._processors = self._build_processors()
+        self._control.attach(self._processors)
+        if self._processors is not None:
+            await self._processors.start()
         self._dispatcher.subscriptions.bind(asyncio.get_running_loop())
         registry = self._registry
         self._pool.declare(
@@ -670,8 +680,29 @@ class App:
                 "(snodra.MemoryEventStore runs the in-memory one, not durable: tests and local runs)"
             )
 
+    def _build_processors(self) -> Processors | None:
+        """The event processors this instance runs, or ``None`` when it runs none (no handler, or consuming is off)."""
+        if not self._settings.consumer_enabled or self._store is None or self._event_store is None:
+            return None
+        if not self._events.processors():
+            return None
+        return Processors(
+            service=self._settings.service,
+            store=self._store,
+            events=self._event_store,
+            registry=self._events,
+            codec=self._codec,
+            settings=self._settings,
+            timings=self._timings,
+            clock=self._clock,
+        )
+
+    def _processor_statuses(self) -> list[hub_pb2.ProcessorStatus]:
+        """One status per started processor (none when this instance runs none), never blocking."""
+        return [] if self._processors is None else self._processors.statuses()
+
     def _start_events(self) -> None:
-        """Starts the outbox relay and one consumer per processor, when their stores are there."""
+        """Starts the outbox relay, when its stores are there (the processors started in :meth:`start`)."""
         if self._store is None or self._event_store is None:
             return
         if self._settings.outbox_enabled:
@@ -689,27 +720,16 @@ class App:
                 clock=self._clock,
             )
             self._event_tasks.append(relay.start())
-        if self._settings.consumer_enabled:
-            for processor in self._events.processors():
-                consumer = EventConsumer(
-                    service=self._settings.service,
-                    processor=processor,
-                    store=self._store,
-                    events=self._event_store,
-                    registry=self._events,
-                    source=self._settings.events_source,
-                    codec=self._codec,
-                    max_attempts=self._settings.consumer_max_attempts,
-                    backoff=self._timings.event_handler_backoff,
-                    resubscribe_min=self._timings.event_resubscribe_min,
-                    resubscribe_max=self._timings.event_resubscribe_max,
-                    resubscribe_stable=self._timings.event_resubscribe_stable,
-                )
-                self._event_tasks.append(consumer.start())
 
     async def _stop_events(self, budget: float) -> None:
-        """Cancels the outbox relay and the consumers, and waits for them to end within ``budget`` seconds."""
-        tasks, self._event_tasks = self._event_tasks, []
+        """Cancels the outbox relay, the processors, their control workers and the store's work, and waits for them to
+        end within ``budget`` seconds."""
+        tasks = self._event_tasks
+        self._event_tasks = []
+        if self._processors is not None:
+            await self._processors.stop()
+            tasks = tasks + self._processors.tasks()
+        tasks = tasks + self._control.tasks()
         for task in tasks:
             task.cancel()
         if not tasks:

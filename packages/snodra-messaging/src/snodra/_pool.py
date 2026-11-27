@@ -63,6 +63,8 @@ class Pool:
         certificates: Certificates | None = None,
         telemetry: Telemetry | None = None,
         on_cert_presented: Callable[[str], None] | None = None,
+        on_control: Callable[[hub_pb2.ControlRequest, Callable[[hub_pb2.ClientMessage], bool]], None] | None = None,
+        processors: Callable[[], Sequence[hub_pb2.ProcessorStatus]] | None = None,
     ) -> None:
         self._timings = timings
         self._dispatcher = dispatcher
@@ -71,6 +73,8 @@ class Pool:
         self._telemetry = telemetry
         self._on_cert_presented = on_cert_presented
         self._on_answer = on_answer
+        self._on_control = on_control
+        self._processors = processors
         self._backoff = settings.reconnect_backoff
         self._tls = settings.tls
         self._max_concurrent = settings.max_concurrent
@@ -178,7 +182,13 @@ class Pool:
             server_name=name,
             telemetry=self._telemetry,
             on_cert_presented=self._on_cert_presented,
+            on_control=None if self._on_control is None else self._control_frame,
         )
+
+    def _control_frame(self, stream: _Stream, request: hub_pb2.ControlRequest) -> None:
+        """A control request arrives: hand it to the control plane with the stream's own write, never the read loop."""
+        assert self._on_control is not None
+        self._on_control(request, stream.put)
 
     def _changed(self) -> None:
         """A stream was acknowledged or ended, or a rollover began or ended: dedupe, revive a parked address, raise the
@@ -356,7 +366,7 @@ class Pool:
 
     def _report_status(self) -> None:
         """One ``InstanceStatus`` on every live stream: the hub ids it holds a stream to, the handlers in flight over
-        every hub, and no processor (this library runs none)."""
+        every hub, and one status per started event processor (none when this library runs none)."""
         if self._departing:
             return  # the shutdown: the empty Register, the subscriptions' ends and the half-close only
         live = self._live()
@@ -369,11 +379,17 @@ class Pool:
             if (hub := self._hub_id(c)) is not None and hub not in ids:
                 ids.append(hub)
         handlers = 0 if self._dispatcher is None else self._dispatcher.handlers_in_flight
+        processors: Sequence[hub_pb2.ProcessorStatus] = ()
+        if self._processors is not None:
+            try:
+                processors = self._processors()
+            except Exception:  # a status that cannot be built is no reason to stop reporting the instance
+                log.exception("the processor status could not be built; reporting none this time")
         for c in reported:
             stream = c.live_stream()
             if stream is None:  # pragma: no cover (reported hubs are live)
                 continue
-            status = hub_pb2.InstanceStatus(connected_hub_ids=ids, handlers_in_flight=handlers)
+            status = hub_pb2.InstanceStatus(connected_hub_ids=ids, handlers_in_flight=handlers, processors=processors)
             stream.put(hub_pb2.ClientMessage(status=status))
 
     # The DNS answer.

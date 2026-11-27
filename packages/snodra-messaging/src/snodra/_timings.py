@@ -83,6 +83,10 @@ class Timings:
     :attr:`event_resubscribe_stable`)."""
     event_resubscribe_stable: float
     """A subscription that lived this long before it failed counts as a good one: the next wait starts over."""
+    processor_control_poll: float
+    """How often every instance reads its processors' ``processor_control`` documents (a pause converges within it)."""
+    dead_letter_sample: float
+    """How often a processor's dead-letter count is sampled for its status (and after a letter is parked)."""
     dns_refresh: float
     """How often a ``dns:///`` target is resolved again."""
     dns_drain_limit: float
@@ -125,6 +129,8 @@ DEFAULT_TIMINGS: Final = Timings(
     event_resubscribe_min=1.0,
     event_resubscribe_max=30.0,
     event_resubscribe_stable=30.0,
+    processor_control_poll=5.0,
+    dead_letter_sample=30.0,
     dns_refresh=30.0,
     dns_drain_limit=65.0,
 )

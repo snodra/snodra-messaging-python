@@ -372,6 +372,7 @@ class HubConnection:
         on_cancel: Callable[[_Stream, hub_pb2.Cancel], None] | None = None,
         on_flow: Callable[[_Stream, hub_pb2.Flow], None] | None = None,
         on_answer: Callable[[_Stream, hub_pb2.ServerMessage], None] | None = None,
+        on_control: Callable[[_Stream, hub_pb2.ControlRequest], None] | None = None,
         on_lost: Callable[[_Stream], None] | None = None,
         credentials: HubCredentials | None = None,
         tls: _tls.TLSConfig | None = None,
@@ -400,6 +401,7 @@ class HubConnection:
         self._on_cancel = on_cancel
         self._on_flow = on_flow
         self._on_answer = on_answer
+        self._on_control = on_control
         self._on_lost = on_lost
         self._gate: asyncio.Event | None = None  # the writer waits on it before writing a frame (a test hook)
         self._options = [
@@ -894,6 +896,8 @@ class HubConnection:
                         self._hand_over(self._on_flow, stream, m.flow)
                     case "reply" | "error" | "part" | "end" if self._on_answer is not None:
                         self._hand_over(self._on_answer, stream, m)
+                    case "control" if self._on_control is not None:
+                        self._hand_over(self._on_control, stream, m.control)
         except grpc.aio.AioRpcError as e:
             return stream.status or _End(e.code(), e.details() or "")
 
