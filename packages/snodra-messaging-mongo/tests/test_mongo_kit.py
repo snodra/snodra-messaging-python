@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import pytest
 import snodra
-from snodra.testing import MESSAGE_STORE_CHECKS, MESSAGE_STORE_L3_CHECKS, run_store_conformance
+from snodra.testing import (
+    MESSAGE_STORE_CHECKS,
+    MESSAGE_STORE_L3_CHECKS,
+    MESSAGE_STORE_L4_CHECKS,
+    run_store_conformance,
+)
 from snodra_mongo import MongoStore
 
 pytestmark = pytest.mark.timeout(300)
 
 
 async def test_the_mongo_message_store_passes_the_kit(store: MongoStore) -> None:
-    await run_store_conformance(lambda: store, level=3)
+    await run_store_conformance(lambda: store, level=4)
 
 
 async def test_the_store_reports_its_name_and_has_the_six_ports(store: MongoStore) -> None:
@@ -46,4 +51,17 @@ def test_the_kit_is_the_nine_level_two_checks_and_the_eight_level_three_ones() -
         "pause_state_round_trips",
         "replay_ranges_round_trip",
         "processor_control_write_inside_rolled_back_transaction_is_kept",
+    )
+    assert tuple(check.__name__ for check in MESSAGE_STORE_L4_CHECKS) == (
+        "external_call_idempotency_returns_first_result",
+        "saga_ports_round_trip",
+        "two_transactions_starting_one_saga_key_leave_one_live_saga",
+        "two_transactions_updating_one_saga_version_commit_once",
+        "saga_dispatch_store_refuses_an_event_the_outbox_would_refuse",
+        "due_deadline_is_claimed_once_until_its_lease_passes",
+        "an_empty_deadline_correlation_id_reads_as_absent",
+        "two_schedulers_claim_each_due_deadline_once",
+        "dispatch_hands_out_each_saga_in_seq_order",
+        "two_relays_never_hold_one_saga_lease",
+        "concurrent_notice_claims_return_each_notice_once",
     )

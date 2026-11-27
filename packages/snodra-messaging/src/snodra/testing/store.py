@@ -1,22 +1,23 @@
-"""The message-store conformance kit: the nine level-2 and eight level-3 store checks, each named as in the reference
-kit.
+"""The message-store conformance kit: the nine level-2, eight level-3 and eleven level-4 store checks, each named as
+in the reference kit.
 
 An add-on's own test hands the kit a factory over a store whose schema is ready and which holds nothing::
 
     from snodra.testing import run_store_conformance
 
     async def test_my_store_passes_conformance() -> None:
-        await run_store_conformance(lambda: MyStore(), level=3)
+        await run_store_conformance(lambda: MyStore(), level=4)
 
 - **One store** for the whole run: the checks run one after the other on the store the factory returns, each on ids,
   processors and keys of its own. The outbox checks claim the whole outbox, so each first relays whatever another check
   left pending and leaves nothing pending itself: the store must be the kit's alone while it runs.
 - **Every check is public**, so a failing one can be run by itself: it takes the :class:`~snodra._store.MessageStore`.
-  :data:`MESSAGE_STORE_CHECKS` holds the nine level-2 checks and :data:`MESSAGE_STORE_L3_CHECKS` the eight level-3 ones.
+  :data:`MESSAGE_STORE_CHECKS` holds the nine level-2 checks, :data:`MESSAGE_STORE_L3_CHECKS` the eight level-3 ones
+  and :data:`MESSAGE_STORE_L4_CHECKS` the eleven level-4 ones.
 - **The runner's level** is ``level=2`` by default, running only the level-2 checks, so a level-2 third-party add-on
-  keeps the published entry point. ``level=3`` runs both sets in the reference kit's order;
-  :func:`run_store_l3_conformance` is the named level-3 alias.
-- **The ids are the reference kit's**, one to one; ``store_checks.txt`` lists all 17 in its order. This module holds the
+  keeps the published entry point. ``level=3`` runs the level-2 and level-3 sets and ``level=4`` all three, in the
+  reference kit's order; :func:`run_store_l3_conformance` and :func:`run_store_l4_conformance` are the named aliases.
+- **The ids are the reference kit's**, one to one; ``store_checks.txt`` lists all 28 in its order. This module holds the
   checks, the helpers they share and the runner. It uses only the standard library: ``snodra.testing`` imports no test
   framework and no store client.
 - The kit waits at most a minute for a lease to pass (its expired-lease check sleeps :data:`LEASE` plus
@@ -36,10 +37,20 @@ from typing import Final
 
 from snodra._store import (
     MAX_PAYLOAD_DEPTH,
+    Association,
+    Conflict,
     ControlOperation,
     DeadLetter,
     DeadLetterError,
     DeadLetterReason,
+    DeadlineDocument,
+    DeadlineStatus,
+    DeadlineStore,
+    DispatchFailure,
+    DispatchKind,
+    ExternalCall,
+    ExternalCallStatus,
+    FailureReason,
     InvalidMessage,
     Locked,
     MessageStore,
@@ -49,6 +60,10 @@ from snodra._store import (
     ProcessedMarker,
     ProcessorControlState,
     ReplayRange,
+    SagaDispatchDocument,
+    SagaDispatchStore,
+    SagaDocument,
+    SagaFailureDocument,
     letter_id,
     now_ms,
 )
@@ -167,6 +182,121 @@ def _letter(
 def _fresh_processor() -> str:
     """A processor no other check has used."""
     return f"conformance-{uuid.uuid4()}"
+
+
+def _in_progress(key: str, owner: str, now: int, lease_until_ms: int) -> ExternalCall:
+    """An in-progress external call of the kit."""
+    return ExternalCall(
+        key=key,
+        status=ExternalCallStatus.IN_PROGRESS,
+        attempts=1,
+        updated_at_ms=now,
+        lease_until_ms=lease_until_ms,
+        owner=owner,
+    )
+
+
+def _saga(
+    type_name: str,
+    saga_id: str,
+    *,
+    start_key: str | None,
+    now: int,
+    state: str = '{"step":0}',
+    associations: tuple[Association, ...] = (),
+) -> SagaDocument:
+    """A saga document of the kit."""
+    return SagaDocument(
+        id=saga_id,
+        type_name=type_name,
+        state=state,
+        associations=associations,
+        start_key=start_key,
+        ended=False,
+        ended_at_ms=None,
+        version=0,
+        created_at_ms=now,
+        updated_at_ms=now,
+    )
+
+
+def _dispatch_entry(
+    saga_id: str,
+    seq: int,
+    kind: DispatchKind,
+    created_at_ms: int,
+) -> SagaDispatchDocument:
+    """A pending dispatch entry of the kit."""
+    return SagaDispatchDocument(
+        id=f"{saga_id}:{seq}",
+        saga_id=saga_id,
+        seq=seq,
+        kind=kind,
+        type_name="conformance.Dispatched",
+        payload='{"amount":42}',
+        headers={"correlation-id": "c-1"},
+        routing_key=None,
+        created_at_ms=created_at_ms,
+    )
+
+
+def _deadline_document(
+    *,
+    deadline_id: str,
+    saga_type: str,
+    saga_id: str,
+    name: str,
+    due_at_ms: int,
+    correlation_id: str | None = None,
+    payload: str | None = None,
+    payload_type: str | None = None,
+) -> DeadlineDocument:
+    """A scheduled deadline of the kit."""
+    return DeadlineDocument(
+        id=deadline_id,
+        saga_type=saga_type,
+        saga_id=saga_id,
+        name=name,
+        payload=payload,
+        payload_type=payload_type,
+        due_at_ms=due_at_ms,
+        status=DeadlineStatus.SCHEDULED,
+        claimed_by=None,
+        claimed_until_ms=None,
+        finished_at_ms=None,
+        correlation_id=correlation_id,
+    )
+
+
+async def _claim_mine(
+    deadlines: DeadlineStore,
+    owner: str,
+    now: int,
+    until: int,
+    saga_id: str,
+) -> DeadlineDocument | None:
+    """Claims due deadlines until one of ``saga_id`` comes out (another check's are left claimed)."""
+    while True:
+        found = await deadlines.claim_due(owner, now, until)
+        if found is None:
+            return None
+        if found.saga_id == saga_id:
+            return found
+
+
+async def _claim_notice(
+    queue: SagaDispatchStore,
+    now: int,
+    reserve_until: int,
+    entry_id: str,
+) -> SagaDispatchDocument | None:
+    """Claims due notices until the one of ``entry_id`` comes out (another check's stay reserved)."""
+    while True:
+        found = await queue.claim_due_notice(now, reserve_until)
+        if found is None:
+            return None
+        if found.id == entry_id:
+            return found
 
 
 def _nested(depth: int) -> bytes:
@@ -800,6 +930,622 @@ async def processor_control_write_inside_rolled_back_transaction_is_kept(store: 
     assert state.replay == (replay,), "a replay range commits on its own"
 
 
+async def external_call_idempotency_returns_first_result(store: MessageStore) -> None:
+    """The first call of a key wins: a repeat finds its record and, once it succeeded, the first reply; a lapsed call
+    is taken over or given up only when the record is still the one read."""
+    calls = store.external
+    t0 = now_ms()
+    key = f"conformance:{uuid.uuid4()}"
+    first = _in_progress(key, "owner-1", t0, t0 + 60_000)
+    assert await calls.insert(first)
+    assert not await calls.insert(_in_progress(key, "owner-2", t0, t0 + 60_000)), "the key is taken"
+    assert await calls.find(key) == first
+    assert not await calls.succeed(key, "owner-2", '{"n":2}', t0 + 1), "not the owner"
+    assert await calls.succeed(key, "owner-1", '{"n":1}', t0 + 2)
+    assert not await calls.succeed(key, "owner-1", '{"n":3}', t0 + 3), "settled"
+    assert not await calls.insert(_in_progress(key, "owner-3", t0, t0 + 60_000))
+    settled = await calls.find(key)
+    assert settled is not None
+    assert settled.status is ExternalCallStatus.SUCCEEDED
+    assert settled.reply == '{"n":1}', "the first result"
+    assert (settled.owner, settled.lease_until_ms) == (None, None), "a settled record has no owner"
+    assert settled.updated_at_ms == t0 + 2
+
+    lapsed_key = f"conformance:{uuid.uuid4()}"
+    lapsed = _in_progress(lapsed_key, "owner-1", t0, t0 + 10)
+    assert await calls.insert(lapsed)
+    taken = await calls.take_over(lapsed, "owner-2", t0 + 60_000, t0 + 20)
+    assert taken is not None
+    assert (taken.attempts, taken.owner, taken.lease_until_ms) == (2, "owner-2", t0 + 60_000)
+    assert await calls.take_over(lapsed, "owner-3", t0 + 60_000, t0 + 21) is None, (
+        "the record changed since it was read"
+    )
+    assert not await calls.fail(lapsed_key, "owner-1", '{"code":"X"}', t0 + 22), "not the owner any more"
+    assert await calls.fail(lapsed_key, "owner-2", '{"code":"HANDLER_ERROR","message":"m"}', t0 + 23)
+    failed = await calls.find(lapsed_key)
+    assert failed is not None
+    assert failed.status is ExternalCallStatus.FAILED
+    assert failed.error == '{"code":"HANDLER_ERROR","message":"m"}'
+    assert (failed.owner, failed.lease_until_ms) == (None, None)
+
+    unknown_key = f"conformance:{uuid.uuid4()}"
+    stale = _in_progress(unknown_key, "owner-1", t0, t0 + 10)
+    assert await calls.insert(stale)
+    changed = replace(stale, owner="someone-else")
+    assert not await calls.expire(changed, t0 + 20), "not the record read"
+    assert await calls.expire(stale, t0 + 20)
+    unknown = await calls.find(unknown_key)
+    assert unknown is not None
+    assert unknown.status is ExternalCallStatus.UNKNOWN
+    assert (unknown.owner, unknown.lease_until_ms) == (None, None)
+
+    owned_key = f"conformance:{uuid.uuid4()}"
+    assert await calls.insert(_in_progress(owned_key, "owner-1", t0, t0 + 60_000))
+    assert not await calls.mark_unknown(owned_key, "owner-2", t0 + 1)
+    assert await calls.mark_unknown(owned_key, "owner-1", t0 + 1)
+    marked = await calls.find(owned_key)
+    assert marked is not None
+    assert marked.status is ExternalCallStatus.UNKNOWN
+    reset_key = f"conformance:{uuid.uuid4()}"
+    assert await calls.insert(_in_progress(reset_key, "owner-1", t0, t0 + 60_000))
+    assert not await calls.reset(reset_key, "owner-2"), "not the owner"
+    assert await calls.reset(reset_key, "owner-1")
+    assert await calls.find(reset_key) is None
+    assert await calls.insert(_in_progress(reset_key, "owner-2", t0, t0 + 60_000)), "begun afresh"
+
+
+async def saga_ports_round_trip(store: MessageStore) -> None:
+    """Each saga port writes what it reads back, in a committed transaction; an aborted one leaves nothing."""
+    sagas = store.sagas
+    txs = store
+    now = now_ms()
+    type_name = f"conformance.Saga{uuid.uuid4().hex}"
+    saga = _saga(
+        type_name,
+        str(uuid.uuid4()),
+        start_key=f"{type_name}|orderId=o-1",
+        now=now,
+        state='{"step":1}',
+        associations=(Association("orderId", "o-1"),),
+    )
+    async with txs.transaction():
+        await sagas.sagas.insert(saga)
+    async with txs.transaction():
+        assert await sagas.sagas.find_by_id(saga.id) == saga
+        assert await sagas.sagas.find_live(type_name, "orderId", "o-1") == [saga]
+        assert await sagas.sagas.find_live(type_name, "orderId", "o-2") == []
+        updated = replace(saga, state='{"step":2}', version=1)
+        assert await sagas.sagas.update(updated, 0)
+    assert (await sagas.sagas.count_live_by_type()).get(type_name) == 1, "one live instance of the type"
+    async with txs.transaction():
+        assert not await sagas.sagas.update(updated, 0), "a stale version"
+    try:
+        async with txs.transaction():
+            twin = replace(saga, id=str(uuid.uuid4()))
+            try:
+                await sagas.sagas.insert(twin)
+            except Conflict:
+                raise _Rollback from None
+            raise AssertionError("a live start key is not a conflict")
+    except _Rollback:
+        pass
+    rolled_back = replace(saga, id=str(uuid.uuid4()), start_key=None)
+    try:
+        async with txs.transaction():
+            await sagas.sagas.insert(rolled_back)
+            raise _Rollback
+    except _Rollback:
+        pass
+    assert await sagas.sagas.find_by_id(rolled_back.id, tx=txs.plain()) is None
+
+    dispatch = replace(
+        _dispatch_entry(saga.id, 1000, DispatchKind.COMMAND, now),
+        headers={
+            "correlation-id": "c-1",
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        },
+        routing_key="o-1",
+    )
+
+    def deadline(name: str) -> DeadlineDocument:
+        return _deadline_document(
+            deadline_id=str(uuid.uuid4()),
+            saga_type=type_name,
+            saga_id=saga.id,
+            name=name,
+            due_at_ms=now + 60_000,
+            correlation_id="c-1",
+            payload='{"why":"timeout"}',
+            payload_type="conformance.Timeout",
+        )
+
+    fired = deadline("fired")
+    by_id = deadline("by-id")
+    by_name = deadline("by-name")
+    rest = deadline("rest")
+    async with txs.transaction():
+        await sagas.dispatch.record([dispatch])
+        await sagas.dispatch.record([])
+        for item in (fired, by_id, by_name, rest):
+            await sagas.deadlines.insert(item)
+    assert await sagas.dispatch.next_pending(saga.id) == dispatch, "the recorded entry reads back"
+
+    later = now + 1_000
+    async with txs.transaction():
+        assert await sagas.deadlines.find_scheduled(fired.id) == fired
+        assert await sagas.deadlines.mark_fired(fired.id, later)
+        assert not await sagas.deadlines.mark_fired(fired.id, later), "fired once"
+        await sagas.deadlines.cancel(saga.id, by_id.id, later)
+        await sagas.deadlines.cancel_by_name(saga.id, "by-name", later)
+        assert await sagas.deadlines.find_scheduled(rest.id) == rest, "untouched"
+        await sagas.deadlines.cancel_all(saga.id, later)
+    for item in (fired, by_id, by_name, rest):
+        assert await sagas.deadlines.find_scheduled(item.id, tx=txs.plain()) is None
+
+    failure = SagaFailureDocument(
+        id=f"{type_name}:{uuid.uuid4()}",
+        saga_type=type_name,
+        event_id=str(uuid.uuid4()),
+        event_type="conformance.Happened",
+        payload='{"x":1}',
+        headers={"correlationId": "c-1"},
+        error="boom",
+        attempts=3,
+        first_failed_at_ms=now,
+        last_failed_at_ms=now,
+    )
+    async with txs.transaction():
+        await sagas.failures.save(failure)
+    assert await sagas.failures.find(failure.id, tx=txs.plain()) == failure
+    assert await sagas.failures.failed_again(failure.id, "boom again", 2, later, tx=txs.plain())
+    again = await sagas.failures.find(failure.id, tx=txs.plain())
+    assert again is not None
+    assert (again.attempts, again.error, again.last_failed_at_ms) == (5, "boom again", later)
+    assert await sagas.failures.list(type_name, tx=txs.plain()) == [again]
+    assert await sagas.failures.delete(failure.id, tx=txs.plain())
+    assert not await sagas.failures.delete(failure.id, tx=txs.plain())
+    assert not await sagas.failures.failed_again(failure.id, "x", 1, later, tx=txs.plain()), "never inserts"
+    assert await sagas.failures.list(type_name, tx=txs.plain()) == []
+
+    marker_id = f"saga:{type_name}:{uuid.uuid4()}"
+    async with txs.transaction():
+        assert not await sagas.markers.exists(marker_id)
+        await sagas.markers.insert(marker_id, "conformance.Happened", now)
+    try:
+        async with txs.transaction():
+            assert await sagas.markers.exists(marker_id)
+            try:
+                await sagas.markers.insert(marker_id, "conformance.Happened", now)
+            except Conflict:
+                raise _Rollback from None
+            raise AssertionError("a marker inserts once")
+    except _Rollback:
+        pass
+    ended = replace(updated, ended=True, ended_at_ms=later, version=2, updated_at_ms=later)
+    async with txs.transaction():
+        assert await sagas.sagas.update(ended, 1)
+    assert await sagas.sagas.find_by_id(saga.id, tx=txs.plain()) == ended
+    assert (await sagas.sagas.count_live_by_type()).get(type_name) is None, "no live instance of the type"
+    async with txs.transaction():
+        await sagas.dispatch.mark_dispatched(dispatch.id, later)
+
+
+async def two_transactions_starting_one_saga_key_leave_one_live_saga(store: MessageStore) -> None:
+    """Two live transactions each start a saga holding one start key: exactly one commits, the other conflicts, and
+    one live saga holds the key."""
+    sagas = store.sagas.sagas
+    type_name = f"conformance.Race{uuid.uuid4().hex}"
+    start_key = f"{type_name}|orderId=o-1"
+    ids = [f"race-{uuid.uuid4()}", f"race-{uuid.uuid4()}"]
+    now = now_ms()
+    documents = [
+        _saga(
+            type_name,
+            saga_id,
+            start_key=start_key,
+            now=now,
+            state=f'{{"by":"{saga_id}"}}',
+            associations=(Association("orderId", "o-1"),),
+        )
+        for saga_id in ids
+    ]
+    first = await store.begin()
+    second = await store.begin()
+    outcomes: list[Exception | None] = []
+    for tx, document in ((first, documents[0]), (second, documents[1])):
+        try:
+            await sagas.insert(document, tx=tx)
+        except Exception as error:
+            outcomes.append(error)
+            await store.rollback(tx)
+        else:
+            try:
+                await store.commit(tx)
+            except Exception as error:
+                outcomes.append(error)
+            else:
+                outcomes.append(None)
+    wins = [index for index, outcome in enumerate(outcomes) if outcome is None]
+    assert len(wins) == 1, f"exactly one commits: {outcomes}"
+    lost = outcomes[1 - wins[0]]
+    assert lost is not None, "the other conflicts"
+    live = await sagas.find_live(type_name, "orderId", "o-1", tx=store.plain())
+    assert [document.id for document in live] == [ids[wins[0]]], "one live saga holds the key, the winner's"
+
+
+async def two_transactions_updating_one_saga_version_commit_once(store: MessageStore) -> None:
+    """Two live transactions update one saga from one version: exactly one commits, the other conflicts, and the
+    stored saga is the winner's."""
+    sagas = store.sagas.sagas
+    type_name = f"conformance.Race{uuid.uuid4().hex}"
+    saga_id = f"race-{uuid.uuid4()}"
+    now = now_ms()
+    saga = _saga(type_name, saga_id, start_key=None, now=now, associations=(Association("orderId", "o-1"),))
+    async with store.transaction():
+        await sagas.insert(saga)
+    a = replace(saga, state='{"step":"a"}', version=1)
+    b = replace(saga, state='{"step":"b"}', version=1)
+    first = await store.begin()
+    second = await store.begin()
+    pairs = ((first, a), (second, b))
+    outcomes: list[Exception | None] = [None, None]
+    performed = [False, False]
+    for index, (tx, document) in enumerate(pairs):
+        try:
+            changed = await sagas.update(document, 0, tx=tx)
+        except Exception as error:
+            outcomes[index] = error
+            await store.rollback(tx)
+        else:
+            assert changed, "an update at the version both read is refused by the check"
+            performed[index] = True
+    for index, (tx, _document) in enumerate(pairs):
+        if not performed[index]:
+            continue
+        try:
+            await store.commit(tx)
+        except Exception as error:
+            outcomes[index] = error
+    wins = [index for index, outcome in enumerate(outcomes) if outcome is None]
+    assert len(wins) == 1, f"exactly one commits: {outcomes}"
+    assert outcomes[1 - wins[0]] is not None, "the other conflicts"
+    stored = await sagas.find_by_id(saga_id, tx=store.plain())
+    assert stored == [a, b][wins[0]], "the winner's"
+
+
+async def saga_dispatch_store_refuses_an_event_the_outbox_would_refuse(store: MessageStore) -> None:
+    """A saga event entry whose payload the outbox would refuse is refused inside the saga's transaction, and nothing
+    of the attempt commits."""
+    sagas = store.sagas
+    now = now_ms()
+    too_deep = _nested(MAX_PAYLOAD_DEPTH + 1).decode()
+    for payload in (
+        "[1]",
+        "null",
+        '{"n":18446744073709551615}',
+        '{"n":-9223372036854775809}',
+        '{"n":123456789012345678901234567890}',
+        '{"n":1e400}',
+        '{"s":"\\ud800"}',
+        too_deep,
+    ):
+        saga_id = str(uuid.uuid4())
+        fine = _dispatch_entry(saga_id, 1000, DispatchKind.EVENT, now)
+        refused = replace(_dispatch_entry(saga_id, 1001, DispatchKind.EVENT, now), payload=payload)
+        try:
+            async with store.transaction():
+                await sagas.dispatch.record([fine, refused])
+                raise AssertionError(f"{payload}: recorded")
+        except InvalidMessage:
+            pass
+        assert await sagas.dispatch.next_pending(saga_id) is None, f"{payload}: nothing recorded"
+    saga_id = str(uuid.uuid4())
+    command = replace(_dispatch_entry(saga_id, 1000, DispatchKind.COMMAND, now), payload="null")
+    async with store.transaction():
+        await sagas.dispatch.record([command])
+    async with store.transaction():
+        await sagas.dispatch.mark_dispatched(command.id, now)
+
+
+async def due_deadline_is_claimed_once_until_its_lease_passes(store: MessageStore) -> None:
+    """A due deadline is claimed by one scheduler at a time, earliest first, until its claim passes; one not due,
+    fired or cancelled never is. The overdue count counts the due SCHEDULED deadlines per name, claimed or not."""
+    sagas = store.sagas
+    now = now_ms()
+    saga_id = str(uuid.uuid4())
+    first_name = f"first-{uuid.uuid4().hex}"
+    second_name = f"second-{uuid.uuid4().hex}"
+    first = _deadline_document(
+        deadline_id=str(uuid.uuid4()),
+        saga_type="conformance.Deadlines",
+        saga_id=saga_id,
+        name=first_name,
+        due_at_ms=now - 2_000,
+    )
+    second = _deadline_document(
+        deadline_id=str(uuid.uuid4()),
+        saga_type="conformance.Deadlines",
+        saga_id=saga_id,
+        name=second_name,
+        due_at_ms=now - 1_000,
+    )
+    later = _deadline_document(
+        deadline_id=str(uuid.uuid4()),
+        saga_type="conformance.Deadlines",
+        saga_id=saga_id,
+        name=first_name,
+        due_at_ms=now + 60_000,
+    )
+    async with store.transaction():
+        for item in (second, later, first):
+            await sagas.deadlines.insert(item)
+    overdue = await sagas.deadlines.count_overdue_by_name(now)
+    assert (overdue.get(first_name), overdue.get(second_name)) == (1, 1)
+    until = now + 30_000
+    a = await _claim_mine(sagas.deadlines, "scheduler-a", now, until, saga_id)
+    assert a == replace(first, claimed_by="scheduler-a", claimed_until_ms=until), "the earliest due deadline"
+    b = await _claim_mine(sagas.deadlines, "scheduler-b", now, until, saga_id)
+    assert b is not None
+    assert b.id == second.id, "the next one"
+    assert await _claim_mine(sagas.deadlines, "scheduler-a", now, until, saga_id) is None
+    overdue = await sagas.deadlines.count_overdue_by_name(now)
+    assert (overdue.get(first_name), overdue.get(second_name)) == (1, 1), "claimed deadlines are still overdue"
+    past = until + 1
+    again = await _claim_mine(sagas.deadlines, "scheduler-b", past, past + 30_000, saga_id)
+    assert again is not None
+    assert again.id == first.id, "a passed claim is claimed again"
+    async with store.transaction():
+        assert await sagas.deadlines.mark_fired(first.id, past)
+        await sagas.deadlines.cancel(saga_id, second.id, past)
+    far = now + 3_600_000
+    later_claim = await _claim_mine(sagas.deadlines, "scheduler-a", far, far + 30_000, saga_id)
+    assert later_claim is not None
+    assert later_claim.id == later.id
+    overdue = await sagas.deadlines.count_overdue_by_name(far)
+    assert (overdue.get(first_name), overdue.get(second_name)) == (1, None)
+    async with store.transaction():
+        await sagas.deadlines.cancel_all(saga_id, far)
+
+
+async def an_empty_deadline_correlation_id_reads_as_absent(store: MessageStore) -> None:
+    """A deadline written with an empty correlation id reads back without one, from find_scheduled and from
+    claim_due."""
+    sagas = store.sagas
+    now = now_ms()
+    saga_id = str(uuid.uuid4())
+    deadline = _deadline_document(
+        deadline_id=str(uuid.uuid4()),
+        saga_type="conformance.Deadlines",
+        saga_id=saga_id,
+        name=f"empty-{uuid.uuid4().hex}",
+        due_at_ms=now - 1_000,
+        correlation_id="",
+    )
+    async with store.transaction():
+        await sagas.deadlines.insert(deadline)
+    async with store.transaction():
+        found = await sagas.deadlines.find_scheduled(deadline.id)
+    assert found is not None
+    assert found.correlation_id is None, f"find_scheduled: {found}"
+    claimed = await _claim_mine(sagas.deadlines, "scheduler-empty", now, now + 30_000, saga_id)
+    assert claimed is not None
+    assert claimed.correlation_id is None, f"claim_due: {claimed}"
+    async with store.transaction():
+        await sagas.deadlines.cancel_all(saga_id, now)
+
+
+async def two_schedulers_claim_each_due_deadline_once(store: MessageStore) -> None:
+    """Two schedulers claiming at once: every due deadline goes to exactly one of them."""
+    sagas = store.sagas
+    now = now_ms()
+    saga_id = str(uuid.uuid4())
+    mine: set[str] = set()
+    async with store.transaction():
+        for number in range(40):
+            deadline = _deadline_document(
+                deadline_id=str(uuid.uuid4()),
+                saga_type="conformance.Raced",
+                saga_id=saga_id,
+                name="raced",
+                due_at_ms=now - 10_000 + number,
+            )
+            mine.add(deadline.id)
+            await sagas.deadlines.insert(deadline)
+    start = asyncio.Barrier(2)
+    first_claims = asyncio.Barrier(2)
+
+    async def scheduler(owner: str) -> list[str]:
+        got: list[str] = []
+        await asyncio.wait_for(start.wait(), BARRIER_WAIT)
+        first = True
+        while True:
+            found = await sagas.deadlines.claim_due(owner, now, now + 60_000)
+            if first:
+                first = False
+                await asyncio.wait_for(first_claims.wait(), BARRIER_WAIT)
+            if found is None:
+                return got
+            if found.saga_id == saga_id:
+                got.append(found.id)
+            await asyncio.sleep(0)
+
+    a, b = await asyncio.gather(scheduler("scheduler-a"), scheduler("scheduler-b"))
+    assert len(set(a)) == len(a), "scheduler-a claimed a deadline twice"
+    assert len(set(b)) == len(b), "scheduler-b claimed a deadline twice"
+    assert a, f"scheduler-a claimed deadlines: {len(a)}"
+    assert b, f"scheduler-b claimed deadlines: {len(b)}"
+    assert not set(a) & set(b), "claimed by both"
+    assert set(a) | set(b) == mine, "every due deadline is claimed"
+    async with store.transaction():
+        await sagas.deadlines.cancel_all(saga_id, now)
+
+
+async def dispatch_hands_out_each_saga_in_seq_order(store: MessageStore) -> None:
+    """A saga's pending dispatch entries come in seq order, the sagas whose first entry is due oldest first; a saga's
+    lease is held by one relay; an entry dispatched in a rolled-back transaction stays pending; a failed one carries
+    its outcome and notice."""
+    queue = store.sagas.dispatch
+    now = now_ms()
+    pending_before = await queue.pending()
+    older = str(uuid.uuid4())
+    newer = str(uuid.uuid4())
+    command = replace(
+        _dispatch_entry(newer, 1000, DispatchKind.COMMAND, now - 1_000),
+        routing_key="o-1",
+    )
+    event = _dispatch_entry(newer, 1001, DispatchKind.EVENT, now - 1_000)
+    old = _dispatch_entry(older, 0, DispatchKind.EVENT, now - 5_000)
+    async with store.transaction():
+        await queue.record([event, command])
+        await queue.record([old])
+    assert await queue.pending() == pending_before + 3
+    due = await queue.due_sagas(now, [], 10_000)
+    at = {saga_id: index for index, saga_id in enumerate(due)}
+    assert older in at, f"the older saga is due: {due}"
+    assert newer in at, f"the newer saga is due: {due}"
+    assert at[older] < at[newer], f"the older work first: {due}"
+    assert older not in await queue.due_sagas(now, [older], 10_000), "a saga in flight is left out"
+    assert await queue.next_pending(newer) == command, "the lowest seq first, as recorded"
+
+    lease = now + 60_000
+    assert await queue.claim_lease(newer, "relay-a", now, lease)
+    assert not await queue.claim_lease(newer, "relay-b", now, lease), "held by relay-a"
+    assert not await queue.renew_lease(newer, "relay-b", lease), "only the holder renews"
+    assert await queue.renew_lease(newer, "relay-a", now + 120_000)
+    assert not await queue.claim_lease(newer, "relay-b", now + 61_000, now + 121_000), "the renewed lease runs"
+    await queue.release_lease(newer, "relay-b")
+    assert not await queue.claim_lease(newer, "relay-b", now, lease), "only the holder releases"
+    await queue.release_lease(newer, "relay-a")
+    assert await queue.claim_lease(newer, "relay-b", now, lease), "a released lease is free"
+    await queue.release_lease(newer, "relay-b")
+    assert await queue.claim_lease(older, "relay-a", now, now + 1_000)
+    assert await queue.claim_lease(older, "relay-b", now + 2_000, now + 5_000), "a passed lease is free"
+    await queue.release_lease(older, "relay-b")
+
+    try:
+        async with store.transaction():
+            await queue.mark_dispatched(command.id, now)
+            raise _Rollback
+    except _Rollback:
+        pass
+    assert await queue.next_pending(newer) == command, "rolled back: still pending"
+    async with store.transaction():
+        await queue.mark_dispatched(command.id, now)
+    assert await queue.next_pending(newer) == event, "the next entry of the saga"
+
+    await queue.schedule_retry(event.id, 1, now + 60_000)
+    assert await queue.next_pending(newer) == replace(event, attempts=1, next_attempt_at_ms=now + 60_000)
+    assert newer not in await queue.due_sagas(now, [], 10_000), "not due before its next attempt"
+    assert newer in await queue.due_sagas(now + 60_000, [], 10_000), "due at its next attempt"
+
+    failure = DispatchFailure(
+        attempts=2,
+        reason=FailureReason.EXHAUSTED,
+        message="gave up",
+        failed_at_ms=now,
+        notice_at_ms=now + 30_000,
+    )
+    await queue.mark_failed(event.id, failure)
+    assert await queue.next_pending(newer) is None
+    assert await _claim_notice(queue, now, now + 90_000, event.id) is None, "the notice is not due yet"
+    failed = replace(
+        event,
+        attempts=2,
+        next_attempt_at_ms=now + 60_000,
+        failed_at_ms=now,
+        failure_reason=FailureReason.EXHAUSTED,
+        failure_message="gave up",
+        notice_pending=True,
+        notice_attempts=0,
+        notice_next_at_ms=now + 90_000,
+    )
+    assert await _claim_notice(queue, now + 30_000, now + 90_000, event.id) == failed, "the due notice, reserved"
+    assert await _claim_notice(queue, now + 30_000, now + 90_000, event.id) is None, "a reserved notice once"
+    await queue.schedule_notice_retry(event.id, 1, now + 100_000)
+    assert await _claim_notice(queue, now + 100_000, now + 160_000, event.id) == replace(
+        failed, notice_attempts=1, notice_next_at_ms=now + 160_000
+    ), "a failed delivery is tried again"
+    await queue.clear_notice(event.id)
+    assert await _claim_notice(queue, now + 3_600_000, now + 3_660_000, event.id) is None
+
+    await queue.mark_failed(
+        old.id,
+        DispatchFailure(
+            attempts=None,
+            reason=FailureReason.INVALID,
+            message="not a JSON object",
+            failed_at_ms=now,
+            notice_at_ms=None,
+        ),
+    )
+    assert await queue.next_pending(older) is None
+    assert await _claim_notice(queue, now + 3_600_000, now + 3_660_000, old.id) is None
+    assert await queue.pending() == pending_before, "neither dispatched nor failed: none left"
+
+
+async def two_relays_never_hold_one_saga_lease(store: MessageStore) -> None:
+    """Two relays claiming the dispatch leases of the same sagas at once: each saga's lease goes to exactly one."""
+    queue = store.sagas.dispatch
+    now = now_ms()
+    ids = [str(uuid.uuid4()) for _ in range(40)]
+    start = asyncio.Barrier(2)
+
+    async def relay(owner: str) -> set[str]:
+        held: set[str] = set()
+        await asyncio.wait_for(start.wait(), BARRIER_WAIT)
+        for saga_id in ids:
+            if await queue.claim_lease(saga_id, owner, now, now + 60_000):
+                held.add(saga_id)
+            await asyncio.sleep(0)
+        return held
+
+    a, b = await asyncio.gather(relay("relay-a"), relay("relay-b"))
+    assert not a & b, "held by both relays"
+    assert a | b == set(ids), "every lease has a holder"
+    for saga_id in ids:
+        await queue.release_lease(saga_id, "relay-a" if saga_id in a else "relay-b")
+
+
+async def concurrent_notice_claims_return_each_notice_once(store: MessageStore) -> None:
+    """Two relays claiming due failure notices at once: every notice goes to exactly one of them, once."""
+    queue = store.sagas.dispatch
+    now = now_ms()
+    entries = [_dispatch_entry(str(uuid.uuid4()), 1000, DispatchKind.COMMAND, now - 1_000) for _ in range(40)]
+    async with store.transaction():
+        await queue.record(entries)
+    for entry in entries:
+        await queue.mark_failed(
+            entry.id,
+            DispatchFailure(
+                attempts=1,
+                reason=FailureReason.NO_HANDLER,
+                message="nobody",
+                failed_at_ms=now,
+                notice_at_ms=now,
+            ),
+        )
+    mine = {entry.id for entry in entries}
+    start = asyncio.Barrier(2)
+
+    async def relay() -> list[str]:
+        got: list[str] = []
+        await asyncio.wait_for(start.wait(), BARRIER_WAIT)
+        while True:
+            found = await queue.claim_due_notice(now, now + 60_000)
+            if found is None:
+                return got
+            if found.id in mine:
+                got.append(found.id)
+            await asyncio.sleep(0)
+
+    a, b = await asyncio.gather(relay(), relay())
+    claimed = set(a) | set(b)
+    assert claimed == mine, "every due notice was claimed"
+    assert len(a) + len(b) == len(entries), f"a notice was claimed twice: {a} and {b}"
+    for entry_id in mine:
+        await queue.clear_notice(entry_id)
+
+
 MESSAGE_STORE_CHECKS: tuple[StoreCheck, ...] = (
     appended_entry_is_claimed_in_created_seq_order,
     outbox_rejects_a_payload_that_is_not_a_json_object,
@@ -827,17 +1573,35 @@ MESSAGE_STORE_L3_CHECKS: tuple[StoreCheck, ...] = (
 level-2 checks)."""
 
 
+MESSAGE_STORE_L4_CHECKS: tuple[StoreCheck, ...] = (
+    external_call_idempotency_returns_first_result,
+    saga_ports_round_trip,
+    two_transactions_starting_one_saga_key_leave_one_live_saga,
+    two_transactions_updating_one_saga_version_commit_once,
+    saga_dispatch_store_refuses_an_event_the_outbox_would_refuse,
+    due_deadline_is_claimed_once_until_its_lease_passes,
+    an_empty_deadline_correlation_id_reads_as_absent,
+    two_schedulers_claim_each_due_deadline_once,
+    dispatch_hands_out_each_saga_in_seq_order,
+    two_relays_never_hold_one_saga_lease,
+    concurrent_notice_claims_return_each_notice_once,
+)
+"""Every level-4 check, in the reference kit's order."""
+
+
 def _checks_for(level: int) -> tuple[StoreCheck, ...]:
     """The checks a run of ``level`` uses, in the Rust kit's order."""
-    if level == 2:
-        return MESSAGE_STORE_CHECKS
-    # The Rust list places delete_markers among the level-2 checks, and the other seven level-3 checks at the end.
-    return (
+    level3 = (
         *MESSAGE_STORE_CHECKS[:6],
         MESSAGE_STORE_L3_CHECKS[0],
         *MESSAGE_STORE_CHECKS[6:],
         *MESSAGE_STORE_L3_CHECKS[1:],
     )
+    if level == 2:
+        return MESSAGE_STORE_CHECKS
+    if level == 3:
+        return level3
+    return (*level3, *MESSAGE_STORE_L4_CHECKS)
 
 
 async def run_store_conformance(
@@ -847,9 +1611,10 @@ async def run_store_conformance(
 ) -> None:
     """Runs the checks of ``level`` by name on the store ``open_store`` returns (called once); the first failing check
     raises :class:`AssertionError` naming itself and the store. ``level=2`` runs the nine level-2 checks; ``level=3``
-    runs them and the eight level-3 control and dead-letter checks. See the module docstring."""
-    if level not in (2, 3):
-        raise ValueError(f"the store kit runs level 2 or 3, not {level}")
+    runs them and the eight level-3 control and dead-letter checks; ``level=4`` runs both and the eleven level-4 saga
+    and external-call checks. See the module docstring."""
+    if level not in (2, 3, 4):
+        raise ValueError(f"the store kit runs level 2, 3 or 4, not {level}")
     store = open_store()
     name = store.name
     for check in _checks_for(level):
@@ -865,3 +1630,9 @@ async def run_store_l3_conformance(open_store: Callable[[], MessageStore]) -> No
     """The level-3 form of :func:`run_store_conformance` (the nine level-2 checks and the eight level-3 checks). Kept
     as the named entry point; ``level=3`` is the same run."""
     await run_store_conformance(open_store, level=3)
+
+
+async def run_store_l4_conformance(open_store: Callable[[], MessageStore]) -> None:
+    """The level-4 form of :func:`run_store_conformance` (level 2 and 3 and the eleven level-4 checks). Kept as the
+    named entry point; ``level=4`` is the same run."""
+    await run_store_conformance(open_store, level=4)

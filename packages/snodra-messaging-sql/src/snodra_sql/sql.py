@@ -1,7 +1,8 @@
 """The SQL message store: PostgreSQL and MySQL on the shared layout version 1.
 
-The store keeps the outbox, the processed-event markers, the dead letters and the processor control
-state in the service's own database. Every operation joins the transaction bound to the current context
+The store keeps the outbox, the processed-event markers, the dead letters, the processor control state,
+the external-call records and the saga records in the service's own database. Every operation joins the
+transaction bound to the current context
 (``async with store.transaction()``) or runs in a short transaction of its own, at READ COMMITTED;
 ``store.transaction(conn=conn)`` binds a connection the service already runs a transaction on, and the
 store never commits or rolls it back.
@@ -22,8 +23,8 @@ nobody; MySQL has no notification and the relay polls.
 
 The dead-letter and processor-control stores use the layout's text/binary payload split and its
 ``replay`` array, and a letter whose expiry passed is gone for every read and write here. The
-external-call and saga ports are part of the interface frozen at level 2 and report
-:class:`snodra.MessageStoreUnsupported` for now. The official add-ons implement every port by level 4.
+external-call records commit outside the caller's transaction; the saga records, their dispatch entries,
+deadlines, failures and markers join it.
 
 See https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/.
 """
@@ -40,7 +41,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from typing import Any, Final
@@ -53,6 +54,7 @@ from asyncmy.constants import CLIENT
 from snodra import (
     RESET_KIND,
     AppendListener,
+    Association,
     Conflict,
     ControlOperation,
     DeadLetter,
@@ -61,13 +63,16 @@ from snodra import (
     DeadLetterStore,
     DeadLetterSummary,
     DeadlineDocument,
+    DeadlineStatus,
     DispatchFailure,
+    DispatchKind,
     ExternalCall,
+    ExternalCallStatus,
     ExternalCallStore,
+    FailureReason,
     InvalidMessage,
     Locked,
     MessageStoreFailed,
-    MessageStoreUnsupported,
     OutboxEntry,
     OutboxStore,
     Parked,
@@ -123,6 +128,8 @@ MAX_NAME: Final = 255
 MAX_ID: Final = 255
 FREE_TEXT_BYTES: Final = 16 * 1024
 PURGE_BATCH: Final = 1000
+SAGA_START_LOCK: Final = 0x534E4452
+"""The first key of the transaction-scoped advisory lock that serialises saga starts per start key."""
 
 DEFAULT_MIN_SIZE: Final = 1
 DEFAULT_MAX_SIZE: Final = 10
@@ -344,13 +351,13 @@ class SqlStore:
         self.processed: ProcessedStore = _SqlProcessed(self)
         self.dead_letters: DeadLetterStore = _SqlDeadLetters(self)
         self.control: ProcessorControlStore = _SqlControl(self)
-        self.external: ExternalCallStore = _UnsupportedExternal()
+        self.external: ExternalCallStore = _SqlExternalCalls(self)
         self.sagas: SagaStores = SagaStores(
-            sagas=_UnsupportedSagas(),
-            dispatch=_UnsupportedDispatch(),
-            deadlines=_UnsupportedDeadlines(),
-            failures=_UnsupportedFailures(),
-            markers=_UnsupportedMarkers(),
+            sagas=_SqlSagas(self),
+            dispatch=_SqlDispatch(self),
+            deadlines=_SqlDeadlines(self),
+            failures=_SqlFailures(self),
+            markers=_SqlMarkers(self),
         )
 
     @property
@@ -1686,148 +1693,891 @@ def _decode_replay(text: Any) -> tuple[ReplayRange, ...]:
     return tuple(ranges)
 
 
-# ---- the ports this level does not implement ------------------------------------------------------
+# ---- external calls -------------------------------------------------------------------------------
 
 
-def _unsupported(what: str) -> MessageStoreUnsupported:
-    return MessageStoreUnsupported(f"{what} in the SQL message store (level 2)")
+class _SqlExternalCalls:
+    """The external-call records on ``snodra_external_calls``. Every operation is a write of its own, outside the
+    caller's transaction; every write after the insert is conditional on the record read or owned."""
 
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
 
-class _UnsupportedExternal:
+    def _columns(self) -> str:
+        return "id, status, reply, error, attempts, updated_at, lease_until, owner"
+
     async def insert(self, call: ExternalCall) -> bool:
-        raise _unsupported("external calls")
+        _check_text("an external call's key", call.key, -1)
+        _check_text("an external call's reply", call.reply or "", -1)
+        _check_text("an external call's error", call.error or "", -1)
+        store = self._store
+        async with store._own() as conn:
+            try:
+                await store._exec(
+                    conn,
+                    "INSERT INTO snodra_external_calls "
+                    "(id_hash, id, status, reply, error, attempts, updated_at, lease_until, owner) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        _sha256(call.key),
+                        call.key,
+                        call.status.value,
+                        call.reply,
+                        call.error,
+                        call.attempts,
+                        store._time(call.updated_at_ms),
+                        None if call.lease_until_ms is None else store._time(call.lease_until_ms),
+                        call.owner,
+                    ),
+                )
+            except Conflict as error:
+                if _duplicate(error):
+                    return False
+                raise
+        return True
 
     async def find(self, key: str) -> ExternalCall | None:
-        raise _unsupported("external calls")
+        _check_text("an external call's key", key, -1)
+        store = self._store
+        async with store._read() as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_external_calls WHERE id_hash = ?",
+                (_sha256(key),),
+            )
+        return None if row is None else _external_from_row(row)
 
     async def take_over(self, seen: ExternalCall, owner: str, lease_until_ms: int, now_ms: int) -> ExternalCall | None:
-        raise _unsupported("external calls")
+        store = self._store
+        async with store._own() as conn:
+            condition, args = _external_read_condition(seen, store)
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_external_calls SET lease_until = ?, updated_at = ?, owner = ?, attempts = attempts + 1 "
+                f"WHERE {condition}",
+                (store._time(lease_until_ms), store._time(now_ms), owner, *args),
+            )
+            if affected != 1:
+                return None
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_external_calls WHERE id_hash = ?",
+                (_sha256(seen.key),),
+            )
+        return None if row is None else _external_from_row(row)
 
     async def expire(self, seen: ExternalCall, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        return await self._settle(seen, ExternalCallStatus.UNKNOWN, now_ms, reply=None, error=None)
 
     async def succeed(self, key: str, owner: str, reply: str, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_external_calls SET status = ?, reply = ?, error = NULL, updated_at = ?, "
+                "lease_until = NULL, owner = NULL "
+                "WHERE id_hash = ? AND status = 'IN_PROGRESS' AND owner = ?",
+                (ExternalCallStatus.SUCCEEDED.value, reply, store._time(now_ms), _sha256(key), owner),
+            )
+        return affected == 1
 
     async def fail(self, key: str, owner: str, error: str, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_external_calls SET status = ?, error = ?, updated_at = ?, "
+                "lease_until = NULL, owner = NULL "
+                "WHERE id_hash = ? AND status = 'IN_PROGRESS' AND owner = ?",
+                (ExternalCallStatus.FAILED.value, error, store._time(now_ms), _sha256(key), owner),
+            )
+        return affected == 1
 
     async def mark_unknown(self, key: str, owner: str, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_external_calls SET status = ?, updated_at = ?, lease_until = NULL, owner = NULL "
+                "WHERE id_hash = ? AND status = 'IN_PROGRESS' AND owner = ?",
+                (ExternalCallStatus.UNKNOWN.value, store._time(now_ms), _sha256(key), owner),
+            )
+        return affected == 1
 
     async def reset(self, key: str, owner: str) -> bool:
-        raise _unsupported("external calls")
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "DELETE FROM snodra_external_calls WHERE id_hash = ? AND status = 'IN_PROGRESS' AND owner = ?",
+                (_sha256(key), owner),
+            )
+        return affected == 1
+
+    async def _settle(
+        self,
+        seen: ExternalCall,
+        status: ExternalCallStatus,
+        now_ms: int,
+        *,
+        reply: str | None,
+        error: str | None,
+    ) -> bool:
+        store = self._store
+        async with store._own() as conn:
+            condition, args = _external_read_condition(seen, store)
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_external_calls SET status = ?, reply = ?, error = ?, updated_at = ?, "
+                f"lease_until = NULL, owner = NULL WHERE {condition}",
+                (status.value, reply, error, store._time(now_ms), *args),
+            )
+        return affected == 1
 
 
-class _UnsupportedSagas:
+def _external_read_condition(seen: ExternalCall, store: SqlStore) -> tuple[str, tuple[Any, ...]]:
+    condition = "id_hash = ? AND status = 'IN_PROGRESS' "
+    args: list[Any] = [_sha256(seen.key)]
+    if seen.owner is None:
+        condition += "AND owner IS NULL "
+    else:
+        condition += "AND owner = ? "
+        args.append(seen.owner)
+    if seen.lease_until_ms is None:
+        condition += "AND lease_until IS NULL"
+    else:
+        condition += "AND lease_until = ?"
+        args.append(store._time(seen.lease_until_ms))
+    return condition, tuple(args)
+
+
+def _external_from_row(row: dict[str, Any]) -> ExternalCall:
+    return ExternalCall(
+        key=str(row["id"]),
+        status=ExternalCallStatus(str(row["status"])),
+        reply=None if row["reply"] is None else str(row["reply"]),
+        error=None if row["error"] is None else str(row["error"]),
+        attempts=int(row["attempts"]),
+        updated_at_ms=_ms_value(row["updated_at"]),
+        lease_until_ms=None if row["lease_until"] is None else _ms_value(row["lease_until"]),
+        owner=None if row["owner"] is None else str(row["owner"]),
+    )
+
+
+# ---- the sagas ------------------------------------------------------------------------------------
+
+
+def _association_hash(key: str, value: str) -> str:
+    return hashlib.sha256(key.encode() + b"\x00" + value.encode()).hexdigest()
+
+
+class _SqlSagas:
+    """The saga instances on ``snodra_sagas`` and their associations; writes join the caller's transaction."""
+
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
+
+    def _columns(self) -> str:
+        return "id, type, state, start_key, start_key_hash, ended, ended_at, version, created_at, updated_at"
+
     async def find_by_id(self, saga_id: str, *, tx: Tx | None = None) -> SagaDocument | None:
-        raise _unsupported("sagas")
+        _check_text("a saga's id", saga_id, MAX_ID)
+        store = self._store
+        async with store._scoped(tx) as conn:
+            row = await store._fetchone(conn, f"SELECT {self._columns()} FROM snodra_sagas WHERE id = ?", (saga_id,))
+            if row is None:
+                return None
+            associations = await self._associations(conn, (saga_id,))
+        return _saga_from_row(row, associations.get(saga_id, ()))
 
     async def find_live(self, type_name: str, key: str, value: str, *, tx: Tx | None = None) -> list[SagaDocument]:
-        raise _unsupported("sagas")
+        _check_text("a saga's type", type_name, MAX_NAME)
+        _check_text("an association's key", key, -1)
+        _check_text("an association's value", value, -1)
+        store = self._store
+        async with store._scoped(tx) as conn:
+            rows = await store._fetchall(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_sagas s WHERE s.type = ? AND s.ended = FALSE "
+                "AND EXISTS (SELECT 1 FROM snodra_saga_associations a WHERE a.saga_id = s.id "
+                "AND a.assoc_hash = ? AND a.assoc_key = ? AND a.assoc_value = ?) "
+                "ORDER BY s.created_at, s.id",
+                (type_name, _association_hash(key, value), key, value),
+            )
+            associations = await self._associations(conn, [str(row["id"]) for row in rows])
+        return [_saga_from_row(row, associations.get(str(row["id"]), ())) for row in rows]
 
     async def insert(self, saga: SagaDocument, *, tx: Tx | None = None) -> None:
-        raise _unsupported("sagas")
+        self._check(saga)
+        store = self._store
+        async with store._scoped(tx) as conn:
+            if saga.start_key is not None and not saga.ended:
+                if store._driver == DRIVER_POSTGRES:
+                    got = await store._fetchval(
+                        conn,
+                        "SELECT pg_try_advisory_xact_lock(?, hashtext(?)) AS got",
+                        (SAGA_START_LOCK, _sha256(saga.start_key)),
+                    )
+                    if not got:
+                        raise Conflict("another transaction is starting a saga with the same start key")
+                    previous_timeout: Any = None
+                else:
+                    previous_timeout = await store._fetchval(conn, "SELECT @@SESSION.innodb_lock_wait_timeout AS t")
+                    await store._exec(conn, "SET SESSION innodb_lock_wait_timeout = 1")
+            try:
+                await store._exec(
+                    conn,
+                    "INSERT INTO snodra_sagas "
+                    "(id, type, state, start_key, start_key_hash, ended, ended_at, version, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        saga.id,
+                        saga.type_name,
+                        saga.state,
+                        saga.start_key,
+                        None if saga.start_key is None else _sha256(saga.start_key),
+                        saga.ended,
+                        None if saga.ended_at_ms is None else store._time(saga.ended_at_ms),
+                        saga.version,
+                        store._time(saga.created_at_ms),
+                        store._time(saga.updated_at_ms),
+                    ),
+                )
+            finally:
+                if saga.start_key is not None and not saga.ended and store._driver == DRIVER_MYSQL:
+                    with contextlib.suppress(Exception):
+                        await store._exec(conn, "SET SESSION innodb_lock_wait_timeout = ?", (int(previous_timeout),))
+            await self._insert_associations(conn, saga)
 
     async def update(self, saga: SagaDocument, expected_version: int, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("sagas")
+        self._check(saga)
+        store = self._store
+        async with store._scoped(tx) as conn:
+            version = await store._fetchval(
+                conn,
+                "SELECT version FROM snodra_sagas WHERE id = ? FOR UPDATE NOWAIT",
+                (saga.id,),
+            )
+            if version is None or int(version) != expected_version:
+                return False
+            await store._exec(
+                conn,
+                "UPDATE snodra_sagas SET type = ?, state = ?, start_key = ?, start_key_hash = ?, ended = ?, "
+                "ended_at = ?, version = ?, created_at = ?, updated_at = ? WHERE id = ? AND version = ?",
+                (
+                    saga.type_name,
+                    saga.state,
+                    saga.start_key,
+                    None if saga.start_key is None else _sha256(saga.start_key),
+                    saga.ended,
+                    None if saga.ended_at_ms is None else store._time(saga.ended_at_ms),
+                    saga.version,
+                    store._time(saga.created_at_ms),
+                    store._time(saga.updated_at_ms),
+                    saga.id,
+                    expected_version,
+                ),
+            )
+            await store._exec(conn, "DELETE FROM snodra_saga_associations WHERE saga_id = ?", (saga.id,))
+            await self._insert_associations(conn, saga)
+        return True
 
     async def count_live_by_type(self) -> dict[str, int]:
-        raise _unsupported("sagas")
+        store = self._store
+        async with store._read() as conn:
+            rows = await store._fetchall(
+                conn,
+                "SELECT type, COUNT(*) AS n FROM snodra_sagas WHERE ended = FALSE GROUP BY type",
+            )
+        return {str(row["type"]): int(row["n"]) for row in rows}
+
+    def _check(self, saga: SagaDocument) -> None:
+        _check_text("a saga's id", saga.id, MAX_ID)
+        _check_text("a saga's type", saga.type_name, MAX_NAME)
+        _check_text("a saga's state", saga.state, -1)
+        if saga.start_key is not None:
+            _check_text("a saga's start key", saga.start_key, -1)
+        for association in saga.associations:
+            _check_text("an association's key", association.key, -1)
+            _check_text("an association's value", association.value, -1)
+
+    async def _insert_associations(self, conn: Any, saga: SagaDocument) -> None:
+        for index, association in enumerate(saga.associations):
+            await self._store._exec(
+                conn,
+                "INSERT INTO snodra_saga_associations (saga_id, idx, assoc_key, assoc_value, assoc_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    saga.id,
+                    index,
+                    association.key,
+                    association.value,
+                    _association_hash(association.key, association.value),
+                ),
+            )
+
+    async def _associations(self, conn: Any, ids: Sequence[str]) -> dict[str, tuple[Association, ...]]:
+        if not ids:
+            return {}
+        places = ", ".join("?" for _ in ids)
+        rows = await self._store._fetchall(
+            conn,
+            "SELECT saga_id, assoc_key, assoc_value FROM snodra_saga_associations "
+            f"WHERE saga_id IN ({places}) ORDER BY saga_id, idx",
+            tuple(ids),
+        )
+        grouped: dict[str, list[Association]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["saga_id"]), []).append(
+                Association(str(row["assoc_key"]), str(row["assoc_value"]))
+            )
+        return {saga_id: tuple(items) for saga_id, items in grouped.items()}
 
 
-class _UnsupportedDispatch:
+def _saga_from_row(row: dict[str, Any], associations: Sequence[Association]) -> SagaDocument:
+    return SagaDocument(
+        id=str(row["id"]),
+        type_name=str(row["type"]),
+        state=str(row["state"]),
+        associations=tuple(associations),
+        start_key=None if row["start_key"] is None else str(row["start_key"]),
+        ended=bool(row["ended"]),
+        ended_at_ms=None if row["ended_at"] is None else _ms_value(row["ended_at"]),
+        version=int(row["version"]),
+        created_at_ms=_ms_value(row["created_at"]),
+        updated_at_ms=_ms_value(row["updated_at"]),
+    )
+
+
+class _SqlDispatch:
+    """The saga-side outbox and its leases."""
+
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
+
+    def _columns(self) -> str:
+        return (
+            "id, saga_id, seq, kind, type, payload, "
+            f"CAST(headers AS {self._store._text_type()}) AS headers, routing_key, created_at, dispatched_at, "
+            "attempts, next_attempt_at, failed_at, failure_reason, failure_message, notice_pending, "
+            "notice_attempts, notice_next_at"
+        )
+
     async def record(self, entries: Sequence[SagaDispatchDocument], *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga dispatch")
+        for entry in entries:
+            _check_text("a saga-dispatch entry's id", entry.id, MAX_ID)
+            _check_text("a saga-dispatch entry's saga id", entry.saga_id, MAX_ID)
+            _check_text("a saga-dispatch entry's type", entry.type_name, MAX_NAME)
+            if entry.kind is DispatchKind.EVENT:
+                check_outbox_payload(entry.type_name, entry.payload.encode())
+        if not entries:
+            return
+        store = self._store
+        async with store._scoped(tx) as conn:
+            for entry in entries:
+                await store._exec(
+                    conn,
+                    "INSERT INTO snodra_saga_dispatch "
+                    "(id, saga_id, seq, kind, type, payload, headers, routing_key, created_at, dispatched_at, "
+                    "attempts, next_attempt_at, failed_at, failure_reason, failure_message, notice_pending, "
+                    "notice_attempts, notice_next_at) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, CAST(? AS {store._json_type()}), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry.id,
+                        entry.saga_id,
+                        entry.seq,
+                        entry.kind.value,
+                        entry.type_name,
+                        entry.payload,
+                        _headers_json(entry.headers),
+                        entry.routing_key,
+                        store._time(entry.created_at_ms),
+                        None if entry.dispatched_at_ms is None else store._time(entry.dispatched_at_ms),
+                        entry.attempts,
+                        None if entry.next_attempt_at_ms is None else store._time(entry.next_attempt_at_ms),
+                        None if entry.failed_at_ms is None else store._time(entry.failed_at_ms),
+                        None if entry.failure_reason is None else entry.failure_reason.value,
+                        entry.failure_message,
+                        entry.notice_pending,
+                        entry.notice_attempts,
+                        None if entry.notice_next_at_ms is None else store._time(entry.notice_next_at_ms),
+                    ),
+                )
 
     async def due_sagas(self, now_ms: int, except_sagas: Sequence[str], limit: int) -> list[str]:
-        raise _unsupported("saga dispatch")
+        if limit <= 0:
+            return []
+        store = self._store
+        excluded = ""
+        args: list[Any] = []
+        if except_sagas:
+            places = ", ".join("?" for _ in except_sagas)
+            excluded = f"AND d.saga_id NOT IN ({places}) "
+            args.extend(except_sagas)
+        args.extend([store._time(now_ms), int(limit)])
+        async with store._read() as conn:
+            rows = await store._fetchall(
+                conn,
+                "SELECT d.saga_id FROM snodra_saga_dispatch d "
+                "WHERE d.dispatched_at IS NULL AND d.failed_at IS NULL "
+                f"{excluded}"
+                "AND d.seq = (SELECT MIN(x.seq) FROM snodra_saga_dispatch x "
+                "WHERE x.saga_id = d.saga_id AND x.dispatched_at IS NULL AND x.failed_at IS NULL) "
+                "AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?) "
+                "ORDER BY d.created_at, d.saga_id LIMIT ?",
+                tuple(args),
+            )
+        return [str(row["saga_id"]) for row in rows]
 
     async def next_pending(self, saga_id: str) -> SagaDispatchDocument | None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._read() as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_saga_dispatch "
+                "WHERE saga_id = ? AND dispatched_at IS NULL AND failed_at IS NULL ORDER BY seq LIMIT 1",
+                (saga_id,),
+            )
+        return None if row is None else _dispatch_from_row(row)
 
     async def mark_dispatched(self, entry_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            await store._exec(
+                conn,
+                "UPDATE snodra_saga_dispatch SET dispatched_at = ? WHERE id = ?",
+                (store._time(now_ms), entry_id),
+            )
 
     async def schedule_retry(self, entry_id: str, attempts: int, next_attempt_at_ms: int) -> None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._own() as conn:
+            await store._exec(
+                conn,
+                "UPDATE snodra_saga_dispatch SET attempts = ?, next_attempt_at = ? WHERE id = ?",
+                (attempts, store._time(next_attempt_at_ms), entry_id),
+            )
 
     async def mark_failed(self, entry_id: str, failure: DispatchFailure) -> None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        sets = ["failed_at = ?", "failure_reason = ?", "failure_message = ?"]
+        args: list[Any] = [store._time(failure.failed_at_ms), failure.reason.value, _cut_free_text(failure.message)]
+        if failure.attempts is not None:
+            sets.append("attempts = ?")
+            args.append(failure.attempts)
+        if failure.notice_at_ms is None:
+            sets.extend(["notice_pending = NULL", "notice_attempts = NULL", "notice_next_at = NULL"])
+        else:
+            sets.extend(["notice_pending = TRUE", "notice_attempts = 0", "notice_next_at = ?"])
+            args.append(store._time(failure.notice_at_ms))
+        args.append(entry_id)
+        async with store._own() as conn:
+            await store._exec(conn, f"UPDATE snodra_saga_dispatch SET {', '.join(sets)} WHERE id = ?", tuple(args))
 
     async def claim_due_notice(self, now_ms: int, reserve_until_ms: int) -> SagaDispatchDocument | None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._own() as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_saga_dispatch "
+                "WHERE notice_pending = TRUE AND (notice_next_at IS NULL OR notice_next_at <= ?) "
+                "ORDER BY CASE WHEN notice_next_at IS NULL THEN 0 ELSE 1 END, notice_next_at, id "
+                "LIMIT 1 FOR UPDATE SKIP LOCKED",
+                (store._time(now_ms),),
+            )
+            if row is None:
+                return None
+            await store._exec(
+                conn,
+                "UPDATE snodra_saga_dispatch SET notice_next_at = ? WHERE id = ?",
+                (store._time(reserve_until_ms), str(row["id"])),
+            )
+        claimed = _dispatch_from_row(row)
+        return replace(claimed, notice_next_at_ms=reserve_until_ms)
 
     async def clear_notice(self, entry_id: str) -> None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._own() as conn:
+            await store._exec(
+                conn,
+                "UPDATE snodra_saga_dispatch SET notice_pending = NULL, notice_attempts = NULL, "
+                "notice_next_at = NULL WHERE id = ?",
+                (entry_id,),
+            )
 
     async def schedule_notice_retry(self, entry_id: str, notice_attempts: int, next_at_ms: int) -> None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._own() as conn:
+            await store._exec(
+                conn,
+                "UPDATE snodra_saga_dispatch SET notice_attempts = ?, notice_next_at = ? WHERE id = ?",
+                (notice_attempts, store._time(next_at_ms), entry_id),
+            )
 
     async def claim_lease(self, saga_id: str, owner: str, now_ms: int, until_ms: int) -> bool:
-        raise _unsupported("saga dispatch")
+        _check_text("a saga id", saga_id, MAX_ID)
+        store = self._store
+        try:
+            async with store._own() as conn:
+                if store._driver == DRIVER_POSTGRES:
+                    affected = await store._exec(
+                        conn,
+                        "INSERT INTO snodra_saga_dispatch_leases (saga_id, owner, lease_until) "
+                        "VALUES (?, ?, ?) ON CONFLICT (saga_id) DO UPDATE SET owner = EXCLUDED.owner, "
+                        "lease_until = EXCLUDED.lease_until "
+                        "WHERE snodra_saga_dispatch_leases.lease_until < ?",
+                        (saga_id, owner, store._time(until_ms), store._time(now_ms)),
+                    )
+                    return affected == 1
+                affected = await store._exec(
+                    conn,
+                    "UPDATE snodra_saga_dispatch_leases SET owner = ?, lease_until = ? "
+                    "WHERE saga_id = ? AND lease_until < ?",
+                    (owner, store._time(until_ms), saga_id, store._time(now_ms)),
+                )
+                if affected == 1:
+                    return True
+                await store._exec(
+                    conn,
+                    "INSERT INTO snodra_saga_dispatch_leases (saga_id, owner, lease_until) VALUES (?, ?, ?)",
+                    (saga_id, owner, store._time(until_ms)),
+                )
+                return True
+        except Conflict as error:
+            if _duplicate(error) or store._driver == DRIVER_MYSQL:
+                return False
+            raise
 
     async def renew_lease(self, saga_id: str, owner: str, until_ms: int) -> bool:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._own() as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_saga_dispatch_leases SET lease_until = ? WHERE saga_id = ? AND owner = ?",
+                (store._time(until_ms), saga_id, owner),
+            )
+        return affected == 1
 
     async def release_lease(self, saga_id: str, owner: str) -> None:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._own() as conn:
+            await store._exec(
+                conn,
+                "DELETE FROM snodra_saga_dispatch_leases WHERE saga_id = ? AND owner = ?",
+                (saga_id, owner),
+            )
 
     async def pending(self) -> int:
-        raise _unsupported("saga dispatch")
+        store = self._store
+        async with store._read() as conn:
+            value = await store._fetchval(
+                conn,
+                "SELECT COUNT(*) AS n FROM snodra_saga_dispatch WHERE dispatched_at IS NULL AND failed_at IS NULL",
+            )
+        return 0 if value is None else int(value)
 
 
-class _UnsupportedDeadlines:
+def _dispatch_from_row(row: dict[str, Any]) -> SagaDispatchDocument:
+    return SagaDispatchDocument(
+        id=str(row["id"]),
+        saga_id=str(row["saga_id"]),
+        seq=int(row["seq"]),
+        kind=DispatchKind(str(row["kind"])),
+        type_name=str(row["type"]),
+        payload=str(row["payload"]),
+        headers=_headers_from_json(row["headers"]),
+        routing_key=None if row["routing_key"] is None else str(row["routing_key"]),
+        created_at_ms=_ms_value(row["created_at"]),
+        dispatched_at_ms=None if row["dispatched_at"] is None else _ms_value(row["dispatched_at"]),
+        attempts=int(row["attempts"]),
+        next_attempt_at_ms=None if row["next_attempt_at"] is None else _ms_value(row["next_attempt_at"]),
+        failed_at_ms=None if row["failed_at"] is None else _ms_value(row["failed_at"]),
+        failure_reason=None if row["failure_reason"] is None else FailureReason(str(row["failure_reason"])),
+        failure_message=None if row["failure_message"] is None else str(row["failure_message"]),
+        notice_pending=None if row["notice_pending"] is None else bool(row["notice_pending"]),
+        notice_attempts=None if row["notice_attempts"] is None else int(row["notice_attempts"]),
+        notice_next_at_ms=None if row["notice_next_at"] is None else _ms_value(row["notice_next_at"]),
+    )
+
+
+class _SqlDeadlines:
+    """The saga deadlines on ``snodra_deadlines``."""
+
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
+
+    def _columns(self) -> str:
+        return (
+            "id, saga_type, saga_id, name, payload, payload_type, due_at, correlation_id, status, "
+            "claimed_by, claimed_until, finished_at"
+        )
+
     async def insert(self, deadline: DeadlineDocument, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        self._check(deadline)
+        store = self._store
+        async with store._scoped(tx) as conn:
+            await store._exec(
+                conn,
+                "INSERT INTO snodra_deadlines "
+                "(id, saga_type, saga_id, name, payload, payload_type, due_at, correlation_id, status, "
+                "claimed_by, claimed_until, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    deadline.id,
+                    deadline.saga_type,
+                    deadline.saga_id,
+                    deadline.name,
+                    deadline.payload,
+                    deadline.payload_type,
+                    store._time(deadline.due_at_ms),
+                    deadline.correlation_id or "",
+                    deadline.status.value,
+                    deadline.claimed_by,
+                    None if deadline.claimed_until_ms is None else store._time(deadline.claimed_until_ms),
+                    None if deadline.finished_at_ms is None else store._time(deadline.finished_at_ms),
+                ),
+            )
 
     async def find_scheduled(self, deadline_id: str, *, tx: Tx | None = None) -> DeadlineDocument | None:
-        raise _unsupported("deadlines")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_deadlines WHERE id = ? AND status = 'SCHEDULED'",
+                (deadline_id,),
+            )
+        return None if row is None else _deadline_from_row(row)
 
     async def cancel(self, saga_id: str, deadline_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        await self._cancel("id = ? AND saga_id = ?", (deadline_id, saga_id), now_ms, tx)
 
     async def cancel_by_name(self, saga_id: str, name: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        await self._cancel("saga_id = ? AND name = ?", (saga_id, name), now_ms, tx)
 
     async def cancel_all(self, saga_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        await self._cancel("saga_id = ?", (saga_id,), now_ms, tx)
+
+    async def _cancel(self, condition: str, args: tuple[Any, ...], now_ms: int, tx: Tx | None) -> None:
+        store = self._store
+        async with store._scoped(tx) as conn:
+            await store._exec(
+                conn,
+                f"UPDATE snodra_deadlines SET status = 'CANCELLED', finished_at = ? "
+                f"WHERE {condition} AND status = 'SCHEDULED'",
+                (store._time(now_ms), *args),
+            )
 
     async def mark_fired(self, deadline_id: str, now_ms: int, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("deadlines")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_deadlines SET status = 'FIRED', finished_at = ? WHERE id = ? AND status = 'SCHEDULED'",
+                (store._time(now_ms), deadline_id),
+            )
+        return affected == 1
 
     async def claim_due(self, owner: str, now_ms: int, claimed_until_ms: int) -> DeadlineDocument | None:
-        raise _unsupported("deadlines")
+        store = self._store
+        async with store._own() as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_deadlines WHERE status = 'SCHEDULED' "
+                "AND due_at <= ? AND (claimed_until IS NULL OR claimed_until < ?) "
+                "ORDER BY due_at, id LIMIT 1 FOR UPDATE SKIP LOCKED",
+                (store._time(now_ms), store._time(now_ms)),
+            )
+            if row is None:
+                return None
+            await store._exec(
+                conn,
+                "UPDATE snodra_deadlines SET claimed_by = ?, claimed_until = ? WHERE id = ?",
+                (owner, store._time(claimed_until_ms), str(row["id"])),
+            )
+        return replace(
+            _deadline_from_row(row),
+            claimed_by=owner,
+            claimed_until_ms=claimed_until_ms,
+        )
 
     async def count_overdue_by_name(self, now_ms: int) -> dict[str, int]:
-        raise _unsupported("deadlines")
+        store = self._store
+        async with store._read() as conn:
+            rows = await store._fetchall(
+                conn,
+                "SELECT name, COUNT(*) AS n FROM snodra_deadlines "
+                "WHERE status = 'SCHEDULED' AND due_at <= ? GROUP BY name",
+                (store._time(now_ms),),
+            )
+        return {str(row["name"]): int(row["n"]) for row in rows}
+
+    def _check(self, deadline: DeadlineDocument) -> None:
+        _check_text("a deadline's id", deadline.id, MAX_ID)
+        _check_text("a deadline's saga id", deadline.saga_id, MAX_ID)
+        _check_text("a deadline's saga type", deadline.saga_type, MAX_NAME)
+        _check_text("a deadline's name", deadline.name, MAX_NAME)
+        if deadline.payload is not None:
+            _check_text("a deadline's payload", deadline.payload, -1)
+        if deadline.payload_type is not None:
+            _check_text("a deadline's payload type", deadline.payload_type, -1)
+        if deadline.correlation_id is not None:
+            _check_text("a deadline's correlation id", deadline.correlation_id, -1)
 
 
-class _UnsupportedFailures:
+def _deadline_from_row(row: dict[str, Any]) -> DeadlineDocument:
+    correlation = row["correlation_id"]
+    return DeadlineDocument(
+        id=str(row["id"]),
+        saga_type=str(row["saga_type"]),
+        saga_id=str(row["saga_id"]),
+        name=str(row["name"]),
+        payload=None if row["payload"] is None else str(row["payload"]),
+        payload_type=None if row["payload_type"] is None else str(row["payload_type"]),
+        due_at_ms=_ms_value(row["due_at"]),
+        status=DeadlineStatus(str(row["status"])),
+        claimed_by=None if row["claimed_by"] is None else str(row["claimed_by"]),
+        claimed_until_ms=None if row["claimed_until"] is None else _ms_value(row["claimed_until"]),
+        finished_at_ms=None if row["finished_at"] is None else _ms_value(row["finished_at"]),
+        correlation_id=None if not correlation else str(correlation),
+    )
+
+
+class _SqlFailures:
+    """The parked saga events on ``snodra_saga_failures``."""
+
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
+
+    def _columns(self) -> str:
+        return (
+            "id, saga_type, event_id, event_type, payload, "
+            f"CAST(headers AS {self._store._text_type()}) AS headers, error, attempts, first_failed_at, "
+            "last_failed_at"
+        )
+
     async def find(self, failure_id: str, *, tx: Tx | None = None) -> SagaFailureDocument | None:
-        raise _unsupported("saga failures")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            row = await store._fetchone(
+                conn,
+                f"SELECT {self._columns()} FROM snodra_saga_failures WHERE id_hash = ?",
+                (_sha256(failure_id),),
+            )
+        return None if row is None else _failure_from_row(row)
 
     async def save(self, failure: SagaFailureDocument, *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga failures")
+        _check_text("a saga failure's saga type", failure.saga_type, MAX_NAME)
+        _check_text("a saga failure's id", failure.id, -1)
+        _check_text("a saga failure's event id", failure.event_id, -1)
+        _check_text("a saga failure's event type", failure.event_type, -1)
+        _check_text("a saga failure's payload", failure.payload, -1)
+        store = self._store
+        values = (
+            _sha256(failure.id),
+            failure.id,
+            failure.saga_type,
+            failure.event_id,
+            failure.event_type,
+            failure.payload,
+            _headers_json(failure.headers),
+            _cut_free_text(failure.error),
+            failure.attempts,
+            store._time(failure.first_failed_at_ms),
+            store._time(failure.last_failed_at_ms),
+        )
+        insert = (
+            "INSERT INTO snodra_saga_failures "
+            "(id_hash, id, saga_type, event_id, event_type, payload, headers, error, attempts, "
+            "first_failed_at, last_failed_at) "
+            f"VALUES (?, ?, ?, ?, ?, ?, CAST(? AS {store._json_type()}), ?, ?, ?, ?)"
+        )
+        update = (
+            "id = ?, saga_type = ?, event_id = ?, event_type = ?, payload = ?, "
+            f"headers = CAST(? AS {store._json_type()}), error = ?, attempts = ?, first_failed_at = ?, "
+            "last_failed_at = ?"
+        )
+        async with store._scoped(tx) as conn:
+            if store._driver == DRIVER_POSTGRES:
+                await store._exec(conn, f"{insert} ON CONFLICT (id_hash) DO UPDATE SET {update}", values + values[1:])
+            else:
+                sets = (
+                    "id = VALUES(id), saga_type = VALUES(saga_type), event_id = VALUES(event_id), "
+                    "event_type = VALUES(event_type), payload = VALUES(payload), headers = VALUES(headers), "
+                    "error = VALUES(error), attempts = VALUES(attempts), first_failed_at = VALUES(first_failed_at), "
+                    "last_failed_at = VALUES(last_failed_at)"
+                )
+                await store._exec(conn, f"{insert} ON DUPLICATE KEY UPDATE {sets}", values)
 
     async def delete(self, failure_id: str, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("saga failures")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            affected = await store._exec(
+                conn, "DELETE FROM snodra_saga_failures WHERE id_hash = ?", (_sha256(failure_id),)
+            )
+        return affected == 1
 
     async def failed_again(
         self, failure_id: str, error: str, attempts: int, now_ms: int, *, tx: Tx | None = None
     ) -> bool:
-        raise _unsupported("saga failures")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            affected = await store._exec(
+                conn,
+                "UPDATE snodra_saga_failures SET attempts = attempts + ?, error = ?, last_failed_at = ? "
+                "WHERE id_hash = ?",
+                (attempts, _cut_free_text(error), store._time(now_ms), _sha256(failure_id)),
+            )
+        return affected == 1
 
     async def list(self, saga_type: str | None = None, *, tx: Tx | None = None) -> builtins.list[SagaFailureDocument]:
-        raise _unsupported("saga failures")
+        store = self._store
+        query = f"SELECT {self._columns()} FROM snodra_saga_failures"
+        args: list[Any] = []
+        if saga_type is not None:
+            query += " WHERE saga_type = ?"
+            args.append(saga_type)
+        query += " ORDER BY last_failed_at, id_hash"
+        async with store._scoped(tx) as conn:
+            rows = await store._fetchall(conn, query, tuple(args))
+        return [_failure_from_row(row) for row in rows]
 
 
-class _UnsupportedMarkers:
+def _failure_from_row(row: dict[str, Any]) -> SagaFailureDocument:
+    return SagaFailureDocument(
+        id=str(row["id"]),
+        saga_type=str(row["saga_type"]),
+        event_id=str(row["event_id"]),
+        event_type=str(row["event_type"]),
+        payload=str(row["payload"]),
+        headers=_headers_from_json(row["headers"]),
+        error=str(row["error"]),
+        attempts=int(row["attempts"]),
+        first_failed_at_ms=_ms_value(row["first_failed_at"]),
+        last_failed_at_ms=_ms_value(row["last_failed_at"]),
+    )
+
+
+class _SqlMarkers:
+    """The saga stage's markers in ``snodra_processed_events``."""
+
+    def __init__(self, store: SqlStore) -> None:
+        self._store = store
+
     async def exists(self, marker_id: str, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("saga markers")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            value = await store._fetchval(
+                conn, "SELECT COUNT(*) AS n FROM snodra_processed_events WHERE id_hash = ?", (_sha256(marker_id),)
+            )
+        return bool(value)
 
     async def insert(self, marker_id: str, type_name: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga markers")
+        store = self._store
+        async with store._scoped(tx) as conn:
+            await store._exec(
+                conn,
+                "INSERT INTO snodra_processed_events (id_hash, id, type, processed_at) VALUES (?, ?, ?, ?)",
+                (_sha256(marker_id), marker_id, type_name, store._time(now_ms)),
+            )
 
 
 # ---- values, bounds and drivers -------------------------------------------------------------------
@@ -2098,7 +2848,7 @@ def _affected(status: str) -> int:
 
 
 def _failure(error: BaseException) -> BaseException:
-    if isinstance(error, MessageStoreUnsupported | InvalidMessage | Conflict | MessageStoreFailed):
+    if isinstance(error, InvalidMessage | Conflict | MessageStoreFailed):
         return error
     if isinstance(error, asyncpg.PostgresError):
         code = getattr(error, "sqlstate", None)

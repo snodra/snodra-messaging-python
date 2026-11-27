@@ -15,7 +15,6 @@ from snodra._store import (
     MessageStore,
     OutboxEntry,
     Tx,
-    Unsupported,
     bind_transaction,
     current_transaction,
     now_ms,
@@ -361,20 +360,14 @@ async def test_a_foreign_transaction_rolls_back_without_failing() -> None:
     await other.rollback(tx)
 
 
-async def test_the_level_4_ports_are_unsupported_with_the_level_3_ones_in_place() -> None:
+async def test_the_level_4_ports_are_implemented_with_the_level_3_ones_in_place() -> None:
     store = MemoryStore()
     assert await store.processed.delete_markers("processor", []) == 0
     assert await store.dead_letters.count() == 0
     assert (await store.control.get("processor")).paused is False
-    with pytest.raises(Unsupported):
-        await store.external.find("key")
-    with pytest.raises(Unsupported):
-        await store.sagas.sagas.find_by_id("saga")
-    with pytest.raises(Unsupported):
-        await store.sagas.dispatch.pending()
-    with pytest.raises(Unsupported):
-        await store.sagas.deadlines.claim_due("scheduler", 0, 1)
-    with pytest.raises(Unsupported):
-        await store.sagas.failures.find("failure")
-    with pytest.raises(Unsupported):
-        await store.sagas.markers.exists("saga:conformance:1")
+    assert await store.external.find("key") is None
+    assert await store.sagas.sagas.find_by_id("saga") is None
+    assert await store.sagas.dispatch.pending() == 0
+    assert await store.sagas.deadlines.claim_due("scheduler", 0, 1) is None
+    assert await store.sagas.failures.find("failure") is None
+    assert not await store.sagas.markers.exists("saga:conformance:1")

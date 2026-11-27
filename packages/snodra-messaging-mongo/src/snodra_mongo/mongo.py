@@ -11,9 +11,9 @@ another Snodra library stay readable without a migration:
 - The schema is the indexes. :meth:`MongoStore.init_schema` creates every index and TTL index idempotently, which also
   creates the collections a transaction writes to before the first transaction does.
 
-The outbox, the processed-event markers, the dead letters and the processor control state are implemented, in the
-collections and document shapes the layout fixes. The external-call and saga ports are part of the interface frozen at
-level 2 and report :class:`snodra.MessageStoreUnsupported` until this add-on implements them by level 4.
+Every message-store port is implemented in the collections and document shapes the layout fixes: the outbox, the
+processed-event markers, the dead letters, the processor control state, the external-call records and the saga
+records. The external-call writes commit outside the caller's transaction; the saga records join its session.
 
 Every operation joins the transaction bound to the current context (``async with store.transaction()``) or runs in a
 write of its own, never in another operation's transaction. A service that already runs a MongoDB transaction binds
@@ -52,6 +52,7 @@ from pymongo.errors import DuplicateKeyError, OperationFailure, PyMongoError
 from snodra import (
     RESET_KIND,
     AppendListener,
+    Association,
     Conflict,
     ControlOperation,
     DeadLetter,
@@ -60,13 +61,16 @@ from snodra import (
     DeadLetterStore,
     DeadLetterSummary,
     DeadlineDocument,
+    DeadlineStatus,
     DispatchFailure,
+    DispatchKind,
     ExternalCall,
+    ExternalCallStatus,
     ExternalCallStore,
+    FailureReason,
     InvalidMessage,
     Locked,
     MessageStoreFailed,
-    MessageStoreUnsupported,
     OutboxEntry,
     OutboxStore,
     Parked,
@@ -304,13 +308,13 @@ class MongoStore:
         self.processed: ProcessedStore = _MongoProcessed(self)
         self.dead_letters: DeadLetterStore = _MongoDeadLetters(self)
         self.control: ProcessorControlStore = _MongoControl(self)
-        self.external: ExternalCallStore = _UnsupportedExternal()
+        self.external: ExternalCallStore = _MongoExternalCalls(self)
         self.sagas: SagaStores = SagaStores(
-            sagas=_UnsupportedSagas(),
-            dispatch=_UnsupportedDispatch(),
-            deadlines=_UnsupportedDeadlines(),
-            failures=_UnsupportedFailures(),
-            markers=_UnsupportedMarkers(),
+            sagas=_MongoSagas(self),
+            dispatch=_MongoDispatch(self),
+            deadlines=_MongoDeadlines(self),
+            failures=_MongoFailures(self),
+            markers=_MongoMarkers(self),
         )
 
     @property
@@ -1429,151 +1433,780 @@ def _stored_text(value: object) -> str:
     return str(value)
 
 
-# ---- the ports this level does not implement ------------------------------------------------------
+# ---- the external calls ---------------------------------------------------------------------------
 
 
-def _unsupported(what: str) -> MessageStoreUnsupported:
-    return MessageStoreUnsupported(f"{what} in the MongoDB message store (level 2)")
+class _MongoExternalCalls:
+    """``external_calls``: every write is one document write of its own, outside any transaction; every write after the
+    insert is conditional on the record read or owned."""
 
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
 
-class _UnsupportedExternal:
+    @property
+    def _collection(self) -> AsyncCollection[Any]:
+        return self._store.database[EXTERNAL_COLLECTION]
+
     async def insert(self, call: ExternalCall) -> bool:
-        raise _unsupported("external calls")
+        document: dict[str, Any] = {
+            "_id": call.key,
+            "status": call.status.value,
+            "attempts": call.attempts,
+            "updatedAt": _datetime(call.updated_at_ms),
+        }
+        if call.reply is not None:
+            document["reply"] = call.reply
+        if call.error is not None:
+            document["error"] = call.error
+        if call.lease_until_ms is not None:
+            document["leaseUntil"] = _datetime(call.lease_until_ms)
+        if call.owner is not None:
+            document["owner"] = call.owner
+        try:
+            await self._collection.insert_one(document)
+        except DuplicateKeyError:
+            return False
+        except Exception as error:
+            raise _failure(error) from error
+        return True
 
     async def find(self, key: str) -> ExternalCall | None:
-        raise _unsupported("external calls")
+        try:
+            document = await self._collection.find_one({"_id": key})
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _external_from_document(document)
 
     async def take_over(self, seen: ExternalCall, owner: str, lease_until_ms: int, now_ms: int) -> ExternalCall | None:
-        raise _unsupported("external calls")
+        try:
+            document = await self._collection.find_one_and_update(
+                _external_as_read(seen),
+                {
+                    "$set": {
+                        "leaseUntil": _datetime(lease_until_ms),
+                        "updatedAt": _datetime(now_ms),
+                        "owner": owner,
+                    },
+                    "$inc": {"attempts": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _external_from_document(document)
 
     async def expire(self, seen: ExternalCall, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        return await self._settle(seen, ExternalCallStatus.UNKNOWN, now_ms, reply=None, error=None)
 
     async def succeed(self, key: str, owner: str, reply: str, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        try:
+            result = await self._collection.update_one(
+                _external_owned(key, owner),
+                {
+                    "$set": {
+                        "status": ExternalCallStatus.SUCCEEDED.value,
+                        "reply": reply,
+                        "updatedAt": _datetime(now_ms),
+                    },
+                    "$unset": {"error": "", "leaseUntil": "", "owner": ""},
+                },
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.matched_count) == 1
 
     async def fail(self, key: str, owner: str, error: str, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        try:
+            result = await self._collection.update_one(
+                _external_owned(key, owner),
+                {
+                    "$set": {
+                        "status": ExternalCallStatus.FAILED.value,
+                        "error": error,
+                        "updatedAt": _datetime(now_ms),
+                    },
+                    "$unset": {"leaseUntil": "", "owner": ""},
+                },
+            )
+        except Exception as cause:
+            raise _failure(cause) from cause
+        return int(result.matched_count) == 1
 
     async def mark_unknown(self, key: str, owner: str, now_ms: int) -> bool:
-        raise _unsupported("external calls")
+        try:
+            result = await self._collection.update_one(
+                _external_owned(key, owner),
+                {
+                    "$set": {"status": ExternalCallStatus.UNKNOWN.value, "updatedAt": _datetime(now_ms)},
+                    "$unset": {"leaseUntil": "", "owner": ""},
+                },
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.matched_count) == 1
 
     async def reset(self, key: str, owner: str) -> bool:
-        raise _unsupported("external calls")
+        try:
+            result = await self._collection.delete_one(_external_owned(key, owner))
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.deleted_count) == 1
+
+    async def _settle(
+        self,
+        seen: ExternalCall,
+        status: ExternalCallStatus,
+        now_ms: int,
+        *,
+        reply: str | None,
+        error: str | None,
+    ) -> bool:
+        set_fields: dict[str, Any] = {"status": status.value, "updatedAt": _datetime(now_ms)}
+        unset = {"leaseUntil": "", "owner": ""}
+        if reply is not None:
+            set_fields["reply"] = reply
+        if error is not None:
+            set_fields["error"] = error
+        try:
+            result = await self._collection.update_one(_external_as_read(seen), {"$set": set_fields, "$unset": unset})
+        except Exception as cause:
+            raise _failure(cause) from cause
+        return int(result.matched_count) == 1
 
 
-class _UnsupportedSagas:
+def _external_owned(key: str, owner: str) -> dict[str, Any]:
+    return {"_id": key, "status": ExternalCallStatus.IN_PROGRESS.value, "owner": owner}
+
+
+def _external_as_read(seen: ExternalCall) -> dict[str, Any]:
+    return {
+        "_id": seen.key,
+        "status": ExternalCallStatus.IN_PROGRESS.value,
+        "owner": seen.owner,
+        "leaseUntil": None if seen.lease_until_ms is None else _datetime(seen.lease_until_ms),
+    }
+
+
+def _external_from_document(document: Mapping[str, Any]) -> ExternalCall:
+    lease = document.get("leaseUntil")
+    return ExternalCall(
+        key=str(document["_id"]),
+        status=ExternalCallStatus(str(document["status"])),
+        reply=None if document.get("reply") is None else str(document["reply"]),
+        error=None if document.get("error") is None else str(document["error"]),
+        attempts=int(document.get("attempts", 0)),
+        updated_at_ms=_ms_value(document["updatedAt"]),
+        lease_until_ms=None if lease is None else _ms_value(lease),
+        owner=None if document.get("owner") is None else str(document["owner"]),
+    )
+
+
+# ---- the sagas ------------------------------------------------------------------------------------
+
+
+class _MongoSagas:
+    """``sagas``: one document per instance, transactional with the caller's session."""
+
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
+
+    @property
+    def _collection(self) -> AsyncCollection[Any]:
+        return self._store.database[SAGAS_COLLECTION]
+
     async def find_by_id(self, saga_id: str, *, tx: Tx | None = None) -> SagaDocument | None:
-        raise _unsupported("sagas")
+        session = self._store._session(tx)
+        try:
+            document = await self._collection.find_one({"_id": saga_id}, session=session)
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _saga_from_document(document)
 
     async def find_live(self, type_name: str, key: str, value: str, *, tx: Tx | None = None) -> list[SagaDocument]:
-        raise _unsupported("sagas")
+        session = self._store._session(tx)
+        query = {
+            "type": type_name,
+            "ended": False,
+            "associations": {"$elemMatch": {"k": key, "v": value}},
+        }
+        try:
+            documents = (
+                await self._collection.find(query, session=session)
+                .sort([("createdAt", 1), ("_id", 1)])
+                .to_list(length=None)
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return [_saga_from_document(document) for document in documents]
 
     async def insert(self, saga: SagaDocument, *, tx: Tx | None = None) -> None:
-        raise _unsupported("sagas")
+        session = self._store._session(tx)
+        try:
+            await self._collection.insert_one(_saga_document(saga), session=session)
+        except Exception as error:
+            raise _failure(error) from error
 
     async def update(self, saga: SagaDocument, expected_version: int, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("sagas")
+        session = self._store._session(tx)
+        try:
+            result = await self._collection.replace_one(
+                {"_id": saga.id, "version": Int64(expected_version)},
+                _saga_document(saga),
+                session=session,
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.matched_count) == 1
 
     async def count_live_by_type(self) -> dict[str, int]:
-        raise _unsupported("sagas")
+        try:
+            cursor = await self._collection.aggregate(
+                [
+                    {"$match": {"ended": False}},
+                    {"$group": {"_id": "$type", "n": {"$sum": 1}}},
+                ]
+            )
+            documents = await cursor.to_list(length=None)
+        except Exception as error:
+            raise _failure(error) from error
+        return {str(document["_id"]): int(document["n"]) for document in documents}
 
 
-class _UnsupportedDispatch:
+def _saga_document(saga: SagaDocument) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "_id": saga.id,
+        "type": saga.type_name,
+        "state": saga.state,
+        "associations": [{"k": association.key, "v": association.value} for association in saga.associations],
+        "ended": saga.ended,
+        "version": Int64(saga.version),
+        "createdAt": _datetime(saga.created_at_ms),
+        "updatedAt": _datetime(saga.updated_at_ms),
+    }
+    if saga.start_key is not None:
+        document["startKey"] = saga.start_key
+    if saga.ended_at_ms is not None:
+        document["endedAt"] = _datetime(saga.ended_at_ms)
+    return document
+
+
+def _saga_from_document(document: Mapping[str, Any]) -> SagaDocument:
+    associations = tuple(
+        Association(str(item["k"]), str(item["v"]))
+        for item in document.get("associations") or ()
+        if isinstance(item, Mapping) and item.get("k") is not None and item.get("v") is not None
+    )
+    ended_at = document.get("endedAt")
+    return SagaDocument(
+        id=str(document["_id"]),
+        type_name=str(document["type"]),
+        state=str(document["state"]),
+        associations=associations,
+        start_key=None if document.get("startKey") is None else str(document["startKey"]),
+        ended=bool(document.get("ended", False)),
+        ended_at_ms=None if ended_at is None else _ms_value(ended_at),
+        version=int(document.get("version", 0)),
+        created_at_ms=_ms_value(document["createdAt"]),
+        updated_at_ms=_ms_value(document["updatedAt"]),
+    )
+
+
+class _MongoDispatch:
+    """``saga_dispatch`` and ``saga_dispatch_leases``."""
+
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
+
+    @property
+    def _collection(self) -> AsyncCollection[Any]:
+        return self._store.database[SAGA_DISPATCH_COLLECTION]
+
+    @property
+    def _leases(self) -> AsyncCollection[Any]:
+        return self._store.database[SAGA_LEASES_COLLECTION]
+
     async def record(self, entries: Sequence[SagaDispatchDocument], *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga dispatch")
+        for entry in entries:
+            if entry.kind is DispatchKind.EVENT:
+                check_outbox_payload(entry.type_name, entry.payload.encode())
+        if not entries:
+            return
+        session = self._store._session(tx)
+        try:
+            await self._collection.insert_many([_dispatch_document(entry) for entry in entries], session=session)
+        except Exception as error:
+            raise _failure(error) from error
 
     async def due_sagas(self, now_ms: int, except_sagas: Sequence[str], limit: int) -> list[str]:
-        raise _unsupported("saga dispatch")
+        if limit <= 0:
+            return []
+        match: dict[str, Any] = {"dispatchedAt": None, "failedAt": None}
+        if except_sagas:
+            match["sagaId"] = {"$nin": list(except_sagas)}
+        pipeline: list[dict[str, Any]] = [
+            {"$match": match},
+            {"$sort": {"sagaId": 1, "seq": 1}},
+            {"$group": {"_id": "$sagaId", "next": {"$first": "$nextAttemptAt"}, "since": {"$first": "$createdAt"}}},
+            {"$match": {"$or": [{"next": None}, {"next": {"$lte": _datetime(now_ms)}}]}},
+            {"$sort": {"since": 1, "_id": 1}},
+            {"$limit": int(limit)},
+        ]
+        try:
+            cursor = await self._collection.aggregate(pipeline)
+            documents = await cursor.to_list(length=None)
+        except Exception as error:
+            raise _failure(error) from error
+        return [str(document["_id"]) for document in documents]
 
     async def next_pending(self, saga_id: str) -> SagaDispatchDocument | None:
-        raise _unsupported("saga dispatch")
+        try:
+            document = await self._collection.find_one(
+                {"sagaId": saga_id, "dispatchedAt": None, "failedAt": None},
+                sort=[("seq", 1)],
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _dispatch_from_document(document)
 
     async def mark_dispatched(self, entry_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga dispatch")
+        session = self._store._session(tx)
+        try:
+            await self._collection.update_one(
+                {"_id": entry_id}, {"$set": {"dispatchedAt": _datetime(now_ms)}}, session=session
+            )
+        except Exception as error:
+            raise _failure(error) from error
 
     async def schedule_retry(self, entry_id: str, attempts: int, next_attempt_at_ms: int) -> None:
-        raise _unsupported("saga dispatch")
+        try:
+            await self._collection.update_one(
+                {"_id": entry_id},
+                {"$set": {"attempts": attempts, "nextAttemptAt": _datetime(next_attempt_at_ms)}},
+            )
+        except Exception as error:
+            raise _failure(error) from error
 
     async def mark_failed(self, entry_id: str, failure: DispatchFailure) -> None:
-        raise _unsupported("saga dispatch")
+        set_fields: dict[str, Any] = {
+            "failedAt": _datetime(failure.failed_at_ms),
+            "failureReason": failure.reason.value,
+            "failureMessage": failure.message,
+        }
+        if failure.attempts is not None:
+            set_fields["attempts"] = failure.attempts
+        update: dict[str, Any] = {"$set": set_fields}
+        if failure.notice_at_ms is None:
+            update["$unset"] = {"noticePending": "", "noticeAttempts": "", "noticeNextAt": ""}
+        else:
+            set_fields.update(
+                {
+                    "noticePending": True,
+                    "noticeAttempts": 0,
+                    "noticeNextAt": _datetime(failure.notice_at_ms),
+                }
+            )
+        try:
+            await self._collection.update_one({"_id": entry_id}, update)
+        except Exception as error:
+            raise _failure(error) from error
 
     async def claim_due_notice(self, now_ms: int, reserve_until_ms: int) -> SagaDispatchDocument | None:
-        raise _unsupported("saga dispatch")
+        query = {
+            "noticePending": True,
+            "$or": [
+                {"noticeNextAt": None},
+                {"noticeNextAt": {"$lte": _datetime(now_ms)}},
+            ],
+        }
+        try:
+            document = await self._collection.find_one_and_update(
+                query,
+                {"$set": {"noticeNextAt": _datetime(reserve_until_ms)}},
+                sort=[("noticeNextAt", 1), ("_id", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _dispatch_from_document(document)
 
     async def clear_notice(self, entry_id: str) -> None:
-        raise _unsupported("saga dispatch")
+        try:
+            await self._collection.update_one(
+                {"_id": entry_id},
+                {"$unset": {"noticePending": "", "noticeAttempts": "", "noticeNextAt": ""}},
+            )
+        except Exception as error:
+            raise _failure(error) from error
 
     async def schedule_notice_retry(self, entry_id: str, notice_attempts: int, next_at_ms: int) -> None:
-        raise _unsupported("saga dispatch")
+        try:
+            await self._collection.update_one(
+                {"_id": entry_id},
+                {"$set": {"noticeAttempts": notice_attempts, "noticeNextAt": _datetime(next_at_ms)}},
+            )
+        except Exception as error:
+            raise _failure(error) from error
 
     async def claim_lease(self, saga_id: str, owner: str, now_ms: int, until_ms: int) -> bool:
-        raise _unsupported("saga dispatch")
+        try:
+            await self._leases.update_one(
+                {"_id": saga_id, "until": {"$lt": _datetime(now_ms)}},
+                {"$set": {"owner": owner, "until": _datetime(until_ms)}},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            return False
+        except Exception as error:
+            raise _failure(error) from error
+        return True
 
     async def renew_lease(self, saga_id: str, owner: str, until_ms: int) -> bool:
-        raise _unsupported("saga dispatch")
+        try:
+            result = await self._leases.update_one(
+                {"_id": saga_id, "owner": owner},
+                {"$set": {"until": _datetime(until_ms)}},
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.matched_count) == 1
 
     async def release_lease(self, saga_id: str, owner: str) -> None:
-        raise _unsupported("saga dispatch")
+        try:
+            await self._leases.delete_one({"_id": saga_id, "owner": owner})
+        except Exception as error:
+            raise _failure(error) from error
 
     async def pending(self) -> int:
-        raise _unsupported("saga dispatch")
+        try:
+            return int(await self._collection.count_documents({"dispatchedAt": None, "failedAt": None}))
+        except Exception as error:
+            raise _failure(error) from error
 
 
-class _UnsupportedDeadlines:
+def _dispatch_document(entry: SagaDispatchDocument) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "_id": entry.id,
+        "sagaId": entry.saga_id,
+        "seq": Int64(entry.seq),
+        "kind": entry.kind.value,
+        "type": entry.type_name,
+        "payload": entry.payload,
+        "headers": _headers(entry.headers),
+        "createdAt": _datetime(entry.created_at_ms),
+        "attempts": entry.attempts,
+    }
+    if entry.routing_key is not None:
+        document["routingKey"] = entry.routing_key
+    if entry.dispatched_at_ms is not None:
+        document["dispatchedAt"] = _datetime(entry.dispatched_at_ms)
+    if entry.next_attempt_at_ms is not None:
+        document["nextAttemptAt"] = _datetime(entry.next_attempt_at_ms)
+    if entry.failed_at_ms is not None:
+        document["failedAt"] = _datetime(entry.failed_at_ms)
+    if entry.failure_reason is not None:
+        document["failureReason"] = entry.failure_reason.value
+    if entry.failure_message is not None:
+        document["failureMessage"] = entry.failure_message
+    if entry.notice_pending is not None:
+        document["noticePending"] = entry.notice_pending
+    if entry.notice_attempts is not None:
+        document["noticeAttempts"] = entry.notice_attempts
+    if entry.notice_next_at_ms is not None:
+        document["noticeNextAt"] = _datetime(entry.notice_next_at_ms)
+    return document
+
+
+def _dispatch_from_document(document: Mapping[str, Any]) -> SagaDispatchDocument:
+    def optional_ms(name: str) -> int | None:
+        value = document.get(name)
+        return None if value is None else _ms_value(value)
+
+    return SagaDispatchDocument(
+        id=str(document["_id"]),
+        saga_id=str(document["sagaId"]),
+        seq=int(document["seq"]),
+        kind=DispatchKind(str(document["kind"])),
+        type_name=str(document["type"]),
+        payload=str(document["payload"]),
+        headers=_read_headers(document.get("headers")),
+        routing_key=None if document.get("routingKey") is None else str(document["routingKey"]),
+        created_at_ms=_ms_value(document["createdAt"]),
+        dispatched_at_ms=optional_ms("dispatchedAt"),
+        attempts=int(document.get("attempts", 0)),
+        next_attempt_at_ms=optional_ms("nextAttemptAt"),
+        failed_at_ms=optional_ms("failedAt"),
+        failure_reason=(
+            None if document.get("failureReason") is None else FailureReason(str(document["failureReason"]))
+        ),
+        failure_message=None if document.get("failureMessage") is None else str(document["failureMessage"]),
+        notice_pending=None if document.get("noticePending") is None else bool(document["noticePending"]),
+        notice_attempts=None if document.get("noticeAttempts") is None else int(document["noticeAttempts"]),
+        notice_next_at_ms=optional_ms("noticeNextAt"),
+    )
+
+
+class _MongoDeadlines:
+    """``deadlines``."""
+
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
+
+    @property
+    def _collection(self) -> AsyncCollection[Any]:
+        return self._store.database[DEADLINES_COLLECTION]
+
     async def insert(self, deadline: DeadlineDocument, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        session = self._store._session(tx)
+        try:
+            await self._collection.insert_one(_deadline_document(deadline), session=session)
+        except Exception as error:
+            raise _failure(error) from error
 
     async def find_scheduled(self, deadline_id: str, *, tx: Tx | None = None) -> DeadlineDocument | None:
-        raise _unsupported("deadlines")
+        session = self._store._session(tx)
+        try:
+            document = await self._collection.find_one(
+                {"_id": deadline_id, "status": DeadlineStatus.SCHEDULED.value}, session=session
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _deadline_from_document(document)
 
     async def cancel(self, saga_id: str, deadline_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        await self._cancel({"_id": deadline_id, "sagaId": saga_id}, now_ms, tx)
 
     async def cancel_by_name(self, saga_id: str, name: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        await self._cancel({"sagaId": saga_id, "name": name}, now_ms, tx)
 
     async def cancel_all(self, saga_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("deadlines")
+        await self._cancel({"sagaId": saga_id}, now_ms, tx)
+
+    async def _cancel(self, query: dict[str, Any], now_ms: int, tx: Tx | None) -> None:
+        session = self._store._session(tx)
+        query = {**query, "status": DeadlineStatus.SCHEDULED.value}
+        try:
+            await self._collection.update_many(
+                query,
+                {"$set": {"status": DeadlineStatus.CANCELLED.value, "finishedAt": _datetime(now_ms)}},
+                session=session,
+            )
+        except Exception as error:
+            raise _failure(error) from error
 
     async def mark_fired(self, deadline_id: str, now_ms: int, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("deadlines")
+        session = self._store._session(tx)
+        try:
+            result = await self._collection.update_one(
+                {"_id": deadline_id, "status": DeadlineStatus.SCHEDULED.value},
+                {"$set": {"status": DeadlineStatus.FIRED.value, "finishedAt": _datetime(now_ms)}},
+                session=session,
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.modified_count) == 1
 
     async def claim_due(self, owner: str, now_ms: int, claimed_until_ms: int) -> DeadlineDocument | None:
-        raise _unsupported("deadlines")
+        at = _datetime(now_ms)
+        try:
+            document = await self._collection.find_one_and_update(
+                {
+                    "status": DeadlineStatus.SCHEDULED.value,
+                    "dueAt": {"$lte": at},
+                    "$or": [{"claimedUntil": None}, {"claimedUntil": {"$lt": at}}],
+                },
+                {"$set": {"claimedBy": owner, "claimedUntil": _datetime(claimed_until_ms)}},
+                sort=[("dueAt", 1), ("_id", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _deadline_from_document(document)
 
     async def count_overdue_by_name(self, now_ms: int) -> dict[str, int]:
-        raise _unsupported("deadlines")
+        try:
+            cursor = await self._collection.aggregate(
+                [
+                    {
+                        "$match": {
+                            "status": DeadlineStatus.SCHEDULED.value,
+                            "dueAt": {"$lte": _datetime(now_ms)},
+                        }
+                    },
+                    {"$group": {"_id": "$name", "n": {"$sum": 1}}},
+                ]
+            )
+            documents = await cursor.to_list(length=None)
+        except Exception as error:
+            raise _failure(error) from error
+        return {str(document["_id"]): int(document["n"]) for document in documents}
 
 
-class _UnsupportedFailures:
+def _deadline_document(deadline: DeadlineDocument) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "_id": deadline.id,
+        "sagaType": deadline.saga_type,
+        "sagaId": deadline.saga_id,
+        "name": deadline.name,
+        "dueAt": _datetime(deadline.due_at_ms),
+        "status": deadline.status.value,
+    }
+    if deadline.payload is not None:
+        document["payload"] = deadline.payload
+    if deadline.payload_type is not None:
+        document["payloadType"] = deadline.payload_type
+    if deadline.correlation_id:
+        document["correlationId"] = deadline.correlation_id
+    if deadline.claimed_by is not None:
+        document["claimedBy"] = deadline.claimed_by
+    if deadline.claimed_until_ms is not None:
+        document["claimedUntil"] = _datetime(deadline.claimed_until_ms)
+    if deadline.finished_at_ms is not None:
+        document["finishedAt"] = _datetime(deadline.finished_at_ms)
+    return document
+
+
+def _deadline_from_document(document: Mapping[str, Any]) -> DeadlineDocument:
+    def optional_ms(name: str) -> int | None:
+        value = document.get(name)
+        return None if value is None else _ms_value(value)
+
+    return DeadlineDocument(
+        id=str(document["_id"]),
+        saga_type=str(document["sagaType"]),
+        saga_id=str(document["sagaId"]),
+        name=str(document["name"]),
+        payload=None if document.get("payload") is None else str(document["payload"]),
+        payload_type=None if document.get("payloadType") is None else str(document["payloadType"]),
+        due_at_ms=_ms_value(document["dueAt"]),
+        status=DeadlineStatus(str(document["status"])),
+        claimed_by=None if document.get("claimedBy") is None else str(document["claimedBy"]),
+        claimed_until_ms=optional_ms("claimedUntil"),
+        finished_at_ms=optional_ms("finishedAt"),
+        correlation_id=None if not document.get("correlationId") else str(document["correlationId"]),
+    )
+
+
+class _MongoFailures:
+    """``saga_failures``."""
+
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
+
+    @property
+    def _collection(self) -> AsyncCollection[Any]:
+        return self._store.database[SAGA_FAILURES_COLLECTION]
+
     async def find(self, failure_id: str, *, tx: Tx | None = None) -> SagaFailureDocument | None:
-        raise _unsupported("saga failures")
+        session = self._store._session(tx)
+        try:
+            document = await self._collection.find_one({"_id": failure_id}, session=session)
+        except Exception as error:
+            raise _failure(error) from error
+        return None if document is None else _failure_from_document(document)
 
     async def save(self, failure: SagaFailureDocument, *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga failures")
+        session = self._store._session(tx)
+        try:
+            await self._collection.replace_one(
+                {"_id": failure.id}, _failure_document(failure), upsert=True, session=session
+            )
+        except Exception as error:
+            raise _failure(error) from error
 
     async def delete(self, failure_id: str, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("saga failures")
+        session = self._store._session(tx)
+        try:
+            result = await self._collection.delete_one({"_id": failure_id}, session=session)
+        except Exception as error:
+            raise _failure(error) from error
+        return int(result.deleted_count) == 1
 
     async def failed_again(
         self, failure_id: str, error: str, attempts: int, now_ms: int, *, tx: Tx | None = None
     ) -> bool:
-        raise _unsupported("saga failures")
+        session = self._store._session(tx)
+        try:
+            result = await self._collection.update_one(
+                {"_id": failure_id},
+                {
+                    "$inc": {"attempts": attempts},
+                    "$set": {"error": error, "lastFailedAt": _datetime(now_ms)},
+                },
+                session=session,
+            )
+        except Exception as cause:
+            raise _failure(cause) from cause
+        return int(result.matched_count) == 1
 
     async def list(self, saga_type: str | None = None, *, tx: Tx | None = None) -> builtins.list[SagaFailureDocument]:
-        raise _unsupported("saga failures")
+        session = self._store._session(tx)
+        query: dict[str, Any] = {} if saga_type is None else {"sagaType": saga_type}
+        try:
+            documents = (
+                await self._collection.find(query, session=session)
+                .sort([("lastFailedAt", 1), ("_id", 1)])
+                .to_list(length=None)
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return [_failure_from_document(document) for document in documents]
 
 
-class _UnsupportedMarkers:
+def _failure_document(failure: SagaFailureDocument) -> dict[str, Any]:
+    return {
+        "_id": failure.id,
+        "sagaType": failure.saga_type,
+        "eventId": failure.event_id,
+        "eventType": failure.event_type,
+        "payload": failure.payload,
+        "headers": _headers(failure.headers),
+        "error": failure.error,
+        "attempts": failure.attempts,
+        "firstFailedAt": _datetime(failure.first_failed_at_ms),
+        "lastFailedAt": _datetime(failure.last_failed_at_ms),
+    }
+
+
+def _failure_from_document(document: Mapping[str, Any]) -> SagaFailureDocument:
+    return SagaFailureDocument(
+        id=str(document["_id"]),
+        saga_type=str(document["sagaType"]),
+        event_id=str(document["eventId"]),
+        event_type=str(document["eventType"]),
+        payload=str(document["payload"]),
+        headers=_read_headers(document.get("headers")),
+        error=str(document["error"]),
+        attempts=int(document.get("attempts", 0)),
+        first_failed_at_ms=_ms_value(document["firstFailedAt"]),
+        last_failed_at_ms=_ms_value(document["lastFailedAt"]),
+    )
+
+
+class _MongoMarkers:
+    """The saga stage's markers in ``processed_events``."""
+
+    def __init__(self, store: MongoStore) -> None:
+        self._store = store
+
     async def exists(self, marker_id: str, *, tx: Tx | None = None) -> bool:
-        raise _unsupported("saga markers")
+        session = self._store._session(tx)
+        try:
+            document = await self._store._processed_collection.find_one(
+                {"_id": marker_id}, projection={"_id": 1}, session=session
+            )
+        except Exception as error:
+            raise _failure(error) from error
+        return document is not None
 
     async def insert(self, marker_id: str, type_name: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _unsupported("saga markers")
-
-
-# ---- values and errors ----------------------------------------------------------------------------
+        session = self._store._session(tx)
+        try:
+            await self._store._processed_collection.insert_one(
+                {"_id": marker_id, "type": type_name, "processedAt": _datetime(now_ms)},
+                session=session,
+            )
+        except Exception as error:
+            raise _failure(error) from error
 
 
 def _datetime(milliseconds: int) -> datetime:
@@ -1604,7 +2237,7 @@ def _failure(error: BaseException) -> BaseException:
     """What a driver error means to the store: a duplicate key, a write conflict or a transient transaction error is a
     :class:`snodra.MessageStoreConflict` (a retry of the whole attempt resolves it); every other error is a
     :class:`snodra.MessageStoreFailed`."""
-    if isinstance(error, MessageStoreUnsupported | InvalidMessage | Conflict | MessageStoreFailed):
+    if isinstance(error, InvalidMessage | Conflict | MessageStoreFailed):
         return error
     if isinstance(error, DuplicateKeyError):
         return Conflict(str(error))

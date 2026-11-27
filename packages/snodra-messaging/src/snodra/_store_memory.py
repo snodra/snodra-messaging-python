@@ -36,6 +36,7 @@ from snodra._eventstore import ProcessedMarker, ReplayRange
 from snodra._store import (
     RESET_KIND,
     AppendListener,
+    Association,
     Conflict,
     ControlOperation,
     DeadLetter,
@@ -44,8 +45,11 @@ from snodra._store import (
     DeadLetterStore,
     DeadLetterSummary,
     DeadlineDocument,
+    DeadlineStatus,
     DispatchFailure,
+    DispatchKind,
     ExternalCall,
+    ExternalCallStatus,
     ExternalCallStore,
     Failed,
     InvalidMessage,
@@ -121,12 +125,26 @@ class _Overlay[T]:
 
 
 @dataclass(slots=True)
+class _Lease:
+    """One saga dispatch lease."""
+
+    owner: str
+    until_ms: int
+
+
+@dataclass(slots=True)
 class _Data:
     """Everything the store holds, committed."""
 
     outbox: _Table[_OutboxRow] = field(default_factory=_Table)
     processed: _Table[_ProcessedRow] = field(default_factory=_Table)
     dead: _Table[DeadLetter] = field(default_factory=_Table)
+    external: _Table[ExternalCall] = field(default_factory=_Table)
+    sagas: _Table[SagaDocument] = field(default_factory=_Table)
+    dispatch: _Table[SagaDispatchDocument] = field(default_factory=_Table)
+    deadlines: _Table[DeadlineDocument] = field(default_factory=_Table)
+    failures: _Table[SagaFailureDocument] = field(default_factory=_Table)
+    leases: _Table[_Lease] = field(default_factory=_Table)
     reserved: dict[tuple[str, str], int] = field(default_factory=dict)
     version: int = 0
     next_tx: int = 1
@@ -145,6 +163,10 @@ class _MemoryTx:
     outbox: _Overlay[_OutboxRow] = field(default_factory=_Overlay)
     processed: _Overlay[_ProcessedRow] = field(default_factory=_Overlay)
     dead: _Overlay[DeadLetter] = field(default_factory=_Overlay)
+    sagas: _Overlay[SagaDocument] = field(default_factory=_Overlay)
+    dispatch: _Overlay[SagaDispatchDocument] = field(default_factory=_Overlay)
+    deadlines: _Overlay[DeadlineDocument] = field(default_factory=_Overlay)
+    failures: _Overlay[SagaFailureDocument] = field(default_factory=_Overlay)
 
     def __del__(self) -> None:
         """A transaction dropped without a commit releases its reservations, as a database's connection does."""
@@ -175,13 +197,13 @@ class MemoryStore:
         self.processed: ProcessedStore = _MemoryProcessed(self)
         self.dead_letters: DeadLetterStore = _DeadLetters(self)
         self.control: ProcessorControlStore = _Control()
-        self.external: ExternalCallStore = _External()
+        self.external: ExternalCallStore = _External(self)
         self.sagas = SagaStores(
-            sagas=_Sagas(),
-            dispatch=_Dispatch(),
-            deadlines=_Deadlines(),
-            failures=_Failures(),
-            markers=_Markers(),
+            sagas=_Sagas(self),
+            dispatch=_Dispatch(self),
+            deadlines=_Deadlines(self),
+            failures=_Failures(self),
+            markers=_Markers(self),
         )
 
     @property
@@ -215,6 +237,10 @@ class MemoryStore:
             self._check_stale("outbox", self._data.outbox, inner.outbox)
             self._check_stale("processed", self._data.processed, inner.processed)
             self._check_stale("dead", self._data.dead, inner.dead)
+            self._check_stale("sagas", self._data.sagas, inner.sagas)
+            self._check_stale("dispatch", self._data.dispatch, inner.dispatch)
+            self._check_stale("deadlines", self._data.deadlines, inner.deadlines)
+            self._check_stale("failures", self._data.failures, inner.failures)
             self._apply(inner)
             committed = True
         finally:
@@ -233,6 +259,10 @@ class MemoryStore:
         inner.outbox.writes.clear()
         inner.processed.writes.clear()
         inner.dead.writes.clear()
+        inner.sagas.writes.clear()
+        inner.dispatch.writes.clear()
+        inner.deadlines.writes.clear()
+        inner.failures.writes.clear()
         self._release(inner)
 
     # ---- what the stores use -------------------------------------------------------------------
@@ -375,6 +405,10 @@ class MemoryStore:
         tx.outbox.writes.clear()
         tx.processed.writes.clear()
         tx.dead.writes.clear()
+        tx.sagas.writes.clear()
+        tx.dispatch.writes.clear()
+        tx.deadlines.writes.clear()
+        tx.failures.writes.clear()
         self._release(tx)
 
     # ---- transactions --------------------------------------------------------------------------
@@ -435,6 +469,33 @@ class MemoryStore:
         self._apply_table(self._data.outbox, tx.outbox)
         self._apply_table(self._data.processed, tx.processed)
         self._apply_table(self._data.dead, tx.dead)
+        self._apply_table(self._data.sagas, tx.sagas)
+        self._apply_table(self._data.dispatch, tx.dispatch)
+        self._apply_table(self._data.deadlines, tx.deadlines)
+        self._apply_table(self._data.failures, tx.failures)
+
+    def current_row[T](self, table: _Table[T], overlay: _Overlay[T], key: str, tx: Tx | None) -> T | None:
+        """The row ``key`` as ``tx`` sees it (a committed row or the transaction's write)."""
+        inner = self._open(current_transaction() if tx is None else tx)
+        if inner is None:
+            return table.rows.get(key)
+        write = overlay.writes.get(key)
+        if write is not None:
+            return write.value
+        return table.rows.get(key)
+
+    def current_rows[T](self, table: _Table[T], overlay: _Overlay[T], tx: Tx | None) -> dict[str, T]:
+        """Every row as ``tx`` sees them: committed rows with the transaction's writes applied."""
+        inner = self._open(current_transaction() if tx is None else tx)
+        if inner is None:
+            return dict(table.rows)
+        rows = dict(table.rows)
+        for key, write in overlay.writes.items():
+            if write.value is None:
+                rows.pop(key, None)
+            else:
+                rows[key] = write.value
+        return rows
 
     def _apply_table[T](self, table: _Table[T], overlay: _Overlay[T]) -> None:
         for key, write in overlay.writes.items():
@@ -780,149 +841,532 @@ class _Control:
 
 
 class _External:
-    """The external-call records, implemented from level 4."""
+    """The external-call records: every write commits on its own, outside any transaction."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    @property
+    def _rows(self) -> dict[str, ExternalCall]:
+        return self._store._data.external.rows
 
     async def insert(self, call: ExternalCall) -> bool:
-        raise _refuse("external calls", 4)
+        if call.key in self._rows:
+            return False
+        self._store._write("external", self._store._data.external, None, None, call.key, call)
+        return True
 
     async def find(self, key: str) -> ExternalCall | None:
-        raise _refuse("external calls", 4)
+        return self._rows.get(key)
 
     async def take_over(self, seen: ExternalCall, owner: str, lease_until_ms: int, now_ms: int) -> ExternalCall | None:
-        raise _refuse("external calls", 4)
+        if self._rows.get(seen.key) != seen:
+            return None
+        taken = replace(
+            seen, owner=owner, lease_until_ms=lease_until_ms, updated_at_ms=now_ms, attempts=seen.attempts + 1
+        )
+        self._store._write("external", self._store._data.external, None, None, seen.key, taken)
+        return taken
 
     async def expire(self, seen: ExternalCall, now_ms: int) -> bool:
-        raise _refuse("external calls", 4)
+        if self._rows.get(seen.key) != seen:
+            return False
+        self._store._write(
+            "external",
+            self._store._data.external,
+            None,
+            None,
+            seen.key,
+            replace(seen, status=ExternalCallStatus.UNKNOWN, owner=None, lease_until_ms=None, updated_at_ms=now_ms),
+        )
+        return True
 
     async def succeed(self, key: str, owner: str, reply: str, now_ms: int) -> bool:
-        raise _refuse("external calls", 4)
+        current = self._rows.get(key)
+        if current is None or current.owner != owner or current.status is not ExternalCallStatus.IN_PROGRESS:
+            return False
+        self._store._write(
+            "external",
+            self._store._data.external,
+            None,
+            None,
+            key,
+            replace(
+                current,
+                status=ExternalCallStatus.SUCCEEDED,
+                reply=reply,
+                error=None,
+                owner=None,
+                lease_until_ms=None,
+                updated_at_ms=now_ms,
+            ),
+        )
+        return True
 
     async def fail(self, key: str, owner: str, error: str, now_ms: int) -> bool:
-        raise _refuse("external calls", 4)
+        current = self._rows.get(key)
+        if current is None or current.owner != owner or current.status is not ExternalCallStatus.IN_PROGRESS:
+            return False
+        self._store._write(
+            "external",
+            self._store._data.external,
+            None,
+            None,
+            key,
+            replace(
+                current,
+                status=ExternalCallStatus.FAILED,
+                error=error,
+                owner=None,
+                lease_until_ms=None,
+                updated_at_ms=now_ms,
+            ),
+        )
+        return True
 
     async def mark_unknown(self, key: str, owner: str, now_ms: int) -> bool:
-        raise _refuse("external calls", 4)
+        current = self._rows.get(key)
+        if current is None or current.owner != owner or current.status is not ExternalCallStatus.IN_PROGRESS:
+            return False
+        self._store._write(
+            "external",
+            self._store._data.external,
+            None,
+            None,
+            key,
+            replace(
+                current,
+                status=ExternalCallStatus.UNKNOWN,
+                owner=None,
+                lease_until_ms=None,
+                updated_at_ms=now_ms,
+            ),
+        )
+        return True
 
     async def reset(self, key: str, owner: str) -> bool:
-        raise _refuse("external calls", 4)
+        current = self._rows.get(key)
+        if current is None or current.owner != owner or current.status is not ExternalCallStatus.IN_PROGRESS:
+            return False
+        self._store._write("external", self._store._data.external, None, None, key, None)
+        return True
 
 
 class _Sagas:
-    """The saga collection, implemented from level 4."""
+    """The saga instances; a write joins the store's transaction."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    def _write(self, tx: Tx | None) -> _MemoryTx | None:
+        return self._store.resolve(tx)
+
+    def _rows(self, tx: Tx | None) -> dict[str, SagaDocument]:
+        inner = self._write(tx)
+        overlay = _EMPTY_SAGAS if inner is None else inner.sagas
+        return self._store.current_rows(self._store._data.sagas, overlay, tx)
 
     async def find_by_id(self, saga_id: str, *, tx: Tx | None = None) -> SagaDocument | None:
-        raise _refuse("sagas", 4)
+        return self._rows(tx).get(saga_id)
 
     async def find_live(self, type_name: str, key: str, value: str, *, tx: Tx | None = None) -> list[SagaDocument]:
-        raise _refuse("sagas", 4)
+        live = [
+            saga
+            for saga in self._rows(tx).values()
+            if not saga.ended and saga.type_name == type_name and Association(key, value) in saga.associations
+        ]
+        live.sort(key=lambda saga: (saga.created_at_ms, saga.id))
+        return live
+
+    def _start_key_free(self, saga: SagaDocument, tx: Tx | None) -> bool:
+        if saga.start_key is None or saga.ended:
+            return True
+        for other in self._rows(tx).values():
+            if other.id != saga.id and not other.ended and other.start_key == saga.start_key:
+                return False
+        return True
 
     async def insert(self, saga: SagaDocument, *, tx: Tx | None = None) -> None:
-        raise _refuse("sagas", 4)
+        inner = self._write(tx)
+        if saga.id in self._rows(tx):
+            raise Conflict(f"duplicate key: a saga {saga.id} exists")
+        if not self._start_key_free(saga, tx):
+            raise Conflict(f"a live saga holds the start key {saga.start_key}")
+        if inner is not None and saga.start_key is not None and not saga.ended:
+            self._store._reserve(inner, "saga-start", saga.start_key)
+        self._store._write(
+            "sagas", self._store._data.sagas, None if inner is None else inner.sagas, inner, saga.id, saga
+        )
 
     async def update(self, saga: SagaDocument, expected_version: int, *, tx: Tx | None = None) -> bool:
-        raise _refuse("sagas", 4)
+        current = self._rows(tx).get(saga.id)
+        if current is None or current.version != expected_version:
+            return False
+        inner = self._write(tx)
+        if not self._start_key_free(saga, tx):
+            raise Conflict(f"a live saga holds the start key {saga.start_key}")
+        if inner is not None and saga.start_key is not None and not saga.ended and current.start_key != saga.start_key:
+            self._store._reserve(inner, "saga-start", saga.start_key)
+        self._store._write(
+            "sagas", self._store._data.sagas, None if inner is None else inner.sagas, inner, saga.id, saga
+        )
+        return True
 
     async def count_live_by_type(self) -> dict[str, int]:
-        raise _refuse("sagas", 4)
+        counts: dict[str, int] = {}
+        for saga in self._store._data.sagas.rows.values():
+            if not saga.ended:
+                counts[saga.type_name] = counts.get(saga.type_name, 0) + 1
+        return counts
 
 
 class _Dispatch:
-    """The saga dispatch entries and leases, implemented from level 4."""
+    """The saga-side outbox and its leases."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    def _rows(self, tx: Tx | None = None) -> dict[str, SagaDispatchDocument]:
+        inner = self._store.resolve(tx)
+        overlay = _EMPTY_DISPATCH if inner is None else inner.dispatch
+        return self._store.current_rows(self._store._data.dispatch, overlay, tx)
+
+    @staticmethod
+    def _pending(entry: SagaDispatchDocument) -> bool:
+        return entry.dispatched_at_ms is None and entry.failed_at_ms is None
 
     async def record(self, entries: Sequence[SagaDispatchDocument], *, tx: Tx | None = None) -> None:
-        raise _refuse("saga dispatch", 4)
+        for entry in entries:
+            if entry.kind is DispatchKind.EVENT:
+                check_outbox_payload(entry.type_name, entry.payload.encode())
+        inner = self._store.resolve(tx)
+        current = self._rows(tx)
+        for entry in entries:
+            if entry.id in current:
+                raise Conflict(f"duplicate key: a saga-dispatch entry {entry.id} exists")
+        for entry in entries:
+            self._store._write(
+                "dispatch",
+                self._store._data.dispatch,
+                None if inner is None else inner.dispatch,
+                inner,
+                entry.id,
+                entry,
+            )
+
+    def _committed(self) -> dict[str, SagaDispatchDocument]:
+        return self._store._data.dispatch.rows
 
     async def due_sagas(self, now_ms: int, except_sagas: Sequence[str], limit: int) -> list[str]:
-        raise _refuse("saga dispatch", 4)
+        first: dict[str, SagaDispatchDocument] = {}
+        for entry in self._committed().values():
+            if not self._pending(entry) or entry.saga_id in except_sagas:
+                continue
+            found = first.get(entry.saga_id)
+            if found is None or entry.seq < found.seq:
+                first[entry.saga_id] = entry
+        due = [
+            entry for entry in first.values() if entry.next_attempt_at_ms is None or entry.next_attempt_at_ms <= now_ms
+        ]
+        due.sort(key=lambda entry: (entry.created_at_ms, entry.saga_id))
+        return [entry.saga_id for entry in due[: max(0, limit)]]
 
     async def next_pending(self, saga_id: str) -> SagaDispatchDocument | None:
-        raise _refuse("saga dispatch", 4)
+        pending = [entry for entry in self._committed().values() if entry.saga_id == saga_id and self._pending(entry)]
+        return min(pending, key=lambda entry: entry.seq) if pending else None
 
     async def mark_dispatched(self, entry_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _refuse("saga dispatch", 4)
+        current = self._rows(tx).get(entry_id)
+        if current is None:
+            return
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "dispatch",
+            self._store._data.dispatch,
+            None if inner is None else inner.dispatch,
+            inner,
+            entry_id,
+            replace(current, dispatched_at_ms=now_ms),
+        )
 
     async def schedule_retry(self, entry_id: str, attempts: int, next_attempt_at_ms: int) -> None:
-        raise _refuse("saga dispatch", 4)
+        current = self._committed().get(entry_id)
+        if current is not None:
+            self._store._write(
+                "dispatch",
+                self._store._data.dispatch,
+                None,
+                None,
+                entry_id,
+                replace(current, attempts=attempts, next_attempt_at_ms=next_attempt_at_ms),
+            )
 
     async def mark_failed(self, entry_id: str, failure: DispatchFailure) -> None:
-        raise _refuse("saga dispatch", 4)
+        current = self._committed().get(entry_id)
+        if current is None:
+            return
+        notice = failure.notice_at_ms is not None
+        self._store._write(
+            "dispatch",
+            self._store._data.dispatch,
+            None,
+            None,
+            entry_id,
+            replace(
+                current,
+                attempts=current.attempts if failure.attempts is None else failure.attempts,
+                failed_at_ms=failure.failed_at_ms,
+                failure_reason=failure.reason,
+                failure_message=failure.message,
+                notice_pending=True if notice else None,
+                notice_attempts=0 if notice else None,
+                notice_next_at_ms=failure.notice_at_ms,
+            ),
+        )
 
     async def claim_due_notice(self, now_ms: int, reserve_until_ms: int) -> SagaDispatchDocument | None:
-        raise _refuse("saga dispatch", 4)
+        due = [
+            entry
+            for entry in self._committed().values()
+            if entry.notice_pending and (entry.notice_next_at_ms is None or entry.notice_next_at_ms <= now_ms)
+        ]
+        if not due:
+            return None
+        due.sort(
+            key=lambda entry: (0 if entry.notice_next_at_ms is None else 1, entry.notice_next_at_ms or 0, entry.id)
+        )
+        claimed = replace(due[0], notice_next_at_ms=reserve_until_ms)
+        self._store._write("dispatch", self._store._data.dispatch, None, None, claimed.id, claimed)
+        return claimed
 
     async def clear_notice(self, entry_id: str) -> None:
-        raise _refuse("saga dispatch", 4)
+        current = self._committed().get(entry_id)
+        if current is not None:
+            self._store._write(
+                "dispatch",
+                self._store._data.dispatch,
+                None,
+                None,
+                entry_id,
+                replace(current, notice_pending=None, notice_attempts=None, notice_next_at_ms=None),
+            )
 
     async def schedule_notice_retry(self, entry_id: str, notice_attempts: int, next_at_ms: int) -> None:
-        raise _refuse("saga dispatch", 4)
+        current = self._committed().get(entry_id)
+        if current is not None:
+            self._store._write(
+                "dispatch",
+                self._store._data.dispatch,
+                None,
+                None,
+                entry_id,
+                replace(current, notice_attempts=notice_attempts, notice_next_at_ms=next_at_ms),
+            )
 
     async def claim_lease(self, saga_id: str, owner: str, now_ms: int, until_ms: int) -> bool:
-        raise _refuse("saga dispatch", 4)
+        current = self._store._data.leases.rows.get(saga_id)
+        if current is not None and current.until_ms >= now_ms:
+            return False
+        self._store._write("lease", self._store._data.leases, None, None, saga_id, _Lease(owner, until_ms))
+        return True
 
     async def renew_lease(self, saga_id: str, owner: str, until_ms: int) -> bool:
-        raise _refuse("saga dispatch", 4)
+        current = self._store._data.leases.rows.get(saga_id)
+        if current is None or current.owner != owner:
+            return False
+        self._store._write("lease", self._store._data.leases, None, None, saga_id, _Lease(owner, until_ms))
+        return True
 
     async def release_lease(self, saga_id: str, owner: str) -> None:
-        raise _refuse("saga dispatch", 4)
+        current = self._store._data.leases.rows.get(saga_id)
+        if current is not None and current.owner == owner:
+            self._store._write("lease", self._store._data.leases, None, None, saga_id, None)
 
     async def pending(self) -> int:
-        raise _refuse("saga dispatch", 4)
+        return sum(1 for entry in self._committed().values() if self._pending(entry))
 
 
 class _Deadlines:
-    """The deadlines, implemented from level 4."""
+    """The saga deadlines."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    @staticmethod
+    def _clean(deadline: DeadlineDocument) -> DeadlineDocument:
+        return replace(deadline, correlation_id=deadline.correlation_id or None)
+
+    def _rows(self, tx: Tx | None = None) -> dict[str, DeadlineDocument]:
+        inner = self._store.resolve(tx)
+        overlay = _EMPTY_DEADLINES if inner is None else inner.deadlines
+        return self._store.current_rows(self._store._data.deadlines, overlay, tx)
 
     async def insert(self, deadline: DeadlineDocument, *, tx: Tx | None = None) -> None:
-        raise _refuse("deadlines", 4)
+        if deadline.id in self._rows(tx):
+            raise Conflict(f"duplicate key: a deadline {deadline.id} exists")
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "deadlines",
+            self._store._data.deadlines,
+            None if inner is None else inner.deadlines,
+            inner,
+            deadline.id,
+            self._clean(deadline),
+        )
 
     async def find_scheduled(self, deadline_id: str, *, tx: Tx | None = None) -> DeadlineDocument | None:
-        raise _refuse("deadlines", 4)
+        found = self._rows(tx).get(deadline_id)
+        return found if found is not None and found.status is DeadlineStatus.SCHEDULED else None
 
     async def cancel(self, saga_id: str, deadline_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _refuse("deadlines", 4)
+        self._cancel(lambda deadline: deadline.id == deadline_id and deadline.saga_id == saga_id, now_ms, tx)
 
     async def cancel_by_name(self, saga_id: str, name: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _refuse("deadlines", 4)
+        self._cancel(lambda deadline: deadline.saga_id == saga_id and deadline.name == name, now_ms, tx)
 
     async def cancel_all(self, saga_id: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _refuse("deadlines", 4)
+        self._cancel(lambda deadline: deadline.saga_id == saga_id, now_ms, tx)
+
+    def _cancel(self, matches: Callable[[DeadlineDocument], bool], now_ms: int, tx: Tx | None) -> None:
+        inner = self._store.resolve(tx)
+        for deadline in self._rows(tx).values():
+            if matches(deadline) and deadline.status is DeadlineStatus.SCHEDULED:
+                self._store._write(
+                    "deadlines",
+                    self._store._data.deadlines,
+                    None if inner is None else inner.deadlines,
+                    inner,
+                    deadline.id,
+                    replace(deadline, status=DeadlineStatus.CANCELLED, finished_at_ms=now_ms),
+                )
 
     async def mark_fired(self, deadline_id: str, now_ms: int, *, tx: Tx | None = None) -> bool:
-        raise _refuse("deadlines", 4)
+        current = self._rows(tx).get(deadline_id)
+        if current is None or current.status is not DeadlineStatus.SCHEDULED:
+            return False
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "deadlines",
+            self._store._data.deadlines,
+            None if inner is None else inner.deadlines,
+            inner,
+            deadline_id,
+            replace(current, status=DeadlineStatus.FIRED, finished_at_ms=now_ms),
+        )
+        return True
 
     async def claim_due(self, owner: str, now_ms: int, claimed_until_ms: int) -> DeadlineDocument | None:
-        raise _refuse("deadlines", 4)
+        due = [
+            deadline
+            for deadline in self._store._data.deadlines.rows.values()
+            if deadline.status is DeadlineStatus.SCHEDULED
+            and deadline.due_at_ms <= now_ms
+            and (deadline.claimed_until_ms is None or deadline.claimed_until_ms < now_ms)
+        ]
+        if not due:
+            return None
+        due.sort(key=lambda deadline: (deadline.due_at_ms, deadline.id))
+        claimed = self._clean(replace(due[0], claimed_by=owner, claimed_until_ms=claimed_until_ms))
+        self._store._write("deadlines", self._store._data.deadlines, None, None, claimed.id, claimed)
+        return claimed
 
     async def count_overdue_by_name(self, now_ms: int) -> dict[str, int]:
-        raise _refuse("deadlines", 4)
+        counts: dict[str, int] = {}
+        for deadline in self._store._data.deadlines.rows.values():
+            if deadline.status is DeadlineStatus.SCHEDULED and deadline.due_at_ms <= now_ms:
+                counts[deadline.name] = counts.get(deadline.name, 0) + 1
+        return counts
 
 
 class _Failures:
-    """The parked saga failures, implemented from level 4."""
+    """The parked saga events."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    def _rows(self, tx: Tx | None = None) -> dict[str, SagaFailureDocument]:
+        inner = self._store.resolve(tx)
+        overlay = _EMPTY_FAILURES if inner is None else inner.failures
+        return self._store.current_rows(self._store._data.failures, overlay, tx)
 
     async def find(self, failure_id: str, *, tx: Tx | None = None) -> SagaFailureDocument | None:
-        raise _refuse("saga failures", 4)
+        return self._rows(tx).get(failure_id)
 
     async def save(self, failure: SagaFailureDocument, *, tx: Tx | None = None) -> None:
-        raise _refuse("saga failures", 4)
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "failures",
+            self._store._data.failures,
+            None if inner is None else inner.failures,
+            inner,
+            failure.id,
+            failure,
+        )
 
     async def delete(self, failure_id: str, *, tx: Tx | None = None) -> bool:
-        raise _refuse("saga failures", 4)
+        if failure_id not in self._rows(tx):
+            return False
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "failures", self._store._data.failures, None if inner is None else inner.failures, inner, failure_id, None
+        )
+        return True
 
     async def failed_again(
         self, failure_id: str, error: str, attempts: int, now_ms: int, *, tx: Tx | None = None
     ) -> bool:
-        raise _refuse("saga failures", 4)
+        current = self._rows(tx).get(failure_id)
+        if current is None:
+            return False
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "failures",
+            self._store._data.failures,
+            None if inner is None else inner.failures,
+            inner,
+            failure_id,
+            replace(current, attempts=current.attempts + attempts, error=error, last_failed_at_ms=now_ms),
+        )
+        return True
 
     async def list(self, saga_type: str | None = None, *, tx: Tx | None = None) -> builtins.list[SagaFailureDocument]:
-        raise _refuse("saga failures", 4)
+        found = [failure for failure in self._rows(tx).values() if saga_type is None or failure.saga_type == saga_type]
+        found.sort(key=lambda failure: (failure.last_failed_at_ms, failure.id))
+        return found
 
 
 class _Markers:
-    """The saga stage's markers, implemented from level 4."""
+    """The saga stage's markers: processed-event ids, in the same table as every other marker."""
+
+    def __init__(self, store: MemoryStore) -> None:
+        self._store = store
+
+    def _overlay(self, tx: Tx | None) -> _Overlay[_ProcessedRow]:
+        inner = self._store.resolve(tx)
+        return _EMPTY_PROCESSED if inner is None else inner.processed
+
+    def _exists(self, marker_id: str, tx: Tx | None) -> bool:
+        return marker_id in self._store.current_rows(self._store._data.processed, self._overlay(tx), tx)
 
     async def exists(self, marker_id: str, *, tx: Tx | None = None) -> bool:
-        raise _refuse("saga markers", 4)
+        return self._exists(marker_id, tx)
 
     async def insert(self, marker_id: str, type_name: str, now_ms: int, *, tx: Tx | None = None) -> None:
-        raise _refuse("saga markers", 4)
+        if self._exists(marker_id, tx):
+            raise Conflict(f"duplicate key: a marker {marker_id} exists")
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "processed",
+            self._store._data.processed,
+            None if inner is None else inner.processed,
+            inner,
+            marker_id,
+            _ProcessedRow(ProcessedMarker(id=marker_id, type_name=type_name, processed_at_ms=now_ms)),
+        )
+
+
+_EMPTY_SAGAS: _Overlay[SagaDocument] = _Overlay()
+_EMPTY_DISPATCH: _Overlay[SagaDispatchDocument] = _Overlay()
+_EMPTY_DEADLINES: _Overlay[DeadlineDocument] = _Overlay()
+_EMPTY_FAILURES: _Overlay[SagaFailureDocument] = _Overlay()
+_EMPTY_PROCESSED: _Overlay[_ProcessedRow] = _Overlay()

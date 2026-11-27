@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from snodra import MessageStoreFailed, MessageStoreUnsupported
+from snodra import MessageStoreFailed
 from snodra_sql import (
     SCHEMA_VERSION,
     SqlConfig,
@@ -123,14 +123,6 @@ def test_the_store_offers_the_lifecycle() -> None:
         assert callable(getattr(store, name)), name
     store.use_clock(lambda: 1_800_000_000_000)
     assert store._now() == 1_800_000_000_000
-
-
-async def test_the_unimplemented_ports_name_the_level() -> None:
-    store = SqlStore(SqlConfig(url="postgres://u@h/db"))
-    with pytest.raises(MessageStoreUnsupported, match="level 2"):
-        await store.external.find("key")
-    with pytest.raises(MessageStoreUnsupported, match="level 2"):
-        await store.sagas.sagas.find_by_id("id")
 
 
 @pytest.mark.timeout(300)

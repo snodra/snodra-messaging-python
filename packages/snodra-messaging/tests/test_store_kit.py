@@ -12,6 +12,7 @@ from snodra._store_memory import MemoryStore
 from snodra.testing import (
     MESSAGE_STORE_CHECKS,
     MESSAGE_STORE_L3_CHECKS,
+    MESSAGE_STORE_L4_CHECKS,
     EventStoreKit,
     StoreCheck,
     appended_entry_is_claimed_in_created_seq_order,
@@ -19,6 +20,7 @@ from snodra.testing import (
     redelivered_after_commit_is_skipped,
     run_store_conformance,
     run_store_l3_conformance,
+    run_store_l4_conformance,
 )
 from snodra.testing.store import _checks_for
 
@@ -50,17 +52,35 @@ RUST_STORE_L3_CHECKS = (
     "processor_control_write_inside_rolled_back_transaction_is_kept",
 )
 
+RUST_STORE_L4_CHECKS = (
+    "external_call_idempotency_returns_first_result",
+    "saga_ports_round_trip",
+    "two_transactions_starting_one_saga_key_leave_one_live_saga",
+    "two_transactions_updating_one_saga_version_commit_once",
+    "saga_dispatch_store_refuses_an_event_the_outbox_would_refuse",
+    "due_deadline_is_claimed_once_until_its_lease_passes",
+    "an_empty_deadline_correlation_id_reads_as_absent",
+    "two_schedulers_claim_each_due_deadline_once",
+    "dispatch_hands_out_each_saga_in_seq_order",
+    "two_relays_never_hold_one_saga_lease",
+    "concurrent_notice_claims_return_each_notice_once",
+)
+
 RUST_STORE_CHECKS = (
     *RUST_STORE_L2_CHECKS[:6],
     RUST_STORE_L3_CHECKS[0],
     *RUST_STORE_L2_CHECKS[6:],
     *RUST_STORE_L3_CHECKS[1:],
+    *RUST_STORE_L4_CHECKS,
 )
 
 
 @pytest.mark.parametrize(
     "check",
-    [pytest.param(check, id=check.__name__) for check in (*MESSAGE_STORE_CHECKS, *MESSAGE_STORE_L3_CHECKS)],
+    [
+        pytest.param(check, id=check.__name__)
+        for check in (*MESSAGE_STORE_CHECKS, *MESSAGE_STORE_L3_CHECKS, *MESSAGE_STORE_L4_CHECKS)
+    ],
 )
 async def test_each_check_passes_on_the_memory_store(check: StoreCheck) -> None:
     await check(MemoryStore())
@@ -71,13 +91,18 @@ async def test_the_runner_runs_every_check_at_level_three() -> None:
     await run_store_l3_conformance(MemoryStore)
 
 
+async def test_the_runner_runs_every_check_at_level_four() -> None:
+    await run_store_conformance(MemoryStore, level=4)
+    await run_store_l4_conformance(MemoryStore)
+
+
 async def test_the_runner_runs_the_level_two_checks_by_default() -> None:
     await run_store_conformance(MemoryStore)
 
 
 async def test_the_runner_refuses_a_level_it_does_not_know() -> None:
-    with pytest.raises(ValueError, match="level 2 or 3"):
-        await run_store_conformance(MemoryStore, level=4)
+    with pytest.raises(ValueError, match="level 2, 3 or 4"):
+        await run_store_conformance(MemoryStore, level=5)
 
 
 async def test_an_empty_claim_owner_is_refused() -> None:
@@ -200,9 +225,12 @@ def test_the_checked_in_store_check_list_is_the_reference_list() -> None:
     assert listed == list(RUST_STORE_CHECKS)
     assert [check.__name__ for check in MESSAGE_STORE_CHECKS] == list(RUST_STORE_L2_CHECKS)
     assert [check.__name__ for check in MESSAGE_STORE_L3_CHECKS] == list(RUST_STORE_L3_CHECKS)
-    assert [check.__name__ for check in _checks_for(3)] == list(RUST_STORE_CHECKS)
+    assert [check.__name__ for check in _checks_for(3)] == list(RUST_STORE_CHECKS[:17])
+    assert [check.__name__ for check in _checks_for(4)] == list(RUST_STORE_CHECKS)
+    assert [check.__name__ for check in MESSAGE_STORE_L4_CHECKS] == list(RUST_STORE_L4_CHECKS)
     assert len(MESSAGE_STORE_CHECKS) == 9
     assert len(MESSAGE_STORE_L3_CHECKS) == 8
+    assert len(MESSAGE_STORE_L4_CHECKS) == 11
 
 
 async def test_the_event_store_kit_records_its_marker_through_the_memory_store() -> None:

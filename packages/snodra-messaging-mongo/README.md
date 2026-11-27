@@ -44,9 +44,9 @@ with an empty `url`: the store does not close a client it does not own.
 The store's transactions are MongoDB multi-document transactions on a client session, so the database must be a
 replica set (a single-node one is enough).
 
-The store implements the outbox, the processed-event markers, the dead letters and the processor control state; the
-level-3 store checks pass on a replica set. The external-call and saga ports are part of the interface frozen at
-level 2 and report `snodra.MessageStoreUnsupported` for now; the official add-ons implement every port by level 4.
+The store implements every message-store port: the outbox, the processed-event markers, the dead letters, the
+processor control state, the external-call records and the saga records. The level-3 and level-4 store checks pass on
+a replica set; level 4 is not claimed publicly until the release that publishes it for every library.
 
 ### The transaction is the service's
 

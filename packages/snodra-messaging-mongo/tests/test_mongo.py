@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import Awaitable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -21,12 +20,10 @@ from snodra import (
     InvalidMessage,
     Locked,
     MessageStoreFailed,
-    MessageStoreUnsupported,
     OutboxEntry,
     Parked,
     ProcessedMarker,
     ReplayRange,
-    SagaFailureDocument,
     Tx,
     bind_transaction,
     unbind_transaction,
@@ -490,34 +487,6 @@ async def test_blank_optional_dead_letter_fields_stay_absent(store: MongoStore) 
     assert found is not None
     assert (found.key, found.event_id, found.event_type, found.blocked_by) == ("", None, None, None)
     assert found.payload == b""
-
-
-async def test_the_unsupported_ports_say_so(store: MongoStore) -> None:
-    """The ports this level does not implement say so."""
-    calls: list[Awaitable[object]] = [
-        store.external.reset("key", "owner"),
-        store.sagas.sagas.find_by_id("saga"),
-        store.sagas.dispatch.clear_notice("id"),
-        store.sagas.deadlines.cancel_all("saga", 0),
-        store.sagas.failures.save(
-            SagaFailureDocument(
-                id="id",
-                saga_type="type",
-                event_id="event",
-                event_type="event.Type",
-                payload="{}",
-                headers={},
-                error="why",
-                attempts=1,
-                first_failed_at_ms=0,
-                last_failed_at_ms=0,
-            )
-        ),
-        store.sagas.markers.insert("id", "type", 0),
-    ]
-    for call in calls:
-        with pytest.raises(MessageStoreUnsupported):
-            await call
 
 
 async def test_another_stores_transaction_is_refused(store: MongoStore, make_config: Any) -> None:
