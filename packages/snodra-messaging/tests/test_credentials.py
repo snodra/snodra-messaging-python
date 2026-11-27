@@ -81,7 +81,7 @@ async def test_the_token_is_never_logged(hub: FakeHub, caplog: pytest.LogCapture
     app = await start_app(hub, credentials=Token(SECRET))
     s, _ = await _registered(hub)
     await s.close(grpc.StatusCode.UNAUTHENTICATED, "token not accepted")
-    await eventually(lambda: app.rejection is not None)
+    await eventually(lambda: app.rejection is not None, within=5.0)
     s, r = await _registered(hub)
     assert r.credentials.token == SECRET  # it was sent
     await app.shutdown()
@@ -220,7 +220,7 @@ async def test_a_permission_denied_close_fetches_nothing(hub: FakeHub, token_end
 async def test_a_token_endpoint_failure_is_exposed_and_retried(hub: FakeHub, token_endpoint: TokenEndpoint) -> None:
     token_endpoint.default = TokenAnswer(status=500)
     app = await start_app(hub, credentials=_client(token_endpoint), reconnect_backoff=(0.05, 1.0))
-    await eventually(lambda: app.rejection is not None)
+    await eventually(lambda: app.rejection is not None, within=5.0)
     rejection = app.rejection
     assert rejection is not None
     assert rejection.code == "UNAUTHENTICATED"
