@@ -29,6 +29,7 @@ from snodra._errors import ConfigurationError
 from snodra._events import EventRegistry
 from snodra._eventstore import Capability, EventStore
 from snodra._hubpb import hub_pb2
+from snodra._reset import ResetMachine
 from snodra._settings import Settings
 from snodra._store import MessageStore, ProcessorControlState, Unsupported
 from snodra._timings import Timings
@@ -96,8 +97,8 @@ class Processors:
             for name in self._names
         }
         self._versions: dict[str, int] = {name: 0 for name in self._names}
-        self._held: dict[str, str] = {}  # the reset operations this instance holds (level 3's reset state machine)
         self._unsupported: set[str] = set()  # processors whose message store has no processor_control
+        self.reset = ResetMachine(self, store, events, registry, clock)
         self._consumer_tasks: dict[str, asyncio.Task[None]] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._poll_interval = timings.processor_control_poll
@@ -120,6 +121,14 @@ class Processors:
     def consumer(self, processor: str) -> EventConsumer:
         """The consumer of ``processor``."""
         return self._consumers[processor]
+
+    def runs(self, processor: str) -> bool:
+        """Whether this instance runs ``processor``."""
+        return processor in self._consumers
+
+    def bump(self, processor: str) -> None:
+        """Counts a change made here: a control document read before it must not be applied over it."""
+        self._versions[processor] += 1
 
     async def start(self) -> None:
         """Reads the control documents, starts the processors they let run, then polls and samples."""
@@ -260,13 +269,18 @@ class Processors:
                 name,
                 self._store.name,
             )
-            await self._set_running(name, True, initial=initial)
+            await self.set_running(name, True, initial=initial)
         for name in self._names:
             if name in self._unsupported or name not in documents:
                 continue
             if self._versions[name] != versions[name]:
                 continue  # read before a change made here: it would undo it
-            await self._apply(name, documents[name], initial=initial)
+            try:
+                await self._apply(name, documents[name], initial=initial)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("could not apply the control document of processor %s", name, exc_info=True)
 
     async def _apply(self, processor: str, document: ProcessorControlState, *, initial: bool) -> None:
         """Applies one document: the pause, the lock that keeps the processor out of its subscription, its ranges."""
@@ -275,30 +289,47 @@ class Processors:
         if document.paused != consumer.paused:
             consumer.pause() if document.paused else consumer.resume()
             log.info("Processor %s %s (processor_control)", processor, "paused" if document.paused else "resumed")
-        held = self._held.get(processor)
+        held = await self.reset.converge_held(processor, document, now)
         operation = document.operation
-        if held is not None and (operation is None or operation.id != held):
-            # The document no longer names the operation this instance held (it was finished or taken over).
-            # TODO(L3-5): remember the ended operation so a late renewal is refused NOT_PREPARED, as the base does.
-            del self._held[processor]
-            held = None
         foreign = operation if operation is not None and operation.holds_at(now) and operation.id != held else None
         consumer.operation_id = held or ("" if foreign is None else foreign.id)
         consumer.set_replay(document.replay)
-        await self._set_running(processor, held is None and foreign is None, initial=initial)
+        await self.set_running(
+            processor,
+            held is None and foreign is None,
+            initial=initial,
+            why=None if foreign is None else f"reset operation {foreign.id} holds its lock",
+        )
+        await self._remove_passed(processor, now)
 
-    async def _set_running(self, processor: str, run: bool, *, initial: bool) -> None:
+    async def set_running(self, processor: str, run: bool, *, initial: bool = False, why: str | None = None) -> None:
         """Starts or stops one consumer, as the documents say (a stopped one stays in no subscription)."""
         task = self._consumer_tasks.get(processor)
         alive = task is not None and not task.done()
         if run and not alive:
             self._consumer_tasks[processor] = self._consumers[processor].start()
         elif not run and alive and task is not None:
-            # TODO(L3-5): finish the record in hand and acknowledge it before leaving the subscription (a reset's
-            # prepare), as the base implementation does; the reset task will own the stop path.
-            log.info("Processor %s stops: a reset operation holds its lock", processor)
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            log.info("Processor %s stops: %s", processor, why or "consuming is paused")
+            consumer = self._consumers[processor]
+            consumer.request_stop()
+            if consumer.handling:
+                # Finish the record in hand, acknowledge it and leave the subscription (the base's stop joins the
+                # reader); a handler that outlives the drain is cancelled, its transaction rolled back.
+                # TODO(spec-gap): SG-46
+                try:
+                    async with asyncio.timeout(self._timings.handler_drain):
+                        await task
+                except TimeoutError:
+                    log.warning(
+                        "Processor %s did not leave within %.2f s: cancelling its record",
+                        processor,
+                        self._timings.handler_drain,
+                    )
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            else:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             self._consumer_tasks.pop(processor, None)
         elif not run and initial:
             # Started under a held lock: it never joins (and reports STOPPED with the operation).
@@ -307,3 +338,38 @@ class Processors:
                 processor,
                 self._consumers[processor].operation_id,
             )
+
+    async def converge(self, processor: str, *, initial: bool = False) -> None:
+        """Reads one processor's control document again and applies it, unless a change here overtook the read."""
+        before = self._versions[processor]
+        try:
+            document = await self._store.control.get(processor)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("could not read the processor control document of %s", processor)
+            return
+        if self._versions[processor] != before:
+            return
+        await self._apply(processor, document, initial=initial)
+
+    async def _remove_passed(self, processor: str, now: int) -> None:
+        """Removes the replay ranges this instance's subscription consumed past from its control document."""
+        consumer = self._consumers[processor]
+        for replay_range in consumer.passed_ranges():
+            try:
+                removed = await self._store.control.remove_range(processor, replay_range, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log.warning("could not remove the replay range of processor %s: %s", processor, error)
+                continue
+            if removed:
+                log.info(
+                    "Processor %s replayed segment %s of %s up to %s",
+                    processor,
+                    replay_range.segment,
+                    replay_range.source,
+                    replay_range.until,
+                )
+            consumer.set_replay(tuple(item for item in consumer.replay_ranges if item != replay_range))

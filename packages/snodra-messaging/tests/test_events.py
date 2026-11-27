@@ -11,7 +11,15 @@ import pytest
 from eventhelpers import OrderPlaced, OrderShipped, RecordingEventStore, SlowOutbox, delivery
 from fakehub import FakeHub
 from helpers import TP, library_tasks, new_app, start_app
-from snodra import ConfigurationError, JsonCodec, MemoryEventStore, MemoryStore, RegistrationClosed, Settings
+from snodra import (
+    ConfigurationError,
+    JsonCodec,
+    MemoryEventStore,
+    MemoryStore,
+    RegistrationClosed,
+    ResetContext,
+    Settings,
+)
 from snodra._events import event_handling, event_message, event_timestamp, is_json_object, outgoing_event
 from snodra._events import outbox_entry as build_entry
 from snodra._eventstore import EventHeaders
@@ -290,3 +298,56 @@ def test_is_json_object_refuses_the_constants_json_has_not() -> None:
     assert not is_json_object(b'{"n":Infinity}')
     assert not is_json_object(b'{"n":-Infinity}')
     assert not is_json_object(b"\xef\xbb\xbf{}")
+
+
+async def test_reset_handlers_run_per_processor_and_are_checked(hub: FakeHub) -> None:
+    app = new_app(hub, store=MemoryStore(), event_store=MemoryEventStore())
+
+    @app.reset_handler
+    async def bare() -> None:
+        pass
+
+    @app.reset_handler()
+    async def called(context: ResetContext) -> None:
+        pass
+
+    @app.reset_handler("mail")
+    async def named(context: ResetContext) -> None:
+        pass
+
+    assert [handler.fn for handler in app._events.reset_handlers("default")] == [bare, called]
+    assert [handler.fn for handler in app._events.reset_handlers("mail")] == [named]
+    assert [handler.wants_context for handler in app._events.reset_handlers("default")] == [False, True]
+
+    with pytest.raises(TypeError, match="ResetContext"):
+
+        @app.reset_handler
+        async def wrong(first: int) -> None:
+            pass
+
+    with pytest.raises(TypeError, match="ResetContext or nothing"):
+
+        @app.reset_handler
+        async def two(first: ResetContext, second: ResetContext) -> None:
+            pass
+
+    with pytest.raises(TypeError, match="async def"):
+
+        @app.reset_handler  # type: ignore[type-var]
+        def sync() -> None:
+            pass
+
+    with pytest.raises(ValueError, match="processor name"):
+
+        @app.reset_handler("Mail")
+        async def bad_name() -> None:
+            pass
+
+
+async def test_a_reset_handler_registered_after_start_is_refused(hub: FakeHub) -> None:
+    app = await start_app(hub, store=MemoryStore(), event_store=MemoryEventStore(), outbox_enabled=False)
+    with pytest.raises(RegistrationClosed, match="registered before the app starts"):
+
+        @app.reset_handler
+        async def too_late() -> None:
+            pass

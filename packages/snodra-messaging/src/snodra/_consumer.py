@@ -64,6 +64,7 @@ from snodra._eventstore import (
     segment_order,
 )
 from snodra._hubpb import hub_pb2
+from snodra._replay import in_replay, open_until, passed_ranges
 from snodra._status import (
     MAX_DEAD_LETTER_ERROR_CHARS,
     StatusView,
@@ -179,6 +180,8 @@ class EventConsumer:
         self._operation_id = ""
         self._replay: tuple[ReplayRange, ...] = ()
         self._subscription: EventStoreSubscription | None = None
+        self._stop_requested = False
+        self._handling = False
         # The parking state of mode collection: the keys with a letter, the segments whose keys are unknown, and what a
         # redelivery still has to write (it does not run the handlers again).
         self._parked_keys: set[str] = set()
@@ -228,7 +231,17 @@ class EventConsumer:
         """Starts reading, paused when a pause is in force, and returns its task."""
         self._started = True
         self._running = True
+        self._stop_requested = False
         return asyncio.create_task(self.run(), name=f"snodra:consumer:{self._processor}")
+
+    @property
+    def handling(self) -> bool:
+        """Whether a record is in hand now (a stop waits for it before leaving the subscription)."""
+        return self._handling
+
+    def request_stop(self) -> None:
+        """Asks the reader to finish the record in hand, acknowledge it and leave the subscription."""
+        self._stop_requested = True
 
     def pause(self) -> None:
         """Pauses consumption: the subscription delivers nothing more without being left (a record handed out before
@@ -287,8 +300,9 @@ class EventConsumer:
                 self._delivered = False
                 started = time.monotonic()
                 trouble: BaseException | None = None
+                stopped = False
                 try:
-                    await self._read(subscription)
+                    stopped = await self._read(subscription)
                 except asyncio.CancelledError as error:
                     if _cancelling():
                         raise
@@ -309,6 +323,8 @@ class EventConsumer:
                         log.warning("closing the subscription %s failed: %s", self._spec.name, error)
                     except Exception as error:
                         log.warning("closing the subscription %s failed: %s", self._spec.name, error)
+                if stopped:
+                    return
                 if trouble is not None:
                     if isinstance(trouble, Exception):
                         self._failing(trouble)
@@ -329,8 +345,8 @@ class EventConsumer:
         finally:
             self._running = False
 
-    async def _read(self, subscription: EventStoreSubscription) -> None:
-        """Reads until cancelled or the subscription fails."""
+    async def _read(self, subscription: EventStoreSubscription) -> bool:
+        """Reads until cancelled, the subscription fails, or a stop was asked for; whether it was a stop."""
         while True:
             event = await subscription.next()
             if isinstance(event, Assigned):
@@ -348,12 +364,20 @@ class EventConsumer:
                 await self._redeliver(subscription, event)
                 continue
             self._delivered = True
-            await self._handle(subscription, event)
+            replay = in_replay(event, self._replay, self._events.compare)
+            self._handling = True
+            try:
+                await self._handle(subscription, event, replay)
+            finally:
+                self._handling = False
+            if self._stop_requested:
+                log.debug("the event processor %s stops after the record in hand", self._processor)
+                return True
             trouble = subscription.take_error()
             if trouble is not None:
                 self._failing_text(trouble)
 
-    async def _handle(self, subscription: EventStoreSubscription, delivery: Delivery) -> None:
+    async def _handle(self, subscription: EventStoreSubscription, delivery: Delivery, replay: bool) -> None:
         """Handles one delivery, then acknowledges it; an exhausted or invalid record goes to its dead letters."""
         # TODO(spec-gap): SG-22
         coords = (delivery.segment, delivery.position)
@@ -362,19 +386,19 @@ class EventConsumer:
             return
         type_ = delivery.headers.get(EventHeaders.TYPE)
         if type_ is None or not type_.strip():
-            await self._invalid(subscription, delivery, None, "record without type header")
+            await self._invalid(subscription, delivery, None, "record without type header", replay)
             return
         handlers = self._registry.handlers(self._processor, type_)
         if not handlers:
             await self._ack(subscription, delivery)
             return
         if not is_json_object(delivery.payload):
-            await self._invalid(subscription, delivery, type_, "payload is not a JSON object")
+            await self._invalid(subscription, delivery, type_, "payload is not a JSON object", replay)
             return
         event_id = self._event_id(delivery)
-        if await self._sequenced(subscription, delivery, type_):
+        if await self._sequenced(subscription, delivery, type_, replay):
             return
-        await self._attempt(subscription, delivery, type_, event_id, handlers)
+        await self._attempt(subscription, delivery, type_, event_id, handlers, replay)
 
     async def _attempt(
         self,
@@ -383,6 +407,7 @@ class EventConsumer:
         type_: str,
         event_id: str,
         handlers: tuple[EventHandler, ...],
+        replay: bool,
     ) -> None:
         """Runs stage 1 with its attempts and backoff; an exhausted record goes to the dead letters."""
         info = event_message(event_id, type_, delivery.headers)
@@ -393,7 +418,7 @@ class EventConsumer:
         for attempt in range(1, self._max_attempts + 1):
             try:
                 with event_handling(info, user_id):
-                    duplicate = await self._stage_one(delivery, type_, event_id, handlers)
+                    duplicate = await self._stage_one(delivery, type_, event_id, handlers, replay)
             except asyncio.CancelledError as error:
                 if _cancelling():
                     raise
@@ -422,7 +447,7 @@ class EventConsumer:
                 await asyncio.sleep(self._backoff)
                 continue
             break
-        await self._exhausted(subscription, delivery, type_, failure, attempt)
+        await self._exhausted(subscription, delivery, type_, failure, attempt, replay)
 
     async def _exhausted(
         self,
@@ -431,13 +456,14 @@ class EventConsumer:
         type_: str,
         failure: BaseException | None,
         attempts: int,
+        replay: bool,
     ) -> None:
         """A record failed every attempt: park it, publish it to the dead-letter source, or log and skip it."""
         self._failed_total += 1
         self._failing(failure) if isinstance(failure, Exception) else self._failing_text(str(failure))
         error = _error_of(failure)
         if self._mode == COLLECTION:
-            letter = self._letter(delivery, DeadLetterReason.HANDLER_FAILED, error, attempts)
+            letter = self._letter(delivery, DeadLetterReason.HANDLER_FAILED, error, attempts, replay=replay)
             log.error(
                 "Event type=%s id=%s at %s-%s@%s failed %d attempt(s) in processor %s, parking it as %s: %s: %s",
                 type_,
@@ -492,12 +518,13 @@ class EventConsumer:
         delivery: Delivery,
         type_: str | None,
         why: str,
+        replay: bool,
     ) -> None:
         """A record that cannot be handled: an INVALID letter (which blocks nothing), a publish, or a log and skip."""
         error = DeadLetterError.invalid(why)
         label = "?" if type_ is None else type_
         if self._mode == COLLECTION:
-            letter = self._letter(delivery, DeadLetterReason.INVALID, error, 0)
+            letter = self._letter(delivery, DeadLetterReason.INVALID, error, 0, replay=replay)
             log.warning(
                 "Record at %s-%s@%s of type %s is invalid (%s), parking it as %s",
                 self._source,
@@ -535,6 +562,7 @@ class EventConsumer:
         subscription: EventStoreSubscription,
         delivery: Delivery,
         type_: str,
+        replay: bool,
     ) -> bool:
         """Parks the record SEQUENCED when its key has a letter (or acknowledges a duplicate); whether it handled it."""
         letters = self._letters
@@ -595,7 +623,9 @@ class EventConsumer:
             )
             await self._ack(subscription, delivery)
             return True
-        letter = self._letter(delivery, DeadLetterReason.SEQUENCED, DeadLetterError.sequenced(head), 0, blocked_by=head)
+        letter = self._letter(
+            delivery, DeadLetterReason.SEQUENCED, DeadLetterError.sequenced(head), 0, blocked_by=head, replay=replay
+        )
         log.info(
             "Record at %s-%s@%s of type %s parked SEQUENCED in processor %s behind %s",
             self._source,
@@ -700,6 +730,7 @@ class EventConsumer:
         type_: str,
         event_id: str,
         handlers: tuple[EventHandler, ...],
+        replay: bool,
     ) -> bool:
         """Records the marker and runs the handlers in one transaction; whether the event was a duplicate."""
         marker = _stage_marker(self._processor, self._source, delivery, type_, event_id, self._clock())
@@ -710,6 +741,8 @@ class EventConsumer:
                     # every add-on's context manager roll back, and nothing of this attempt commits.
                     raise _Duplicate
                 for handler in handlers:
+                    if replay and not handler.replay:
+                        continue
                     try:
                         message: object = self._codec.decode(delivery.payload, handler.message)
                     except DecodeError as error:
@@ -726,6 +759,7 @@ class EventConsumer:
         error: DeadLetterError,
         attempts: int,
         blocked_by: str | None = None,
+        replay: bool = False,
     ) -> DeadLetter:
         """The letter of ``delivery``: its id, key, headers, payload, the reason and the attempts."""
         now = self._clock()
@@ -747,7 +781,7 @@ class EventConsumer:
             parked_at_ms=now,
             last_attempt_at_ms=now,
             expire_at_ms=now + self._retention_ms,
-            replay=False,
+            replay=replay,
         )
 
     async def _load_keys(self, segments: Sequence[str]) -> None:
@@ -826,7 +860,7 @@ class EventConsumer:
             except Exception:
                 segments = []
             segments.sort(key=cmp_to_key(_segment_status_order))
-            replay_until, replaying = self._replay_until(segments)
+            replay_until, replaying = open_until(self._replay, segments, self._events.compare)
         else:
             replaying = False
         return build_status(
@@ -858,36 +892,20 @@ class EventConsumer:
             )
         )
 
-    def _replay_until(self, segments: Sequence[SegmentStatus]) -> tuple[dict[str, str], bool]:
-        """Each assigned segment's open replay end (the furthest this instance has not passed), and whether any is."""
-        until: dict[str, str] = {}
-        replaying = False
-        for segment in segments:
-            progress = segment.committed if segment.committed is not None else segment.position
-            ends = [
-                r.until for r in self._replay if r.segment == segment.segment and not self._passed(progress, r.until)
-            ]
-            if not ends:
-                continue
-            furthest = ends[0]
-            for end in ends[1:]:
-                try:
-                    if self._events.compare(end, furthest) > 0:
-                        furthest = end
-                except Exception:
-                    continue
-            until[segment.segment] = furthest
-            replaying = True
-        return until, replaying
+    @property
+    def replay_ranges(self) -> tuple[ReplayRange, ...]:
+        """The open replay ranges this consumer holds (those of its source)."""
+        return self._replay
 
-    def _passed(self, at: str | None, until: str) -> bool:
-        """Whether ``at`` (a position, ``None`` unknown) is at or past ``until`` by the event store's order."""
-        if at is None:
-            return False
+    def passed_ranges(self) -> list[ReplayRange]:
+        """The open ranges this instance's subscription has consumed past, as its segments report now."""
+        if self._subscription is None:
+            return []
         try:
-            return self._events.compare(at, until) >= 0
+            segments = self._subscription.segments()
         except Exception:
-            return False
+            return []
+        return passed_ranges(self._replay, segments, self._events.compare)
 
     async def sample_dead_letters(self, force: bool = False) -> None:
         """Reads this processor's letter count (mode ``collection`` only) for its status; blocking, run it off the

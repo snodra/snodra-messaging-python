@@ -94,20 +94,51 @@ async def test_an_unknown_processor_a_missing_action_and_a_reset_are_refused(hub
     assert reply.refused.code == hub_pb2.CONTROL_REFUSAL_UNKNOWN_PROCESSOR
     assert "does not run" in reply.refused.message
 
+    # A malformed prepare is checked before the processor: INVALID even for one that does not run here.
+    await s.send(
+        hub_pb2.ServerMessage(
+            control=_control("reset_prepare", processor="audit", control_id="u-2", operation_id="op-1", lease_ms=1)
+        )
+    )
+    reply = await s.recv_control_reply()
+    assert (reply.control_id, reply.refused.code) == ("u-2", hub_pb2.CONTROL_REFUSAL_INVALID)
+
     await s.send(hub_pb2.ServerMessage(control=hub_pb2.ControlRequest(control_id="n-1", processor="default")))
     reply = await s.recv_control_reply()
     assert reply.refused.code == hub_pb2.CONTROL_REFUSAL_INVALID
     assert reply.refused.message == "the control request has no action this instance knows"
 
-    for action in (
-        hub_pb2.ControlRequest(control_id="reset-1", processor="default", reset_prepare=hub_pb2.ResetPrepare()),
-        hub_pb2.ControlRequest(control_id="reset-2", processor="default", reset_execute=hub_pb2.ResetExecute()),
-        hub_pb2.ControlRequest(control_id="reset-3", processor="default", reset_finish=hub_pb2.ResetFinish()),
-    ):
-        await s.send(hub_pb2.ServerMessage(control=action))
-        reply = await s.recv_control_reply()
-        assert reply.control_id == action.control_id
-        assert reply.refused.code == hub_pb2.CONTROL_REFUSAL_UNSUPPORTED
+    # A malformed prepare is INVALID; an execute of an operation this instance does not hold is NOT_PREPARED; a
+    # finish with nothing held is ok (the operation ended elsewhere, or was aborted).
+    await s.send(hub_pb2.ServerMessage(control=_control("reset_prepare", control_id="reset-1")))
+    reply = await s.recv_control_reply()
+    assert (reply.control_id, reply.refused.code) == ("reset-1", hub_pb2.CONTROL_REFUSAL_INVALID)
+    await s.send(
+        hub_pb2.ServerMessage(
+            control=hub_pb2.ControlRequest(
+                control_id="reset-2",
+                processor="default",
+                reset_execute=hub_pb2.ResetExecute(operation_id="op-1", target=hub_pb2.ResetTarget(earliest=True)),
+            )
+        )
+    )
+    reply = await s.recv_control_reply()
+    assert (reply.control_id, reply.refused.code) == ("reset-2", hub_pb2.CONTROL_REFUSAL_NOT_PREPARED)
+    await s.send(
+        hub_pb2.ServerMessage(
+            control=hub_pb2.ControlRequest(
+                control_id="reset-3",
+                processor="default",
+                reset_finish=hub_pb2.ResetFinish(operation_id="op-1"),
+            )
+        )
+    )
+    reply = await s.recv_control_reply()
+    assert (reply.control_id, reply.WhichOneof("result"), reply.ok.detail) == (
+        "reset-3",
+        "ok",
+        "no operation holds the lock",
+    )
 
 
 async def test_every_request_is_answered_exactly_once_in_arrival_order(hub: FakeHub) -> None:

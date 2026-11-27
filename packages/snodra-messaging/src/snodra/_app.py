@@ -329,6 +329,33 @@ class App:
 
         return register if fn is None else register(fn)
 
+    @overload
+    def reset_handler(self, fn: H, /) -> H: ...
+    @overload
+    def reset_handler(self, processor: str = "default", /) -> Callable[[H], H]: ...
+    def reset_handler(self, arg: H | str | None = None, /) -> H | Callable[[H], H]:
+        """Registers a reset handler of the ``default`` processor (bare, ``@app.reset_handler``, or
+        ``@app.reset_handler()``) or of a named one (``@app.reset_handler("mail")``): an ``async def`` taking a
+        :class:`ResetContext` or no parameter.
+
+        A reset handler runs when a reset of its processor replays anything, before the reset deletes a stage-1 marker
+        or moves a position: it clears the projection the processor derives from the events, so the replay can rebuild
+        it. A handler that raises fails the reset (``RESET_HANDLER_FAILED``) and nothing moves. Raises ``TypeError`` for
+        a function that cannot be a reset handler, ``ValueError`` for a processor name outside
+        ``[a-z0-9][a-z0-9-]{0,47}`` and :class:`RegistrationClosed` after ``start``. Returns the function unchanged.
+        """
+        if arg is None:
+            return lambda fn: self._add_reset(fn, "default")
+        if isinstance(arg, str):
+            return lambda fn: self._add_reset(fn, arg)
+        if callable(arg):
+            return self._add_reset(arg, "default")
+        raise TypeError(f"a reset handler is a function or a processor name, got {arg!r}")
+
+    def _add_reset(self, fn: H, processor: str) -> H:
+        self._events.add_reset(fn, processor=processor)
+        return fn
+
     async def publish(self, event: object, *, key: str | None = None) -> None:
         """Builds the event and appends it to the service's outbox, in the caller's transaction.
 

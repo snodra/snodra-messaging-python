@@ -380,6 +380,48 @@ async def publish_all(events: EventStore, sent: Sequence[OutgoingEvent]) -> None
             raise AssertionError(f"publish {outgoing.id}: {error}") from error
 
 
+async def run_event_store_l3_conformance(
+    source: str,
+    open_store: Callable[[], EventStore],
+    store: MarkerStore,
+) -> None:
+    """Runs the level-3 capability checks by name (the form each capability declares); the first failing check raises
+    :class:`AssertionError` naming itself and the event store. See :func:`run_event_store_conformance` for the
+    arguments."""
+    from snodra._eventstore import Capability
+    from snodra.testing.checks import (
+        admin_without_replay_is_unsupported,
+        dead_letter_source_receives,
+        lag_counts_unacked,
+        lag_unknown_without_capability,
+        no_browser_without_capability,
+        replay_from_earliest_redelivers_history,
+    )
+
+    kit = EventStoreKit(source, open_store, store)
+    events = open_store()
+    name = events.name
+    checks = []
+    if events.supports(Capability.REPLAY):
+        checks.append(replay_from_earliest_redelivers_history)
+    else:
+        checks.append(admin_without_replay_is_unsupported)
+    if events.supports(Capability.LAG):
+        checks.append(lag_counts_unacked)
+    else:
+        checks.append(lag_unknown_without_capability)
+    if events.supports(Capability.NATIVE_DEAD_LETTER):
+        checks.append(dead_letter_source_receives)
+    checks.append(no_browser_without_capability)
+    for check in checks:
+        try:
+            await check(kit)
+        except Exception as error:
+            raise AssertionError(
+                f"event store conformance check `{check.__name__}` failed on event store `{name}`: {error}"
+            ) from error
+
+
 async def run_event_store_conformance(
     source: str,
     open_store: Callable[[], EventStore],

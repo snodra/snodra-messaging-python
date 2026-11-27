@@ -75,6 +75,7 @@ from snodra._eventstore_memory import MemoryEventStore
 from snodra._gather import Gathered, Part
 from snodra._identity import Caller, Guard, authenticated, caller_matches, role
 from snodra._messages import message_type
+from snodra._reset import ResetContext
 from snodra._retry import RetryPolicy
 from snodra._settings import Settings
 from snodra._store import (
@@ -225,6 +226,7 @@ __all__ = [
     "Rejection",
     "ReplayRange",
     "ReservedHeader",
+    "ResetContext",
     "ResetTarget",
     "RetryPolicy",
     "Revoked",

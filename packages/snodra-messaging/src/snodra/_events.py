@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, get_type_hints
 
 from snodra import _traceparent
 from snodra._codec import Codec
@@ -36,6 +36,7 @@ from snodra._eventstore import OutgoingEvent as OutgoingEvent
 from snodra._ids import new_id
 from snodra._messages import type_name
 from snodra._registry import _message_class, label_of
+from snodra._reset import ResetContext
 from snodra._store import OutboxEntry, check_outbox_payload, now_ms
 
 if TYPE_CHECKING:
@@ -93,6 +94,16 @@ def event_message(event_id: str, type_name: str, headers: Mapping[str, str]) -> 
 
 
 @dataclass(frozen=True, slots=True)
+class ResetHandler:
+    """One registered reset handler: its function, where it runs and whether it takes a :class:`ResetContext`."""
+
+    fn: Callable[..., Awaitable[Any]]
+    label: str
+    processor: str
+    wants_context: bool
+
+
+@dataclass(frozen=True, slots=True)
 class EventHandler:
     """One registered event handler: its function, the event class it takes, and where it runs."""
 
@@ -113,6 +124,7 @@ class EventRegistry:
 
     def __init__(self) -> None:
         self._handlers: dict[str, dict[str, list[EventHandler]]] = {}
+        self._resets: dict[str, list[ResetHandler]] = {}
         self._closed = False
 
     def close(self) -> None:
@@ -149,6 +161,47 @@ class EventRegistry:
         )
         self._handlers.setdefault(processor, {}).setdefault(handler.type, []).append(handler)
         return handler
+
+    def add_reset(self, fn: object, *, processor: str = DEFAULT_PROCESSOR) -> ResetHandler:
+        """Registers ``fn`` as a reset handler of ``processor``: an ``async def`` taking a :class:`ResetContext` or
+        nothing. Raises :class:`RegistrationClosed`, ``TypeError`` for a function that cannot be one and ``ValueError``
+        for a processor name outside the pattern."""
+        label = label_of(fn)
+        if self._closed:
+            raise RegistrationClosed(f"reset handler {label}: handlers are registered before the app starts")
+        if not inspect.iscoroutinefunction(fn):
+            raise TypeError(f"reset handler {label} must be an async def taking a ResetContext or nothing")
+        if not isinstance(processor, str) or processor == "":
+            raise ValueError(f"reset handler {label}: a processor name is a non-empty text")
+        if _PROCESSOR_NAME.fullmatch(processor) is None:
+            raise ValueError(
+                f"reset handler {label}: the processor name {processor!r} matches [a-z0-9][a-z0-9-]{{0,47}} at most"
+            )
+        parameters = list(inspect.signature(fn).parameters.values())
+        if len(parameters) > 1:
+            raise TypeError(f"reset handler {label} must take a ResetContext or nothing")
+        wants_context = False
+        if parameters:
+            parameter = parameters[0]
+            if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                raise TypeError(f"reset handler {label} must take a ResetContext or nothing")
+            try:
+                annotation: object = get_type_hints(fn).get(parameter.name, parameter.annotation)
+            except Exception:
+                annotation = parameter.annotation
+            if annotation is not ResetContext and not (
+                isinstance(annotation, str) and annotation in ("ResetContext", "snodra.ResetContext")
+            ):
+                raise TypeError(f"reset handler {label} must take a ResetContext or nothing")
+            if annotation is ResetContext or isinstance(annotation, str):
+                wants_context = True
+        handler = ResetHandler(fn=fn, label=label, processor=processor, wants_context=wants_context)
+        self._resets.setdefault(processor, []).append(handler)
+        return handler
+
+    def reset_handlers(self, processor: str) -> tuple[ResetHandler, ...]:
+        """The reset handlers of ``processor``, in registration order."""
+        return tuple(self._resets.get(processor, ()))
 
     def handlers(self, processor: str, type_: str) -> tuple[EventHandler, ...]:
         """The handlers of ``type_`` in ``processor``, in registration order."""

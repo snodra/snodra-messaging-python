@@ -9,14 +9,35 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Awaitable, Callable, Sequence
-from functools import partial
+from dataclasses import replace
+from functools import cmp_to_key, partial
 
-from snodra._eventstore import FIRST_ASSIGNMENT_WITHIN, Delivery, EventHeaders, ProcessedMarker
+from snodra._eventstore import (
+    FIRST_ASSIGNMENT_WITHIN,
+    Capability,
+    Delivery,
+    Earliest,
+    EventHeaders,
+    EventStore,
+    EventStoreAdmin,
+    Invalid,
+    Latest,
+    Positions,
+    ProcessedMarker,
+    ReplayRange,
+    SubscribersActive,
+    SubscriptionSpec,
+    Timestamp,
+    Unsupported,
+    dead_letter_source,
+    segment_order,
+)
 from snodra.testing.eventstore import (
     EVENT_TYPE,
     JOIN_WINDOW,
     QUIET,
     SLICE,
+    WAIT,
     EventStoreKit,
     Reader,
     all_until,
@@ -375,3 +396,261 @@ EVENT_STORE_CHECKS: tuple[Check, ...] = (
     paused_subscription_receives_nothing_and_resumes_in_place,
 )
 """Every check, in the reference kit's order."""
+
+
+# ---- level 3: capabilities ---------------------------------------------------------------------
+
+
+def _has(event_id: str) -> Callable[[Reader], bool]:
+    """A predicate: the reader delivered ``event_id``."""
+    return lambda reader: reader.has(event_id)
+
+
+async def _bounded[T](step: str, call: Awaitable[T]) -> T:
+    """``bounded`` from the kit module, imported here to avoid a circular import at module load."""
+    from snodra.testing.eventstore import bounded
+
+    return await bounded(step, call)
+
+
+def _admin(kit: EventStoreKit, spec: SubscriptionSpec) -> EventStoreAdmin:
+    """The reset side of ``spec``, or a failure naming the refusal."""
+    events = kit.instance()
+    try:
+        return events.admin(spec)
+    except Exception as error:
+        raise AssertionError(f"admin {spec.name}: {error}") from error
+
+
+async def _wait_members(admin: EventStoreAdmin, reader: Reader | None, want: int) -> None:
+    """Waits until the subscription has ``want`` members, pumping ``reader`` so a live one keeps its membership."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WAIT
+    while True:
+        members = await _bounded("members", admin.members())
+        if len(members) == want:
+            return
+        assert loop.time() < deadline, f"the subscription has {len(members)} members, want {want}: {members}"
+        if reader is not None:
+            await reader.pump(SLICE)
+        else:
+            await asyncio.sleep(SLICE)
+
+
+def _in_range(events: EventStore, replay: ReplayRange, position: str) -> bool:
+    """Whether ``position`` is inside ``replay``'s ``[start, until)`` by the event store's order."""
+    return (
+        bool(replay.until)
+        and events.compare(replay.start, position) <= 0
+        and events.compare(position, replay.until) < 0
+    )
+
+
+async def replay_from_earliest_redelivers_history(kit: EventStoreKit) -> None:
+    """While an instance reads the subscription its positions do not move; with none, a reset to earliest replays
+    what it had acknowledged. The plan of each target moves the segments as its doc says."""
+    events = kit.instance()
+    spec = kit.spec()
+    sent = [event(kit, fresh("key")) for _ in range(3)]
+    all_ids = ids(sent)
+    await publish_all(events, sent)
+
+    admin = _admin(kit, spec)
+    first = await Reader.join(events, spec)
+    try:
+        await first.until("the events delivered", lambda r: r.has_all(all_ids))
+        delivered = first.mine(all_ids)
+        await _wait_members(admin, first, 1)
+        earliest = await _bounded("plan earliest", admin.plan(Earliest()))
+        try:
+            await _bounded("apply with a subscriber", admin.apply(earliest))
+        except SubscribersActive:
+            pass
+        else:
+            raise AssertionError("no move while an instance reads the subscription")
+    finally:
+        await first.close()
+    await _wait_members(admin, None, 0)
+    for delivery in delivered:
+        assert any(_in_range(events, replay, delivery.position) for replay in earliest), (
+            f"earliest replays {delivery.position} of segment {delivery.segment}: {earliest}"
+        )
+    latest = await _bounded("plan latest", admin.plan(Latest()))
+    for delivery in delivered:
+        assert any(replay.segment == delivery.segment for replay in latest), (
+            f"latest moves segment {delivery.segment}: {latest}"
+        )
+    for replay in latest:
+        assert not replay.until or events.compare(replay.start, replay.until) >= 0, f"latest replays nothing: {latest}"
+    oldest = delivered[0]
+    at = await _bounded("plan timestamp", admin.plan(Timestamp(oldest.timestamp_ms)))
+    assert any(
+        replay.segment == oldest.segment and events.compare(oldest.position, replay.start) <= 0 for replay in at
+    ), f"a time moves to the first position at or after it: {at}"
+    newest = max(delivery.timestamp_ms for delivery in delivered)
+    past = await _bounded("plan timestamp", admin.plan(Timestamp(newest + 1)))
+    for delivery in delivered:
+        assert any(
+            replay.segment == delivery.segment and events.compare(delivery.position, replay.start) < 0
+            for replay in past
+        ), f"a time after every event of segment {delivery.segment} moves past {delivery.position}: {past}"
+    positions = await _bounded(
+        "plan positions",
+        admin.plan(Positions(((oldest.segment, oldest.position),))),
+    )
+    assert [(replay.segment, replay.start) for replay in positions] == [(oldest.segment, oldest.position)], (
+        f"positions move the listed segments only: {positions}"
+    )
+    for target in (
+        Positions((("conformance-no-such-segment", oldest.position),)),
+        Positions(((oldest.segment, "9223372036854775807"),)),
+    ):
+        try:
+            await _bounded("plan invalid", admin.plan(target))
+        except Invalid:
+            pass
+        else:
+            raise AssertionError(f"{target!r} is invalid")
+    await _bounded("apply earliest", admin.apply(earliest))
+    second = await Reader.join(events, spec)
+    try:
+        await second.until("the acknowledged events replayed", lambda r: r.has_all(all_ids))
+    finally:
+        await second.close()
+
+
+async def admin_without_replay_is_unsupported(kit: EventStoreKit) -> None:
+    """Without ``replay``, the reset side of a subscription is refused as unsupported."""
+    events = kit.instance()
+    try:
+        admin = events.admin(kit.spec())
+    except Unsupported as error:
+        missing = error.feature
+    else:
+        raise AssertionError(f"admin without replay is refused as unsupported, got {admin}")
+    assert missing == Capability.REPLAY, f"the missing capability: {missing}"
+
+
+async def lag_counts_unacked(kit: EventStoreKit) -> None:
+    """Each assigned segment's lag counts what the subscription has not acknowledged. Passes on an empty source: it
+    first gives every assigned segment an acknowledged event."""
+    events = kit.instance()
+    reader = await Reader.join(events, kit.spec())
+    try:
+        await reader.until("segments assigned", lambda r: bool(r.assigned))
+        primed: set[str] = set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + WAIT
+        while not reader.assigned.issubset(primed):
+            assert loop.time() < deadline, (
+                f"an acknowledged event on every segment within {WAIT:g} s (on {sorted(primed)} of "
+                f"{sorted(reader.assigned)})"
+            )
+            prime = event(kit, fresh("key"))
+            prime_id = prime.id
+            await publish_all(events, [prime])
+            await reader.until("the priming event delivered", _has(prime_id))
+            primed.add(reader.first_delivery(prime_id).segment)
+        deadline = loop.time() + WAIT
+        while True:
+            await reader.until("everything acknowledged, lag 0", lambda r: r.known_lag(list(r.assigned)) == 0)
+            count = len(reader.seen)
+            await reader.pump(QUIET)
+            if len(reader.seen) == count and reader.known_lag(list(reader.assigned)) == 0:
+                break
+            assert loop.time() < deadline, f"the source drained within {WAIT:g} s"
+        subscription = reader.subscription
+        assert subscription is not None
+        listed = [status.segment for status in subscription.segments()]
+        ordered = sorted(listed, key=cmp_to_key(segment_order))
+        assert listed == ordered, f"segments() in segment order: {listed}"
+        assert set(listed) == reader.assigned, f"segments() lists the assignment: {listed}, {reader.assigned}"
+
+        sent = [event(kit, fresh("key")) for _ in range(5)]
+        all_ids = ids(sent)
+        reader.held.update(all_ids)
+        await publish_all(events, sent)
+        await reader.until("the held events delivered", lambda r: r.has_all(all_ids))
+        held = {delivery.segment for delivery in reader.mine(all_ids)}
+        await reader.until(
+            "the lag counts the five unacknowledged events",
+            lambda r: r.known_lag(sorted(held)) == 5,
+        )
+        for delivery in list(reader.mine(all_ids)):
+            await reader.ack(delivery)
+        await reader.until("the lag back to 0 once acknowledged", lambda r: r.known_lag(sorted(held)) == 0)
+    finally:
+        await reader.close()
+
+
+async def lag_unknown_without_capability(kit: EventStoreKit) -> None:
+    """Without ``lag``, no segment reports a lag."""
+    events = kit.instance()
+    sent = event(kit, fresh("key"))
+    await publish_all(events, [sent])
+    reader = await Reader.join(events, kit.spec())
+    try:
+        await reader.until("the event delivered", lambda r: r.has(sent.id))
+        subscription = reader.subscription
+        assert subscription is not None
+        statuses = subscription.segments()
+        assert statuses, "segments() lists the assignment"
+        assert all(status.lag is None for status in statuses), f"no lag without the capability: {statuses}"
+    finally:
+        await reader.close()
+
+
+async def dead_letter_source_receives(kit: EventStoreKit) -> None:
+    """``native-dead-letter``: the dead-letter source takes a letter, its ``snodra-dlt-*`` headers included, and
+    delivers it as published."""
+    events = kit.instance()
+    dlt = dead_letter_source(kit.source)
+    key = fresh("key")
+    letter = event(kit, key)
+    letter = replace(
+        letter,
+        source=dlt,
+        headers={
+            **letter.headers,
+            "snodra-dlt-processor": "conformance",
+            "snodra-dlt-reason": "FAILED",
+            "snodra-dlt-error": "the handler failed",
+        },
+    )
+    await publish_all(events, [letter])
+    spec = SubscriptionSpec(name=kit.spec().name, source=dlt)
+    reader = await Reader.join(events, spec)
+    try:
+        await reader.until("the letter delivered from the dead-letter source", lambda r: r.has(letter.id))
+        got = reader.first_delivery(letter.id)
+        for name, value in letter.headers.items():
+            assert got.headers.get(name) == value, f"header {name}"
+        assert got.key == letter.key, "the key"
+        assert got.payload == letter.payload, "the payload"
+    finally:
+        await reader.close()
+
+
+async def no_browser_without_capability(kit: EventStoreKit) -> None:
+    """Without ``browse``: no browser. This library has no event browser at all, so a store that declares ``browse``
+    is told the four browse checks are a kit difference; one that does not proves the absence."""
+    events = kit.instance()
+    if events.supports(Capability.BROWSE):
+        print(
+            "event store conformance check `no_browser_without_capability`: the store declares browse; this library "
+            "has no event browser, so the four browse checks are a kit difference",
+            file=sys.stderr,
+        )
+        return
+    assert not events.supports(Capability.BROWSE), "a browser without the capability"
+
+
+EVENT_STORE_L3_CHECKS: tuple[Check, ...] = (
+    replay_from_earliest_redelivers_history,
+    admin_without_replay_is_unsupported,
+    lag_counts_unacked,
+    lag_unknown_without_capability,
+    dead_letter_source_receives,
+    no_browser_without_capability,
+)
+"""The level-3 capability checks, in the reference kit's order; a run uses the form matching each capability."""

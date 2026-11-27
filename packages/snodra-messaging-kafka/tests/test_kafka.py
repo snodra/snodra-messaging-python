@@ -30,7 +30,7 @@ from snodra import (
     Timestamp,
     dead_letter_source,
 )
-from snodra.testing import run_event_store_conformance
+from snodra.testing import run_event_store_conformance, run_event_store_l3_conformance
 from snodra_kafka import KafkaEventStore, KafkaSubscription, partition_for
 
 from .conftest import (
@@ -61,6 +61,14 @@ async def test_the_event_store_passes_the_nine_conformance_checks(
     source = await create_topic(4, prefix="snodra.conformance")
     await create_topic(1, name=dead_letter_source(source))
     await run_event_store_conformance(source, lambda: make_store(), MemoryStore())
+
+
+async def test_the_event_store_passes_the_level_three_capability_checks(
+    create_topic: CreateTopic, make_store: MakeStore
+) -> None:
+    source = await create_topic(4, prefix="snodra.conformance.l3")
+    await create_topic(1, name=dead_letter_source(source))
+    await run_event_store_l3_conformance(source, lambda: make_store(), MemoryStore())
 
 
 async def test_the_segment_head_and_lag_advance_while_paused(create_topic: CreateTopic, make_store: MakeStore) -> None:

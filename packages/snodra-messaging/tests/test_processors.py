@@ -287,7 +287,7 @@ async def test_a_lock_this_instance_holds_keeps_its_processor_out_of_the_subscri
     assert processors.consumer("default").running is False
 
     # The reset state machine (level 3) marks the operation held here: the document names it, so it stays stopped.
-    processors._held["default"] = "op-1"
+    processors.reset.hold("default", "op-1", 60_000)
     await processors._read_and_apply(initial=False)
     assert processors.consumer("default").running is False
     assert processors.statuses()[0].operation_id == "op-1"
@@ -297,4 +297,4 @@ async def test_a_lock_this_instance_holds_keeps_its_processor_out_of_the_subscri
     await processors._read_and_apply(initial=False)
     assert processors.consumer("default").running is True
     assert processors.statuses()[0].operation_id == ""
-    assert "default" not in processors._held
+    assert processors.reset.held("default") is None

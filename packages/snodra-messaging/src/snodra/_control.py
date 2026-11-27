@@ -18,7 +18,9 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from snodra._deadletters import MAX_LIST, RetryAllOutcome, RetryOutcome
+from snodra._eventstore import Earliest, Latest, Positions, ResetTarget, Timestamp
 from snodra._hubpb import hub_pb2
+from snodra._reset import MIN_LEASE_MS, ResetDone, ResetOk, ResetRefused
 from snodra._status import MAX_TEXT_BYTES, utf8_cut
 from snodra._store import DeadLetter
 
@@ -72,6 +74,7 @@ class ControlPlane:
         self._owner = owner
         self._queues: dict[str, asyncio.Queue[tuple[hub_pb2.ControlRequest, Put]]] = {}
         self._tasks: list[asyncio.Task[None]] = []
+        self._side_tasks: set[asyncio.Task[None]] = set()
 
     def attach(self, owner: Processors | None) -> None:
         """Takes the processors this instance runs and starts one worker per processor."""
@@ -82,12 +85,31 @@ class ControlPlane:
             self._tasks.append(asyncio.create_task(self._serve(name, queue), name=f"snodra:control:{name}"))
 
     def tasks(self) -> list[asyncio.Task[None]]:
-        """The workers, for the shutdown to cancel and await."""
-        return list(self._tasks)
+        """The workers and the requests answered beside them, for the shutdown to cancel and await."""
+        return [*self._tasks, *self._side_tasks]
 
     def handle(self, request: hub_pb2.ControlRequest, put: Put) -> None:
         """Hands a request to its processor's worker and returns at once (the work never runs on the read loop)."""
-        queue = self._queues.get(request.processor)
+        processor = request.processor
+        if request.WhichOneof("action") == "reset_prepare" and (
+            not request.reset_prepare.operation_id.strip() or request.reset_prepare.lease_ms < MIN_LEASE_MS
+        ):
+            # The lease is checked before the processor, as the base does: a malformed prepare is INVALID even for a
+            # processor that does not run here.
+            reply = _refused(
+                request.control_id,
+                hub_pb2.CONTROL_REFUSAL_INVALID,
+                f"a prepare needs an operation id and a lease of at least {MIN_LEASE_MS} ms",
+            )
+            log.info(
+                "Control %s %s on processor %s: refused INVALID (malformed prepare)",
+                request.control_id,
+                _action_of(request),
+                processor,
+            )
+            put(hub_pb2.ClientMessage(control_reply=reply))
+            return
+        queue = self._queues.get(processor)
         if queue is None:
             reply = _refused(
                 request.control_id,
@@ -102,31 +124,70 @@ class ControlPlane:
             )
             put(hub_pb2.ClientMessage(control_reply=reply))
             return
+        action = request.WhichOneof("action")
+        executing = self._owner.reset.executing(processor) if self._owner is not None else None
+        renewal = (
+            action == "reset_prepare"
+            and self._owner is not None
+            and bool(request.reset_prepare.operation_id)
+            and self._owner.reset.held(processor) == request.reset_prepare.operation_id
+        )
+        if renewal or (executing is not None and action == "dead_letter_list"):
+            # A renewal of the operation held here and a dead-letter list are answered beside an execute, never behind
+            # it: the execute may run for a minute (the hub renews every 10 s and waits at most 10 s for an answer).
+            task = asyncio.create_task(self._answer(processor, request, put), name=f"snodra:control:{processor}:beside")
+            self._side_tasks.add(task)
+            task.add_done_callback(self._side_tasks.discard)
+            return
+        if executing is not None and action in (
+            "dead_letter_retry",
+            "dead_letter_retry_all",
+            "dead_letter_discard",
+        ):
+            # A change beside the execute would race its reset handlers and marker deletion: refused at once.
+            reply = _refused(
+                request.control_id,
+                hub_pb2.CONTROL_REFUSAL_LOCKED,
+                f"processor {processor} is executing reset operation {executing}; try again when it finished",
+            )
+            log.info(
+                "Control %s %s on processor %s: refused LOCKED (executing %s)",
+                request.control_id,
+                _action_of(request),
+                processor,
+                executing,
+            )
+            put(hub_pb2.ClientMessage(control_reply=reply))
+            return
         queue.put_nowait((request, put))
 
     async def _serve(self, processor: str, queue: asyncio.Queue[tuple[hub_pb2.ControlRequest, Put]]) -> None:
         """Takes the processor's requests one at a time, in arrival order, and answers each exactly once."""
         while True:
             request, put = await queue.get()
-            try:
-                reply = await self._act(processor, request)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                log.warning("Control %s on processor %s failed: %s", request.control_id, processor, error)
-                reply = _refused(
-                    request.control_id,
-                    hub_pb2.CONTROL_REFUSAL_FAILED,
-                    f"{type(error).__name__}: {error}",
-                )
-            log.info(
-                "Control %s %s on processor %s: %s",
+            await self._answer(processor, request, put)
+
+    async def _answer(self, processor: str, request: hub_pb2.ControlRequest, put: Put) -> None:
+        """One action's answer, logged; a failure is a FAILED refusal, and exactly one reply goes out."""
+        try:
+            reply = await self._act(processor, request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.warning("Control %s on processor %s failed: %s", request.control_id, processor, error)
+            reply = _refused(
                 request.control_id,
-                _action_of(request),
-                processor,
-                _describe(reply),
+                hub_pb2.CONTROL_REFUSAL_FAILED,
+                f"{type(error).__name__}: {error}",
             )
-            put(hub_pb2.ClientMessage(control_reply=reply))
+        log.info(
+            "Control %s %s on processor %s: %s",
+            request.control_id,
+            _action_of(request),
+            processor,
+            _describe(reply),
+        )
+        put(hub_pb2.ClientMessage(control_reply=reply))
 
     async def _act(self, processor: str, request: hub_pb2.ControlRequest) -> hub_pb2.ControlReply:
         """One action; every failure becomes its refusal."""
@@ -148,14 +209,26 @@ class ControlPlane:
                 return await self._retry_all(processor, request)
             if action == "dead_letter_discard":
                 return await self._discard(processor, request)
-            if action in ("reset_prepare", "reset_execute", "reset_finish"):
-                # TODO(L3-5): the leased reset state machine (prepare/execute/finish, replay ranges). Every reset
-                # action must bump its processor's version in Processors, like pause and resume do, so a poll that
-                # read an older document cannot undo it.
-                return _refused(
+            if action == "reset_prepare":
+                prepare = request.reset_prepare
+                return _reset_reply(
                     request.control_id,
-                    hub_pb2.CONTROL_REFUSAL_UNSUPPORTED,
-                    "the reset control is not implemented in this library yet",
+                    await owner.reset.prepare(processor, prepare.operation_id, prepare.lease_ms),
+                )
+            if action == "reset_execute":
+                execute = request.reset_execute
+                target = _target_of(execute.target)
+                if target is None:
+                    return _refused(request.control_id, hub_pb2.CONTROL_REFUSAL_INVALID, "the reset has no target")
+                return _reset_reply(
+                    request.control_id,
+                    await owner.reset.execute(processor, execute.operation_id, target),
+                )
+            if action == "reset_finish":
+                finish = request.reset_finish
+                return _reset_reply(
+                    request.control_id,
+                    await owner.reset.finish(processor, finish.operation_id),
                 )
             return _refused(
                 request.control_id,
@@ -243,6 +316,53 @@ class ControlPlane:
                 f"no dead letter {letter_id} in processor {processor}",
             )
         return _ok(request.control_id, "discarded")
+
+
+_REFUSAL_CODES: dict[str, hub_pb2.ControlRefusal] = {
+    "UNKNOWN_PROCESSOR": hub_pb2.CONTROL_REFUSAL_UNKNOWN_PROCESSOR,
+    "LOCKED": hub_pb2.CONTROL_REFUSAL_LOCKED,
+    "NOT_PREPARED": hub_pb2.CONTROL_REFUSAL_NOT_PREPARED,
+    "SUBSCRIBERS_ACTIVE": hub_pb2.CONTROL_REFUSAL_SUBSCRIBERS_ACTIVE,
+    "RESET_HANDLER_FAILED": hub_pb2.CONTROL_REFUSAL_RESET_HANDLER_FAILED,
+    "INVALID": hub_pb2.CONTROL_REFUSAL_INVALID,
+    "FAILED": hub_pb2.CONTROL_REFUSAL_FAILED,
+    "NOT_FOUND": hub_pb2.CONTROL_REFUSAL_NOT_FOUND,
+    "UNSUPPORTED": hub_pb2.CONTROL_REFUSAL_UNSUPPORTED,
+}
+"""The reset machine's refusal suffixes, as ``hub.proto`` numbers them."""
+
+
+def _reset_reply(control_id: str, reply: ResetOk | ResetRefused | ResetDone) -> hub_pb2.ControlReply:
+    """One reset action's answer, as ``ControlReply`` carries it."""
+    if isinstance(reply, ResetOk):
+        return _ok(control_id, reply.detail)
+    if isinstance(reply, ResetRefused):
+        return _refused(control_id, _REFUSAL_CODES[reply.code], reply.message)
+    outcome = hub_pb2.ResetOutcome(
+        markers_deleted=reply.markers_deleted,
+        reset_handlers=reply.reset_handlers,
+    )
+    for replay_range in reply.ranges:
+        wire = hub_pb2.ReplayRange(segment=replay_range.segment, until=replay_range.until)
+        setattr(wire, "from", replay_range.start)
+        outcome.ranges.append(wire)
+    return hub_pb2.ControlReply(control_id=control_id, reset=outcome)
+
+
+def _target_of(target: hub_pb2.ResetTarget) -> ResetTarget | None:
+    """The reset target a ``ResetTarget`` names, or ``None`` when it names none."""
+    match target.WhichOneof("to"):
+        case "earliest":
+            return Earliest()
+        case "latest":
+            return Latest()
+        case "timestamp_ms":
+            return Timestamp(target.timestamp_ms)
+        case "positions":
+            positions = tuple((item.segment, item.position) for item in target.positions.positions)
+            return Positions(positions)
+        case _:
+            return None
 
 
 def _action_of(request: hub_pb2.ControlRequest) -> str:

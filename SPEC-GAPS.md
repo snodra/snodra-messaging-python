@@ -780,3 +780,20 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** is "acknowledge as lost" acceptable for a level-2 store used in mode `collection`, or should the
   library refuse the mode at startup when the port is unsupported (and how would it tell without a probe)?
 - **Wire change:** no.
+
+### SG-46: how long a reset prepare waits for the record in hand
+
+- **Specification:** [protocol.md, Processor control](https://snodra.damoreira.com/docs/library-authors/protocol/#processor-control)
+  says a `reset_prepare` leaves the subscription and that the hub gives up after 10 s; it does not say how long a record
+  already in hand may finish before the instance answers.
+- **Other Snodra libraries:** Kotlin's prepare calls `EventConsumer.stop`, which joins the reader thread for up to 30 s
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/EventConsumer.kt:107`,
+  joined at `.../EventConsumer.kt:250`): a handler still running after that is left behind and a second reader is not
+  started beside it.
+- **This library:** `Processors.set_running(..., run=False)` waits at most `Timings.handler_drain` (5 s shipped) for a
+  record in hand, acknowledges it and leaves the subscription; a handler that outlives that is cancelled, its
+  transaction rolled back and the record redelivered to the next subscription. The shorter bound keeps the prepare's
+  answer within the hub's 10 s control timeout.
+- **Question:** should prepare finish a record in hand within the hub's bound (and answer `ok` only then), as this
+  library does, or leave it to the next subscription at once (a shorter wait, fewer odds of a late answer)?
+- **Wire change:** no.
