@@ -1285,13 +1285,26 @@ class _MongoControl:
         try:
             result = await self._collection.update_one(free, taken, upsert=True)
         except DuplicateKeyError:
-            state = await self.get(processor)
-            return Locked(False, state.operation)
+            return await self._held_or_renewed(processor, operation, lease_until_ms, now_ms)
         except Exception as error:
             raise _failure(error) from error
         if int(result.matched_count) == 1 or result.upserted_id is not None:
             return Locked.was_taken()
+        return await self._held_or_renewed(processor, operation, lease_until_ms, now_ms)
+
+    async def _held_or_renewed(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> Locked:
+        """The lock when another instance prepared the same operation concurrently, else who holds it.
+
+        This call's renewal ran before that prepare committed; the fresh read sees it. A prepare for the operation
+        that holds the lock is a renewal, never a refusal.
+        """
         state = await self.get(processor)
+        if (
+            state.operation is not None
+            and state.operation.id == operation
+            and await self._renew(processor, operation, lease_until_ms, now_ms)
+        ):
+            return Locked.was_taken()
         return Locked(False, state.operation)
 
     async def _renew(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:

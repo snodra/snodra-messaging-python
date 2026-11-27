@@ -433,6 +433,20 @@ async def test_a_renewal_that_writes_the_same_values_is_still_taken(store: SqlSt
     assert await store.control.release(processor, "op-1", 1_800_000_000_000)
 
 
+async def test_two_instances_preparing_one_operation_both_hold_the_lock(store: SqlStore) -> None:
+    """The hub prepares every instance with the same operation; a prepare that loses the race to the other
+    instance's commit must be recognised as a renewal of the same operation, not as another holder."""
+    now = 1_800_000_000_000
+    for _ in range(30):
+        processor = f"conformance-{uuid.uuid4()}"
+        outcomes = await asyncio.gather(
+            store.control.lock(processor, "op-1", now + 30_000, now),
+            store.control.lock(processor, "op-1", now + 30_000, now),
+        )
+        assert all(outcome == Locked.was_taken() for outcome in outcomes), outcomes
+        assert await store.control.release(processor, "op-1", now)
+
+
 async def test_notify_false_on_postgres_registers_no_listener(store: SqlStore) -> None:
     if store.name != "postgres":
         pytest.skip("MySQL has no notification at all")

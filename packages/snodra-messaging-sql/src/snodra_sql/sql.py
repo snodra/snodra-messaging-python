@@ -1523,6 +1523,18 @@ class _SqlControl:
             if taken == 1:
                 return Locked.was_taken()
             state = await self._get_on(conn, processor)
+            if state.operation is not None and state.operation.id == operation:
+                # Another instance prepared the same operation concurrently: this transaction's
+                # renewal ran before that prepare committed. A fresh statement sees the commit,
+                # and a prepare for the operation that holds the lock is a renewal, not a refusal.
+                renewed = await store._exec(
+                    conn,
+                    "UPDATE snodra_processor_control SET op_lease_until = ?, updated_at = ? "
+                    "WHERE processor = ? AND op_id = ?",
+                    (store._time(lease_until_ms), store._time(now_ms), processor, operation),
+                )
+                if renewed == 1:
+                    return Locked.was_taken()
             return Locked(False, state.operation)
 
     async def extend(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:

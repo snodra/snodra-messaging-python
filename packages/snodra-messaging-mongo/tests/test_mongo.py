@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Awaitable
@@ -18,6 +19,7 @@ from snodra import (
     DeadLetterError,
     DeadLetterReason,
     InvalidMessage,
+    Locked,
     MessageStoreFailed,
     MessageStoreUnsupported,
     OutboxEntry,
@@ -438,6 +440,20 @@ async def test_dead_letter_and_control_documents_write_the_layouts_shape(store: 
     assert isinstance(stored_range["until"], Int64)
     assert (stored_range["from"], stored_range["until"]) == (10, 20)
     assert control["updatedAt"] == _at(t0 + 2_000)
+
+
+async def test_two_instances_preparing_one_operation_both_hold_the_lock(store: MongoStore) -> None:
+    """The hub prepares every instance with the same operation; a prepare that loses the race to the other
+    instance's commit must be recognised as a renewal of the same operation, not as another holder."""
+    t0 = 1_800_000_000_000
+    for _ in range(30):
+        processor = f"conformance-{uuid.uuid4()}"
+        outcomes = await asyncio.gather(
+            store.control.lock(processor, "op-1", t0 + 30_000, t0),
+            store.control.lock(processor, "op-1", t0 + 30_000, t0),
+        )
+        assert all(outcome == Locked.was_taken() for outcome in outcomes), outcomes
+        assert await store.control.release(processor, "op-1", t0)
 
 
 async def test_blank_optional_dead_letter_fields_stay_absent(store: MongoStore) -> None:
