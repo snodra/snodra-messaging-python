@@ -29,8 +29,21 @@ retries and timeouts.
   `Settings(always_route_through_hub=True)` sends it through the hub like any other request.
 - **Every query mode**: point, scatter-gather, streaming and subscription; streams and updates are async iterables (`async for`).
 - **Events through the outbox**: publish inside the same transaction as the service's own writes; a relay publishes what the
-  outbox holds, at least once, and event handlers commit their processed-event marker with their work. Handlers run in named
-  processors, one subscription per processor, with per-key ordering.
+  outbox holds, at least once, and event handlers commit their processed-event marker with their work.
+- **Event processors and their status**: handlers run in the `default` processor or in a named one
+  (`processor="orders"`), each with one subscription and `processor:<processor>:<eventId>` markers, so a redelivery is
+  skipped and one processor's failure does not hold another's. Every started processor reports its state, segments,
+  counters and dead-letter count to the hub.
+- **Processor control**: the dashboard pauses and resumes a processor persistently; a leased reset stops its
+  subscription, runs the `@app.reset_handler` handlers before anything is deleted or replayed, deletes the replayed
+  range's markers, and replays from earliest, latest, timestamp or explicit positions. A handler declared with
+  `replay=False` stays out of a replay, and control runs off the hub read loop.
+- **Dead letters**: `Settings.dead_letter_mode` (`SNODRA_EVENTS_DEAD_LETTER_MODE`) parks a record that exhausts its
+  attempts in `collection` (the message store's dead letters, with list, retry, retry-all and discard from the
+  dashboard), publishes it to the `<source>.dlt` source with the `snodra-dlt-*` headers in `event-store` (when the
+  store declares `native-dead-letter`), or logs it and moves on in `log`.
+  `Settings.dead_letter_retention` (`SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS`, 30 days by default) is how long a
+  collected letter is kept.
 - **Event and message stores**: Kafka or RabbitMQ Streams for events; MongoDB, PostgreSQL or MySQL for the outbox, the
   processed-event markers, the dead letters and the processor control state. Each store is a separate package, selected
   when the service is built.
@@ -39,10 +52,8 @@ retries and timeouts.
   certificate (rolled over to a renewed pair); the caller's token verified against the issuer's keys, and guards on
   handlers.
 - **Telemetry** behind an interface, with an OpenTelemetry implementation in the separate `snodra-messaging-observability` package.
-- **Feature level 2**, proved by the 33 level-1 checks of the conformance runner and by the level-2 event-store and
-  message-store kits. Processor control, the three dead-letter modes and the level-3 store checks are implemented on
-  `main`; level 3 is not claimed publicly until the release that publishes them for every library. Sagas (level 4)
-  are not in it yet.
+- **Feature level 3**, proved by the 33 level-1 checks of the conformance runner and by the level-2 and level-3
+  event-store and message-store kits. Sagas (level 4) are not in it yet.
 
 ## Install
 
