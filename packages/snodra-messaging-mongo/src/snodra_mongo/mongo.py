@@ -1151,7 +1151,13 @@ class _MongoDeadLetters:
 
 
 def _dead_letter_document(letter: DeadLetter) -> dict[str, Any]:
-    """The layout's dead-letter document for ``letter``: optional fields absent, never null."""
+    """The layout's dead-letter document for ``letter``: optional fields absent, never null.
+
+    A value that carries nothing is absent too: a blank ``eventId``, ``eventType`` or ``blockedBy`` is not written,
+    and an empty payload has neither ``payload`` nor ``payloadBinary``. The published layout says a blank id or type
+    is absent; Kotlin's writer stores a non-null empty string instead, so this store follows the layout and Go. A key
+    is written whenever it is not ``None`` (an empty key is still a key).
+    """
     payload = bytes(letter.payload)
     document: dict[str, Any] = {
         "_id": letter.id,

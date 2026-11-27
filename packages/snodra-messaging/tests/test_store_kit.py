@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from snodra._eventstore_memory import MemoryEventStore
-from snodra._store import InvalidMessage, OutboxEntry, Tx, Unsupported
+from snodra._store import InvalidMessage, Locked, OutboxEntry, Tx, Unsupported
 from snodra._store_memory import MemoryStore
 from snodra.testing import (
     MESSAGE_STORE_CHECKS,
@@ -140,6 +140,58 @@ class NoDeadLettersStore(MemoryStore):
 async def test_the_runner_names_a_failing_level_three_check() -> None:
     with pytest.raises(AssertionError, match=r"dead_letters_sequence_per_key.*memory"):
         await run_store_l3_conformance(NoDeadLettersStore)
+
+
+class _BrokenDeleteMarkers:
+    """A processed-events port whose marker deletion deletes nothing."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    async def delete_markers(self, processor: str, ranges: object) -> int:
+        return 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class BrokenDeleteMarkersStore(MemoryStore):
+    """A store whose reset deletes no markers, for the level-3 runner's failure naming."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.processed = _BrokenDeleteMarkers(self.processed)  # type: ignore[assignment]
+
+
+async def test_the_runner_names_a_failing_delete_markers_check() -> None:
+    with pytest.raises(AssertionError, match=r"delete_markers_removes_only_the_range.*memory"):
+        await run_store_l3_conformance(BrokenDeleteMarkersStore)
+
+
+class _BrokenControl:
+    """A control port whose lock reports every operation as taken."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    async def lock(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> Locked:
+        return Locked.was_taken()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class BrokenControlStore(MemoryStore):
+    """A store whose lock is not exclusive, for the level-3 runner's failure naming."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.control = _BrokenControl(self.control)  # type: ignore[assignment]
+
+
+async def test_the_runner_names_a_failing_control_check() -> None:
+    with pytest.raises(AssertionError, match=r"control_lock_is_exclusive_until_lease_expires.*memory"):
+        await run_store_l3_conformance(BrokenControlStore)
 
 
 @pytest.mark.repo

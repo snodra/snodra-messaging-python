@@ -1,19 +1,24 @@
-"""The message-store conformance kit: the nine level-2 store checks, each named as in the reference kit.
+"""The message-store conformance kit: the nine level-2 and eight level-3 store checks, each named as in the reference
+kit.
 
 An add-on's own test hands the kit a factory over a store whose schema is ready and which holds nothing::
 
     from snodra.testing import run_store_conformance
 
     async def test_my_store_passes_conformance() -> None:
-        await run_store_conformance(lambda: MyStore())
+        await run_store_conformance(lambda: MyStore(), level=3)
 
 - **One store** for the whole run: the checks run one after the other on the store the factory returns, each on ids,
   processors and keys of its own. The outbox checks claim the whole outbox, so each first relays whatever another check
   left pending and leaves nothing pending itself: the store must be the kit's alone while it runs.
 - **Every check is public**, so a failing one can be run by itself: it takes the :class:`~snodra._store.MessageStore`.
-- **The ids are the reference kit's**, one to one; ``store_checks.txt`` lists them. This module holds the checks, the
-  helpers they share and the runner. It uses only the standard library: ``snodra.testing`` imports no test framework and
-  no store client.
+  :data:`MESSAGE_STORE_CHECKS` holds the nine level-2 checks and :data:`MESSAGE_STORE_L3_CHECKS` the eight level-3 ones.
+- **The runner's level** is ``level=2`` by default, running only the level-2 checks, so a level-2 third-party add-on
+  keeps the published entry point. ``level=3`` runs both sets in the reference kit's order;
+  :func:`run_store_l3_conformance` is the named level-3 alias.
+- **The ids are the reference kit's**, one to one; ``store_checks.txt`` lists all 17 in its order. This module holds the
+  checks, the helpers they share and the runner. It uses only the standard library: ``snodra.testing`` imports no test
+  framework and no store client.
 - The kit waits at most a minute for a lease to pass (its expired-lease check sleeps :data:`LEASE` plus
   :data:`LEASE_MARGIN`); a store operation that never answers hangs the check, and the test harness's timeout fails it.
 

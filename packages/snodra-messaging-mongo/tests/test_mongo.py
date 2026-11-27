@@ -440,6 +440,42 @@ async def test_dead_letter_and_control_documents_write_the_layouts_shape(store: 
     assert control["updatedAt"] == _at(t0 + 2_000)
 
 
+async def test_blank_optional_dead_letter_fields_stay_absent(store: MongoStore) -> None:
+    """The writer follows the layout: a blank eventId/eventType/blockedBy and an empty payload are absent, never an
+    empty string or an empty binary; an empty key is still a key."""
+    t0 = 1_762_250_000_000
+    letter = DeadLetter(
+        id="orders:snodra.events:3:44",
+        processor="orders",
+        source="snodra.events",
+        segment="3",
+        position="44",
+        key="",
+        event_id="",
+        event_type="",
+        headers={},
+        payload=b"",
+        reason=DeadLetterReason.INVALID,
+        error=DeadLetterError.invalid("not a JSON object"),
+        blocked_by="",
+        attempts=0,
+        parked_at_ms=t0,
+        last_attempt_at_ms=t0,
+        expire_at_ms=t0 + 86_400_000,
+        replay=False,
+    )
+    assert await store.dead_letters.park(letter) is Parked.NEW
+    document = await store.database[DEAD_LETTERS].find_one({"_id": letter.id})
+    assert document is not None
+    assert document["key"] == "", "an empty key is still a key"
+    for absent in ("eventId", "eventType", "blockedBy", "payload", "payloadBinary", "replay"):
+        assert absent not in document, absent
+    found = await store.dead_letters.get(letter.id)
+    assert found is not None
+    assert (found.key, found.event_id, found.event_type, found.blocked_by) == ("", None, None, None)
+    assert found.payload == b""
+
+
 async def test_the_unsupported_ports_say_so(store: MongoStore) -> None:
     """The ports this level does not implement say so."""
     calls: list[Awaitable[object]] = [
