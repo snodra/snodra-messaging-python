@@ -5,7 +5,7 @@
 <h1 align="center">Snodra Messaging (Python)</h1>
 
 <p align="center">
-  Commands, queries, streams, scatter-gathers and subscriptions for asyncio services, routed by Snodra Server.
+  Commands, queries, events, streams, scatter-gathers and subscriptions for asyncio services, routed by Snodra Server.
 </p>
 
 <p align="center">
@@ -28,22 +28,30 @@ retries and timeouts.
   is not shared, of a type the service handles itself, is answered in-process by its own handler, without the hub;
   `Settings(always_route_through_hub=True)` sends it through the hub like any other request.
 - **Every query mode**: point, scatter-gather, streaming and subscription; streams and updates are async iterables (`async for`).
+- **Events through the outbox**: publish inside the same transaction as the service's own writes; a relay publishes what the
+  outbox holds, at least once, and event handlers commit their processed-event marker with their work. Handlers run in named
+  processors, one subscription per processor, with per-key ordering.
+- **Event and message stores**: Kafka or RabbitMQ Streams for events; MongoDB, PostgreSQL or MySQL for the outbox and the
+  processed-event markers. Each store is a separate package, selected when the service is built.
 - **The hub connection**: registration, heartbeats, reconnects, flow control, several hubs and an ordered shutdown.
 - **Credentials and identity**: a token (static, or a file read again), an OAuth2 JWT (renewed) or a client
   certificate (rolled over to a renewed pair); the caller's token verified against the issuer's keys, and guards on
   handlers.
 - **Telemetry** behind an interface, with an OpenTelemetry implementation in the separate `snodra-messaging-observability` package.
-- **Feature level 1**, proved by the 33 checks of the conformance runner. Events, stores, event processors and sagas
-  (levels 2 to 4) are not in it yet.
+- **Feature level 2**, proved by the 33 level-1 checks of the conformance runner and by the level-2 event-store and
+  message-store kits. Processor control, dead letters and sagas (levels 3 and 4) are not in it yet.
 
 ## Install
 
 ```sh
 pip install snodra-messaging
 pip install snodra-messaging-observability   # optional: OpenTelemetry
+pip install snodra-messaging-kafka           # or snodra-messaging-rabbitmq
+pip install snodra-messaging-mongo           # or snodra-messaging-sql
 ```
 
-Both packages are on PyPI and need Python 3.12 or later; the core depends only on `grpcio`, `protobuf` and `cryptography`.
+The packages are on PyPI and need Python 3.12 or later; the core depends only on `grpcio`, `protobuf` and `cryptography`.
+An add-on pins the core version it was released with.
 
 ## A handler
 
@@ -59,6 +67,31 @@ async def place_order(cmd: PlaceOrder) -> OrderReceipt:
 
 A message is a dataclass with `@snodra.message_type("...")`; its payload is JSON by default (see `snodra.Codec`).
 Settings are dataclass options, and `snodra.Settings.from_env()` reads the `SNODRA_*` variables.
+
+## An event
+
+An event is a message type too. Build the service with one event store and one message store, publish inside the
+transaction that holds the service's own writes, and handle it in the processor that owns the subscription:
+
+```python
+@snodra.message_type("orders.OrderPlaced")
+@dataclass
+class OrderPlaced:
+    order_id: str
+    total: int
+
+
+@app.event_handler(processor="orders")
+async def on_order_placed(event: OrderPlaced) -> None:
+    await project_order(event)
+
+
+async with store.transaction():
+    await app.publish(OrderPlaced(order_id=cmd.order_id, total=cmd.total), key=cmd.order_id)
+```
+
+The relay publishes what the outbox holds, at least once; a redelivered event finds its
+`processor:orders:<eventId>` marker and is skipped. A handler without `processor=` runs in `default`.
 
 ## Documentation
 
