@@ -31,6 +31,7 @@ def test_readme_follows_the_library_pattern() -> None:
         "What it is",
         "Install",
         "A handler",
+        "An event",
         "Documentation",
         "Contributing",
         "Releases",
@@ -55,6 +56,11 @@ def test_readme_links_are_public() -> None:
             )
 
 
+def _without_fmt(code: str) -> str:
+    """The code without the formatter directives that keep an example's blank lines."""
+    return "\n".join(line for line in code.splitlines() if line.strip() not in ("# fmt: off", "# fmt: on"))
+
+
 @pytest.mark.repo
 def test_every_python_block_of_the_readme_is_run() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -66,7 +72,7 @@ def test_every_python_block_of_the_readme_is_run() -> None:
     pattern = re.compile(r"^[ \t]*# snippet:(\w+) begin\n(.*?)\n[ \t]*# snippet:\1 end", re.MULTILINE | re.DOTALL)
     for match in pattern.finditer(service_py):
         name = match.group(1)
-        snippets[name] = textwrap.dedent(match.group(2)).strip()
+        snippets[name] = _without_fmt(textwrap.dedent(match.group(2)).strip())
 
     assert snippets, "no snippet regions found in service.py"
 

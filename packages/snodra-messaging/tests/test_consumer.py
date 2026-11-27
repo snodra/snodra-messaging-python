@@ -19,7 +19,9 @@ from eventhelpers import (
 )
 from fakehub import FakeHub, ack
 from helpers import SCALED, eventually, library_tasks, new_app
-from snodra import App, Caller, DecodeError, MemoryStore, MessageInfo, current_caller, current_message
+from snodra import App, Caller, DecodeError, JsonCodec, MemoryStore, MessageInfo, current_caller, current_message
+from snodra._consumer import EventConsumer
+from snodra._events import EventRegistry
 from snodra._eventstore import ReplayRange, SubscriptionSpec
 from snodra._store import ProcessedMarker, ProcessedStore, Tx
 from snodra._timings import Timings
@@ -568,3 +570,29 @@ async def test_a_handler_registered_in_a_named_processor_gets_its_own_subscripti
     await asyncio.wait_for(events.subscribed.wait(), 1.0)
     assert events.specs == [SubscriptionSpec("orders-service.mail", "snodra.events")]
     assert "snodra:consumer:mail" in library_tasks()
+
+
+async def test_an_old_consumer_task_does_not_report_a_new_one_stopped() -> None:
+    consumer = EventConsumer(
+        service="orders-service",
+        processor="default",
+        store=MemoryStore(),
+        events=ScriptedEventStore(),
+        registry=EventRegistry(),
+        source="snodra.events",
+        codec=JsonCodec(),
+        max_attempts=1,
+        backoff=0.01,
+        resubscribe_min=0.01,
+        resubscribe_max=0.02,
+        resubscribe_stable=0.05,
+    )
+    first = consumer.start()
+    second = consumer.start()
+    assert consumer.running is True
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    assert consumer.running is True, "the older task's end reported the newer one stopped"
+    second.cancel()
+    await asyncio.gather(second, return_exceptions=True)
+    assert consumer.running is False

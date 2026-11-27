@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import snodra
@@ -69,6 +70,42 @@ def build(settings: snodra.Settings | None = None) -> snodra.App:
         return Order(order_id=q.order_id, status="placed")
 
     return app
+
+
+@dataclass
+class _ReadmeCommand:
+    """The command shape the README's event block uses (the quickstart's own command carries items)."""
+
+    order_id: str
+    total: int
+
+
+async def _readme_event(
+    app: snodra.App,
+    store: snodra.MessageStore,
+    cmd: _ReadmeCommand,
+    project_order: Callable[[object], Awaitable[None]],
+) -> None:
+    """The README's event block, kept where the README test can find it (not run by the example)."""
+
+    # snippet:event begin
+    # fmt: off
+    @snodra.message_type("orders.OrderPlaced")
+    @dataclass
+    class OrderPlaced:
+        order_id: str
+        total: int
+
+
+    @app.event_handler(processor="orders")
+    async def on_order_placed(event: OrderPlaced) -> None:
+        await project_order(event)
+
+
+    async with store.transaction():
+        await app.publish(OrderPlaced(order_id=cmd.order_id, total=cmd.total), key=cmd.order_id)
+    # fmt: on
+    # snippet:event end
 
 
 async def run(settings: snodra.Settings | None = None) -> None:

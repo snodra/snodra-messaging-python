@@ -793,7 +793,9 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **This library:** `Processors.set_running(..., run=False)` waits at most `Timings.handler_drain` (5 s shipped) for a
   record in hand, acknowledges it and leaves the subscription; a handler that outlives that is cancelled, its
   transaction rolled back and the record redelivered to the next subscription. The shorter bound keeps the prepare's
-  answer within the hub's 10 s control timeout.
+  answer within the hub's 10 s control timeout. Pinned by
+  `tests/test_reset.py::test_a_prepare_that_cannot_finish_the_record_cancels_it_and_the_record_comes_again`.
 - **Question:** should prepare finish a record in hand within the hub's bound (and answer `ok` only then), as this
   library does, or leave it to the next subscription at once (a shorter wait, fewer odds of a late answer)?
+- **Wire change:** no.
 - **Wire change:** no.

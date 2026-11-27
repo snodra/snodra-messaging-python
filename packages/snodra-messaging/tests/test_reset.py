@@ -39,6 +39,7 @@ from snodra._eventstore import (
     SubscriptionSpec,
 )
 from snodra._hubpb import hub_pb2
+from snodra._processors import Processors
 from snodra._reset import ResetDone, ResetOk, ResetRefused, merged, replaying
 from snodra._timings import Timings
 
@@ -801,7 +802,7 @@ async def test_an_execute_that_outlives_its_limit_loses_the_lease_before_the_mar
     assert isinstance(await processors.reset.prepare("default", "op-1", 1_000), ResetOk)
     execute = asyncio.create_task(processors.reset.execute("default", "op-1", Earliest()))
     await asyncio.wait_for(entered.wait(), 3.0)
-    await asyncio.sleep(0.1)  # past the 50 ms execute limit, and several polls
+    await _await_polls(processors, 3)  # past the 50 ms execute limit
     assert processors.consumer("default").running is False, "a poll restarted the consumer while the execute ran"
     gate.set()
     refused = await asyncio.wait_for(execute, 3.0)
@@ -1183,3 +1184,154 @@ async def test_a_reader_that_rejoins_between_the_plan_and_the_move_stops_the_res
     assert events.admin_instance is not None
     assert events.admin_instance.applied == 0, "the positions moved while a reader was back"
     assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+
+
+async def _await_polls(processors: Processors, count: int, within: float = 3.0) -> None:
+    """Waits for ``count`` more control polls, never for a fixed time."""
+    target = processors._polls + count
+    await eventually(lambda: processors._polls >= target, within=within)
+
+
+class _TakeoverOnRelease:
+    """A control store where a new operation takes the lock between a finish's read and its release."""
+
+    def __init__(self, inner: ProcessorControlStore) -> None:
+        self._inner = inner
+
+    async def release(self, processor: str, operation: str, now_ms: int) -> bool:
+        await self._inner.lock(processor, "op-2", now_ms + 30_000, now_ms)
+        return await self._inner.release(processor, operation, now_ms)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+async def test_a_finish_without_the_lock_sees_a_takeover_before_saying_nothing_holds_it(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    app, store, _ = await _app(hub, clock=clock, timings=_timings(processor_control_poll=5.0))
+    await store.control.lock("default", "op-1", NOW + 1_000, NOW)
+    control = _TakeoverOnRelease(store.control)
+    store.control = control  # type: ignore[assignment]
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await eventually(lambda: processors_of(app).statuses()[0].operation_id == "op-1")
+    assert processors_of(app).consumer("default").running is False
+    clock.advance(2.0)
+    refused = await processors_of(app).reset.finish("default", "op-1")
+    assert isinstance(refused, ResetRefused), refused
+    assert refused.code == "NOT_PREPARED"
+    assert "op-2" in refused.message
+    await eventually(lambda: processors_of(app).statuses()[0].operation_id == "op-2")
+    assert processors_of(app).consumer("default").running is False
+    assert isinstance(await processors_of(app).reset.finish("default", "op-2"), ResetOk)
+
+
+class _TakeoverAfterRelease:
+    """A control store where a new operation takes the lock right after a successful release."""
+
+    def __init__(self, inner: ProcessorControlStore) -> None:
+        self._inner = inner
+        self.enabled = False
+
+    async def release(self, processor: str, operation: str, now_ms: int) -> bool:
+        released = await self._inner.release(processor, operation, now_ms)
+        if released and self.enabled:
+            self.enabled = False
+            await self._inner.lock(processor, "op-2", now_ms + 30_000, now_ms)
+        return released
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+async def test_a_release_followed_by_a_remote_takeover_does_not_claim_consuming(hub: FakeHub) -> None:
+    app, store, _ = await _app(hub, timings=_timings(processor_control_poll=5.0))
+    control = _TakeoverAfterRelease(store.control)
+    store.control = control  # type: ignore[assignment]
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        pass
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 30_000), ResetOk)
+    control.enabled = True
+    released = await processors.reset.finish("default", "op-1")
+    assert isinstance(released, ResetOk), released
+    assert released.detail == "released; consuming once the lock is read back"
+    assert processors.consumer("default").running is False
+    await eventually(lambda: processors.statuses()[0].operation_id == "op-2")
+    assert processors.statuses()[0].state == hub_pb2.PROCESSOR_STOPPED
+    assert isinstance(await processors.reset.finish("default", "op-2"), ResetOk)
+
+
+class _ExtendFailing:
+    """A control store whose lease extensions fail while ``fail`` is set."""
+
+    def __init__(self, inner: ProcessorControlStore) -> None:
+        self._inner = inner
+        self.fail = False
+
+    async def extend(self, processor: str, operation: str, lease_until_ms: int, now_ms: int) -> bool:
+        if self.fail:
+            return False
+        return await self._inner.extend(processor, operation, lease_until_ms, now_ms)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+async def test_a_lease_that_passes_during_an_execute_keeps_the_consumer_out(hub: FakeHub) -> None:
+    clock = Clock(NOW)
+    app, store, _ = await _app(
+        hub, clock=clock, timings=_timings(reset_lease_extension=5.0, processor_control_poll=0.05)
+    )
+    control = _ExtendFailing(store.control)
+    store.control = control  # type: ignore[assignment]
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    handled: list[str] = []
+
+    @app.event_handler
+    async def on_placed(event: OrderPlaced) -> None:
+        handled.append(event.order_id)
+
+    @app.reset_handler
+    async def slow(context: ResetContext) -> None:
+        entered.set()
+        await gate.wait()
+
+    await app.start()
+    await _running(app)
+    processors = processors_of(app)
+    await _publish(app, "o-1")
+    await _handle_until(handled, 1)
+    event_id = next(iter(store._data.outbox.rows.values())).entry.id
+    await _await_marker(store, event_id)
+    assert isinstance(await processors.reset.prepare("default", "op-1", 1_000), ResetOk)
+    control.fail = True
+    execute = asyncio.create_task(processors.reset.execute("default", "op-1", Earliest()))
+    await asyncio.wait_for(entered.wait(), 3.0)
+    clock.advance(2.0)  # the persisted lease passes while the reset handler still runs
+    await _await_polls(processors, 3)
+    status = processors.statuses()[0]
+    assert (status.state, status.operation_id) == (hub_pb2.PROCESSOR_STOPPED, "op-1")
+    assert processors.consumer("default").running is False
+    await _publish(app, "o-2")
+    await _await_polls(processors, 2)
+    assert handled == ["o-1"], "a record was read under a lost reset lock"
+    gate.set()
+    refused = await asyncio.wait_for(execute, 3.0)
+    assert isinstance(refused, ResetRefused), refused
+    assert refused.code == "FAILED"
+    assert "lease lost" in refused.message
+    assert await store.processed.exists(f"processor:default:{event_id}"), "a lost lease deleted the marker"
+    assert isinstance(await processors.reset.finish("default", "op-1"), ResetOk)
+    await _handle_until(handled, 2)
+    assert handled == ["o-1", "o-2"]

@@ -184,6 +184,7 @@ class EventConsumer:
         self._operation_id = ""
         self._replay: tuple[ReplayRange, ...] = ()
         self._subscription: EventStoreSubscription | None = None
+        self._task: asyncio.Task[None] | None = None
         self._stop_requested = False
         self._handling = False
         # The parking state of mode collection: the keys with a letter, the segments whose keys are unknown, and what a
@@ -237,12 +238,16 @@ class EventConsumer:
         self._running = True
         self._stop_requested = False
         task = asyncio.create_task(self.run(), name=f"snodra:consumer:{self._processor}")
+        self._task = task
         task.add_done_callback(self._ended)
         return task
 
     def _ended(self, task: asyncio.Task[None]) -> None:
-        """A task cancelled before its first step never runs its ``finally``: the status must still say stopped."""
-        self._running = False
+        """A task cancelled before its first step never runs its ``finally``: the status must still say stopped. A
+        newer task (a start before this callback ran) is the current one and is never reported stopped by it."""
+        if self._task is task:
+            self._task = None
+            self._running = False
 
     @property
     def handling(self) -> bool:
@@ -353,7 +358,8 @@ class EventConsumer:
                 await asyncio.sleep(wait)
                 wait = next_wait(wait, self._resubscribe_min, self._resubscribe_max)
         finally:
-            self._running = False
+            if self._task is asyncio.current_task():
+                self._running = False
 
     async def _read(self, subscription: EventStoreSubscription) -> bool:
         """Reads until cancelled, the subscription fails, or a stop was asked for; whether it was a stop."""

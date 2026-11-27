@@ -355,8 +355,8 @@ class Processors:
             )
 
     async def converge(self, processor: str, *, initial: bool = False) -> bool:
-        """Reads one processor's control document again and applies it; whether it could (a failed read or a change
-        here that overtook it answers false)."""
+        """Reads one processor's control document again and applies it; whether its consumer is running afterwards (a
+        failed read, a change here that overtook it, or a foreign lock that keeps it out answers false)."""
         before = self._versions[processor]
         try:
             document = await self._store.control.get(processor)
@@ -368,7 +368,7 @@ class Processors:
         if self._versions[processor] != before:
             return False
         await self._apply(processor, document, initial=initial)
-        return True
+        return self._consumers[processor].running
 
     async def _remove_passed(self, processor: str, now: int) -> None:
         """Removes the replay ranges this instance's subscription consumed past from its control document."""

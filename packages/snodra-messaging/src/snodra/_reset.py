@@ -556,7 +556,16 @@ class ResetMachine:
         if current is None or not current.holds_at(now):
             if current is not None and current.id == operation:
                 # The document kept an expired entry of this operation: release it, as the base does.
-                await self._store.control.release(processor, operation, now)
+                released = await self._store.control.release(processor, operation, now)
+                if not released:
+                    takeover = await self._takeover(processor, operation)
+                    if takeover is not None:
+                        return takeover
+            # A new operation may have taken the lock between the read and the release: check again before saying
+            # that nothing holds it.
+            takeover = await self._takeover(processor, operation)
+            if takeover is not None:
+                return takeover
             await self._processors.converge(processor, initial=False)
             return ResetOk("no operation holds the lock")
         if current.id == operation:

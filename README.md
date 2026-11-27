@@ -39,7 +39,7 @@ retries and timeouts.
   handlers.
 - **Telemetry** behind an interface, with an OpenTelemetry implementation in the separate `snodra-messaging-observability` package.
 - **Feature level 2**, proved by the 33 level-1 checks of the conformance runner and by the level-2 event-store and
-  message-store kits. Processor control, dead letters and sagas (levels 3 and 4) are not in it yet.
+  message-store kits. Processor control and dead letters land with feature level 3; sagas (level 4) are not in it yet.
 
 ## Install
 
