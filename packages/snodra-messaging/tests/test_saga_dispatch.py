@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from typing import Any
 
+import pytest
 from snodra import (
     ErrorCode,
     HubError,
@@ -18,7 +19,7 @@ from snodra import (
 from snodra._saga import SagaModel
 from snodra._saga_dispatch import SagaDispatchRelay
 from snodra._saga_runtime import SagaRuntime
-from snodra._store import DispatchKind, SagaDispatchDocument
+from snodra._store import DispatchKind, FailureReason, SagaDispatchDocument
 from snodra._store_memory import MemoryStore
 from snodra._timings import DEFAULT_TIMINGS
 
@@ -264,6 +265,7 @@ class StubbornSender(Sender):
     def __init__(self) -> None:
         super().__init__()
         self.release = asyncio.Event()
+        self.started = asyncio.Event()
 
     async def call_payload(
         self,
@@ -275,6 +277,7 @@ class StubbornSender(Sender):
         headers: dict[str, str] | None = None,
         retry: object = None,
     ) -> None:
+        self.started.set()
         try:
             await self.release.wait()
         except asyncio.CancelledError:
@@ -319,7 +322,11 @@ async def test_a_hubless_command_with_no_local_handler_is_no_handler_at_once() -
 async def test_transient_failures_end_as_exhausted_with_a_notice() -> None:
     clock = [1_000]
     sender = Sender([NeverSent("down"), NeverSent("down"), NeverSent("down")])
-    relay, store = await _relay(sender, clock=lambda: clock[0])
+
+    async def notice(failure: SagaCommandFailed, headers: dict[str, str]) -> bool:
+        return False
+
+    relay, store = await _relay(sender, clock=lambda: clock[0], notice=notice)
     entry = _entry("saga-exhausted", 0, DispatchKind.COMMAND)
     async with store.transaction():
         await store.sagas.dispatch.record([entry])
@@ -332,6 +339,9 @@ async def test_transient_failures_end_as_exhausted_with_a_notice() -> None:
         clock[0] = pending.next_attempt_at_ms
     assert await store.sagas.dispatch.next_pending("saga-exhausted") is None
     assert await store.sagas.dispatch.pending() == 0
+    row = store._data.dispatch.rows[entry.id]
+    assert row.failure_reason is FailureReason.EXHAUSTED
+    assert row.notice_pending is True
 
 
 async def test_a_notice_that_cannot_be_delivered_is_retried_then_cleared() -> None:
@@ -357,3 +367,28 @@ async def test_a_notice_that_cannot_be_delivered_is_retried_then_cleared() -> No
     assert len(attempts) == 2
     cleared = next(iter(store._data.dispatch.rows.values()))
     assert not cleared.notice_pending
+
+
+async def test_cancelling_the_relay_abandons_a_blocked_send_without_a_task_leak() -> None:
+    sender = StubbornSender()
+    relay, store = await _relay(sender)
+    saga_id = "saga-cancel"
+    entry = _entry(saga_id, 0, DispatchKind.COMMAND)
+    async with store.transaction():
+        await store.sagas.dispatch.record([entry])
+    running = asyncio.create_task(relay.run_once())
+    await asyncio.wait_for(sender.started.wait(), 2.0)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    relay.stop()
+    sender.release.set()
+    for _ in range(100):
+        if not relay._tasks and not relay._abandoned:
+            break
+        await asyncio.sleep(0.01)
+    assert not relay._tasks
+    assert not relay._abandoned
+    assert not [
+        task for task in asyncio.all_tasks() if task.get_name() == "snodra:saga-dispatch:send" and not task.done()
+    ]

@@ -88,6 +88,8 @@ class SagaDispatchRelay:
         self._running = False
         for task in list(self._tasks):
             task.cancel()
+        for task in list(self._abandoned):
+            task.cancel()
 
     async def run_once(self, *, wait: bool = True) -> None:
         """One polling pass: starts a worker for each due saga, then delivers due notices.
@@ -259,15 +261,31 @@ class SagaDispatchRelay:
                 routing_key=routing_key,
                 headers=headers,
                 retry=False,
-            )
+            ),
+            name="snodra:saga-dispatch:send",
         )
-        done, _ = await asyncio.wait({task}, timeout=self._timings.saga_dispatch_send_timeout)
-        if task not in done:
-            task.cancel()
-            self._abandoned.add(task)
-            task.add_done_callback(self._abandoned.discard)
-            raise TimeoutError
-        await task
+        completed = False
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self._timings.saga_dispatch_send_timeout)
+            if task not in done:
+                raise TimeoutError
+            await task
+            completed = True
+        finally:
+            if not completed and not task.done():
+                task.cancel()
+                self._abandoned.add(task)
+                task.add_done_callback(self._abandoned_done)
+            elif not completed and task.done():
+                self._abandoned_done(task)
+
+    def _abandoned_done(self, task: asyncio.Task[None]) -> None:
+        """Retrieves an abandoned send's outcome so it never surfaces as an un-retrieved exception."""
+        self._abandoned.discard(task)
+        with contextlib.suppress(asyncio.CancelledError):
+            error = task.exception()
+            if error is not None:
+                log.warning("an abandoned saga dispatch send ended with an error: %s", error)
 
     async def _transient(self, entry: SagaDispatchDocument, now: int, message: str) -> Outcome:
         attempts = entry.attempts + 1

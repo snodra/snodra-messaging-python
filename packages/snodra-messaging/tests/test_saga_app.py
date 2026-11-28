@@ -178,6 +178,7 @@ async def test_a_permanent_command_failure_sends_a_local_notice(hub: Any) -> Non
     from snodra import PermissionDenied
 
     ordinary: list[str] = []
+    named: list[str] = []
     store = MemoryStore()
     events = MemoryEventStore()
     app = new_app(hub, store=store, event_store=events, outbox_enabled=False)
@@ -191,6 +192,10 @@ async def test_a_permanent_command_failure_sends_a_local_notice(hub: Any) -> Non
     async def notice(event: SagaCommandFailed) -> None:
         ordinary.append(type(event).__name__)
 
+    @app.event_handler(processor="mail")
+    async def mail_notice(event: SagaCommandFailed) -> None:
+        named.append(type(event).__name__)
+
     await app.start()
     try:
         await events.publish(await _event("snodra.events", "evt-1", "o-1"))
@@ -199,6 +204,7 @@ async def test_a_permanent_command_failure_sends_a_local_notice(hub: Any) -> Non
                 break
             await asyncio.sleep(0.01)
         assert ordinary == ["SagaCommandFailed"]
+        assert named == ["SagaCommandFailed"], "the notice reaches a named processor too"
         live = await store.sagas.sagas.find_live("test.FailingSaga", "order_id", "o-1")
         assert len(live) == 1
         assert '"notices":1' in live[0].state, "the saga itself took the notice"
@@ -340,7 +346,8 @@ async def test_a_saga_only_processor_lists_the_saga_event_types_in_its_status(hu
 
 
 async def test_a_replay_does_not_run_the_saga_stage(hub: Any) -> None:
-    from snodra import Delivery
+    from snodra import Delivery, ReplayRange
+    from snodra._replay import in_replay
 
     store = MemoryStore()
     events = MemoryEventStore()
@@ -359,7 +366,10 @@ async def test_a_replay_does_not_run_the_saga_stage(hub: Any) -> None:
             payload=b'{"orderId":"o-1"}',
             timestamp_ms=0,
         )
-        await consumer._saga_stage(delivery, "test.AppStarted", "evt-1", True)
+        consumer._replay = (ReplayRange(source="snodra.events", segment="0", start="0", until="1"),)
+        replay = in_replay(delivery, consumer._replay, events.compare)
+        assert replay, "the delivery is inside the open replay range"
+        await consumer._saga_stage(delivery, "test.AppStarted", "evt-1", replay)
         assert await store.sagas.sagas.count_live_by_type() == {}
     finally:
         await app.shutdown()
@@ -458,4 +468,37 @@ async def test_a_hub_command_carries_the_saga_headers_and_no_authorization(hub: 
                 break
             await asyncio.sleep(0.01)
     finally:
+        await app.shutdown()
+
+
+_saga_app: Any = None
+
+
+class AppUsingSaga:
+    @saga_start("order_id")
+    async def started(self, event: AppStarted, ctx: SagaContext) -> None:
+        assert _saga_app is not None
+        await _saga_app.send(Ask("x"))
+
+
+async def test_a_real_saga_handler_cannot_call_app_send(hub: Any) -> None:
+    global _saga_app
+    store = MemoryStore()
+    events = MemoryEventStore()
+    app = new_app(hub, store=store, event_store=events, outbox_enabled=False)
+    _saga_app = app
+    app.saga("test.AppUsingSaga")(AppUsingSaga)
+    await app.start()
+    try:
+        await events.publish(await _event("snodra.events", "send-in-saga", "o-1"))
+        for _ in range(200):
+            failures = await store.sagas.failures.list(tx=store.plain())
+            if failures:
+                break
+            await asyncio.sleep(0.01)
+        assert len(failures) == 1
+        assert "App.send cannot be used inside a saga handler" in failures[0].error
+        assert "SagaContext" in failures[0].error
+    finally:
+        _saga_app = None
         await app.shutdown()
