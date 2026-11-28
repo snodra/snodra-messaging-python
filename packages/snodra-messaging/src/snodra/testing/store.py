@@ -29,6 +29,7 @@ See https://snodra.damoreira.com/docs/library-authors/message-store-add-ons/#the
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -1174,13 +1175,15 @@ async def two_transactions_starting_one_saga_key_leave_one_live_saga(store: Mess
         try:
             await asyncio.wait_for(store.commit(tx), START_WAIT)
         except TimeoutError:
+            with contextlib.suppress(Exception):
+                await store.rollback(tx)
             raise AssertionError(f"the commit blocked for more than {START_WAIT:g} s") from None
         except Exception as error:
             outcomes[index] = error
     wins = [index for index, outcome in enumerate(outcomes) if outcome is None]
     assert len(wins) == 1, f"exactly one commits: {outcomes}"
     lost = outcomes[1 - wins[0]]
-    assert lost is not None, "the other conflicts"
+    assert isinstance(lost, Conflict), f"the other must be a Conflict: {lost}"
     live = await sagas.find_live(type_name, "orderId", "o-1", tx=store.plain())
     assert [document.id for document in live] == [ids[wins[0]]], "one live saga holds the key, the winner's"
 

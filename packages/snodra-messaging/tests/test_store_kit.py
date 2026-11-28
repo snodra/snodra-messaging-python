@@ -6,8 +6,19 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from snodra import MessageStoreFailed
 from snodra._eventstore_memory import MemoryEventStore
-from snodra._store import Conflict, InvalidMessage, Locked, OutboxEntry, SagaDocument, SagaStores, Tx, Unsupported
+from snodra._store import (
+    Conflict,
+    InvalidMessage,
+    Locked,
+    OutboxEntry,
+    SagaDocument,
+    SagaRepository,
+    SagaStores,
+    Tx,
+    Unsupported,
+)
 from snodra._store_memory import MemoryStore
 from snodra.testing import (
     MESSAGE_STORE_CHECKS,
@@ -210,6 +221,42 @@ class UnreservedStartKeyStore(MemoryStore):
 async def test_the_start_key_check_bites_on_a_store_that_does_not_reserve() -> None:
     with pytest.raises(AssertionError, match="exactly one commits"):
         await two_transactions_starting_one_saga_key_leave_one_live_saga(UnreservedStartKeyStore())
+
+
+class _NonConflictSagas:
+    """A saga repository whose second insert fails with a non-conflict error: the check must reject it."""
+
+    def __init__(self, inner: SagaRepository) -> None:
+        self._inner = inner
+        self.inserts = 0
+
+    async def insert(self, saga: SagaDocument, *, tx: Tx | None = None) -> None:
+        self.inserts += 1
+        if self.inserts > 1:
+            raise MessageStoreFailed("the store failed, not a conflict")
+        await self._inner.insert(saga, tx=tx)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class NonConflictStartKeyStore(MemoryStore):
+    """A store whose start-key loser raises a failure instead of a conflict."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sagas = SagaStores(
+            sagas=_NonConflictSagas(self.sagas.sagas),  # type: ignore[arg-type]
+            dispatch=self.sagas.dispatch,
+            deadlines=self.sagas.deadlines,
+            failures=self.sagas.failures,
+            markers=self.sagas.markers,
+        )
+
+
+async def test_the_start_key_check_requires_a_conflict() -> None:
+    with pytest.raises(AssertionError, match="must be a Conflict"):
+        await two_transactions_starting_one_saga_key_leave_one_live_saga(NonConflictStartKeyStore())
 
 
 async def test_the_runner_names_a_failing_level_three_check() -> None:

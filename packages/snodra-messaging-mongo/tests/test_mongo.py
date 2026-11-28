@@ -32,6 +32,7 @@ from snodra import (
     ReplayRange,
     SagaDispatchDocument,
     SagaDocument,
+    SagaFailureDocument,
     Tx,
     bind_transaction,
     unbind_transaction,
@@ -605,6 +606,28 @@ async def test_saga_dispatch_deadline_and_external_documents_write_the_layouts_s
     assert "leaseUntil" not in settled
     assert "owner" not in settled
     assert "error" not in settled
+
+    failure = SagaFailureDocument(
+        id=f"{saga.type_name}:evt-9",
+        saga_type=saga.type_name,
+        event_id="evt-9",
+        event_type="orders.OrderPlaced",
+        payload='{"x":1}',
+        headers={"correlationId": "c-9"},
+        error="boom",
+        attempts=2,
+        first_failed_at_ms=now,
+        last_failed_at_ms=now + 1,
+    )
+    async with store.transaction():
+        await store.sagas.failures.save(failure)
+    stored_failure = await store.database["saga_failures"].find_one({"_id": failure.id})
+    assert stored_failure is not None
+    assert stored_failure["sagaType"] == failure.saga_type
+    assert stored_failure["attempts"] == 2
+    assert stored_failure["headers"] == {"correlationId": "c-9"}
+    assert stored_failure["firstFailedAt"] == _at(now)
+    assert stored_failure["lastFailedAt"] == _at(now + 1)
 
 
 async def test_another_stores_transaction_is_refused(store: MongoStore, make_config: Any) -> None:
