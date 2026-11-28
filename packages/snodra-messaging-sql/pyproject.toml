@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "snodra-messaging-sql"
-version = "0.7.0"
+version = "0.8.0"
 description = "The PostgreSQL and MySQL message store for the Snodra messaging suite."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-    "snodra-messaging==0.7.0",
+    "snodra-messaging==0.8.0",
     "asyncpg==0.32.0",
     "asyncmy==0.2.18",
 ]
