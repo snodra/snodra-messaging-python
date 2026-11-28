@@ -375,8 +375,9 @@ class Probe:
                 self.deadline_scheduled_by = probe.settings.language
                 ctx.associate_with(SAGA_ASSOCIATION_KEY, event.order_id)
                 if event.mode == "deadline":
+                    delay = event.deadline_delay_ms / 1000 if event.deadline_delay_ms > 0 else 2.0
                     ctx.schedule(
-                        2.0,
+                        delay,
                         SAGA_DEADLINE_NAME,
                         SagaDeadlinePayload(order_id=event.order_id, run=event.run, family=event.family),
                     )
@@ -467,6 +468,7 @@ class Probe:
                     "run": self.settings.run,
                     "family": self.family.name,
                     "mode": command.mode,
+                    "deadlineDelayMs": command.deadline_delay_ms,
                 }
             elif command.kind == "advanced":
                 type_name = SAGA_ADVANCED_TYPE
@@ -475,6 +477,7 @@ class Probe:
                     "run": self.settings.run,
                     "family": self.family.name,
                     "mode": command.mode,
+                    "deadlineDelayMs": command.deadline_delay_ms,
                 }
             else:
                 raise snodra.InvalidRequest("kind is started or advanced")
@@ -506,7 +509,14 @@ class Probe:
             live = 0
             if request.saga_id:
                 saga = await self.store.sagas.sagas.find_by_id(request.saga_id)
-                live = 1 if saga is not None and not saga.ended else 0
+                if saga is not None:
+                    if saga.associations:
+                        association = saga.associations[0]
+                        live = len(
+                            await self.store.sagas.sagas.find_live(saga.type_name, association.key, association.value)
+                        )
+                    else:
+                        live = 1 if not saga.ended else 0
             else:
                 found = await self.store.sagas.sagas.find_live(request.type, request.key, request.value)
                 live = len(found)
@@ -573,6 +583,12 @@ class Probe:
             taken = await dispatch.claim_lease(request.saga_id, witness, now_ms, now_ms + 5_000)
             if taken:
                 await dispatch.release_lease(request.saga_id, witness)
+                # Check the witness was released: a second fresh claim must now succeed.
+                check = f"{witness}-check"
+                now_ms = int(time.time() * 1000)
+                taken = await dispatch.claim_lease(request.saga_id, check, now_ms, now_ms + 5_000)
+                if taken:
+                    await dispatch.release_lease(request.saga_id, check)
             return SagaReleaseReply(instance=self.instance, released=taken)
 
         @app.command_handler

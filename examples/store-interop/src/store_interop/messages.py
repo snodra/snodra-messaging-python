@@ -229,6 +229,7 @@ class SagaStarted:
     run: str
     family: str
     mode: str
+    deadline_delay_ms: int = 0
 
 
 @snodra.message_type(SAGA_ADVANCED_TYPE)
@@ -324,6 +325,7 @@ class SagaPublish:
     kind: str
     order_id: str
     mode: str
+    deadline_delay_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
