@@ -2,11 +2,14 @@
 
 For every record the event store delivers:
 
-- **A type no handler handles** is acknowledged and runs nothing.
+- **A type no handler and no saga handles** is acknowledged and runs nothing.
 - **Otherwise** the consumer records the stage-1 marker ``processor:<name>:<eventId>`` and runs the processor's handlers
   in one transaction of the message store; the marker and the handlers' writes (an event they publish included) commit
   together, and the record is acknowledged only after the commit. An existing marker makes the delivery a duplicate: the
   handlers are skipped and the record is acknowledged.
+- **The saga stage** of the ``default`` processor runs after stage 1 committed and also when stage 1 exhausted its
+  attempts: every interested saga type applies the event in its own transaction (its marker, state, dispatch entries
+  and deadlines), and the record is acknowledged only after both stages. A replay skips the sagas.
 - **A failing handler** is retried with the level-1 scaled backoff; a record that exhausts its attempts is parked as a
   dead letter (mode ``collection``), published to the event store's dead-letter source (mode ``event-store``) or logged
   and skipped (mode ``log``), then acknowledged. A malformed record (no type header, a payload that is not a JSON
@@ -69,6 +72,7 @@ from snodra._eventstore import (
 )
 from snodra._hubpb import hub_pb2
 from snodra._replay import in_replay, open_until, passed_ranges
+from snodra._saga_runtime import SagaRuntime
 from snodra._status import (
     MAX_DEAD_LETTER_ERROR_CHARS,
     StatusView,
@@ -144,6 +148,8 @@ class EventConsumer:
         dead_letter_retention_ms: int = 30 * 24 * 60 * 60 * 1000,
         dead_letter_publish_timeout: float = 30.0,
         clock: Callable[[], int] | None = None,
+        saga_runtime: SagaRuntime | None = None,
+        extra_event_types: Sequence[str] = (),
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"the event handler attempts must be at least 1, got {max_attempts}")
@@ -162,6 +168,8 @@ class EventConsumer:
         self._retention_ms = dead_letter_retention_ms
         self._publish_timeout = dead_letter_publish_timeout
         self._clock: Callable[[], int] = now_ms if clock is None else clock
+        self._saga_runtime = saga_runtime
+        self._extra_event_types = tuple(extra_event_types)
         self._spec = SubscriptionSpec(
             name=processor_subscription(service, processor),
             source=source,
@@ -405,13 +413,27 @@ class EventConsumer:
             await self._invalid(subscription, delivery, None, "record without type header", replay)
             return
         handlers = self._registry.handlers(self._processor, type_)
-        if not handlers:
-            await self._ack(subscription, delivery)
-            return
         if not is_json_object(delivery.payload):
             await self._invalid(subscription, delivery, type_, "payload is not a JSON object", replay)
             return
         event_id = self._event_id(delivery)
+        if not handlers:
+            try:
+                await self._saga_stage(delivery, type_, event_id, replay)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log.warning(
+                    "the saga stage of the %s event %s failed, redelivering it: %s",
+                    type_,
+                    event_id,
+                    error,
+                )
+                await self._redeliver(subscription, delivery)
+                await asyncio.sleep(self._backoff)
+                return
+            await self._ack(subscription, delivery)
+            return
         if await self._sequenced(subscription, delivery, type_, replay):
             return
         await self._attempt(subscription, delivery, type_, event_id, handlers, replay)
@@ -447,11 +469,18 @@ class EventConsumer:
             except Exception as error:
                 failure = error
             else:
-                self._processed_total += 1
-                if duplicate:
-                    log.debug("skipping the duplicate %s event %s", type_, event_id)
-                await self._ack(subscription, delivery)
-                return
+                try:
+                    await self._saga_stage(delivery, type_, event_id, replay)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    failure = error
+                else:
+                    self._processed_total += 1
+                    if duplicate:
+                        log.debug("skipping the duplicate %s event %s", type_, event_id)
+                    await self._ack(subscription, delivery)
+                    return
             if attempt < self._max_attempts:
                 log.warning(
                     "the %s event %s failed on attempt %d, retrying: %s",
@@ -476,6 +505,13 @@ class EventConsumer:
     ) -> None:
         """A record failed every attempt: park it, publish it to the dead-letter source, or log and skip it."""
         self._failed_total += 1
+        event_id = self._event_id(delivery)
+        try:
+            await self._saga_stage(delivery, type_, event_id, replay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as saga_error:
+            log.warning("the saga stage of the failed %s event %s also failed: %s", type_, event_id, saga_error)
         self._failing(failure) if isinstance(failure, Exception) else self._failing_text(str(failure))
         error = _error_of(failure)
         if self._mode == COLLECTION:
@@ -768,6 +804,13 @@ class EventConsumer:
             return True
         return False
 
+    async def _saga_stage(self, delivery: Delivery, type_: str, event_id: str, replay: bool) -> None:
+        """Applies the event to the saga stage of the ``default`` processor, unless it is a replay."""
+        stage = self._saga_runtime
+        if replay or stage is None or self._processor != "default" or not stage.interested(type_):
+            return
+        await stage.process(type_, bytes(delivery.payload), delivery.headers, event_id)
+
     def _letter(
         self,
         delivery: Delivery,
@@ -901,7 +944,7 @@ class EventConsumer:
                 dead_letters=self._dead_letters if self._mode == COLLECTION else 0,
                 last_error=self._last_error,
                 last_error_at_ms=self._last_error_at_ms,
-                event_types=self._registry.types(self._processor),
+                event_types=sorted(set(self._registry.types(self._processor)) | set(self._extra_event_types)),
                 dead_letter_mode=self._mode,
                 replaying=replaying,
                 operation_id=self._operation_id,

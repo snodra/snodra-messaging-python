@@ -139,6 +139,11 @@ class Sender:
         return self._codec
 
     @property
+    def has_configured_hubs(self) -> bool:
+        """Whether the app has hub addresses; without one a command must be answered by a local handler."""
+        return bool(self._settings.hubs)
+
+    @property
     def default_credit(self) -> int:
         """The window of a stream whose sender asked for none (``Request.initial_credit`` 0 reads as 64 at the hub)."""
         return self._timings.default_credit
@@ -212,6 +217,46 @@ class Sender:
                 outcome = request_outcome(exc)
                 if outcome is not None:
                     self._telemetry.request_done(kind, t.type, outcome, time.monotonic() - started)
+
+    async def call_payload(
+        self,
+        type_: str,
+        payload: bytes,
+        kind: Literal["command", "query"] = "command",
+        *,
+        routing_key: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 (the call's timeout)
+        priority: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        retry: RetryPolicy | Literal[False] | None = None,
+    ) -> None:
+        """Sends an already encoded message by its wire type, with headers the caller built itself.
+
+        The saga relay uses it: the entry's payload and headers (its correlation id, idempotency key and saga id) are
+        already on disk, and there is no message object to encode. A type this instance handles is answered in-process;
+        the headers are passed as they are (the reserved names included), since the relay owns them. The answer's
+        payload is not read.
+        """
+        chosen = self._chosen(timeout)
+        policy = self._policy(retry)
+        if priority is not None and (
+            isinstance(priority, bool) or not isinstance(priority, int) or priority not in _INT32
+        ):
+            raise ValueError(f"the priority of {type_} must be a 32-bit integer, got {priority!r}")
+        template = hub_pb2.Request(
+            kind=hub_pb2.COMMAND if kind == "command" else hub_pb2.QUERY,
+            type=type_,
+            routing_key=routing_key or "",
+            payload=payload,
+            headers=dict(headers or {}),
+            priority=self._settings.priorities.get(type_, 0) if priority is None else priority,
+            mode=hub_pb2.UNARY,
+        )
+        p = Prepared(template, chosen, policy)
+        if self.local is not None and (local := self.local.handler(kind, type_)) is not None:
+            await self.local.call(local, kind, payload, dict(template.headers), None)
+            return
+        await self.with_retry(p, self._attempt, whole_timeout=False)
 
     def prepare(
         self,

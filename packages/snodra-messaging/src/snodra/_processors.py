@@ -30,6 +30,7 @@ from snodra._events import EventRegistry
 from snodra._eventstore import Capability, EventStore
 from snodra._hubpb import hub_pb2
 from snodra._reset import ResetMachine
+from snodra._saga_runtime import SagaRuntime
 from snodra._settings import Settings
 from snodra._store import MessageStore, ProcessorControlState, Unsupported
 from snodra._timings import Timings
@@ -54,12 +55,16 @@ class Processors:
         settings: Settings,
         timings: Timings,
         clock: Callable[[], int],
+        sagas: SagaRuntime | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._settings = settings
         self._timings = timings
-        self._names: tuple[str, ...] = tuple(registry.processors())
+        names = list(registry.processors())
+        if sagas is not None and "default" not in names:
+            names.insert(0, "default")
+        self._names: tuple[str, ...] = tuple(names)
         mode = settings.dead_letter_mode
         if mode == EVENT_STORE and not events.supports(Capability.NATIVE_DEAD_LETTER):
             raise ConfigurationError(
@@ -93,6 +98,8 @@ class Processors:
                 dead_letter_retention_ms=int(settings.dead_letter_retention * 1000),
                 dead_letter_publish_timeout=timings.dead_letter_publish_timeout,
                 clock=clock,
+                saga_runtime=sagas if name == "default" else None,
+                extra_event_types=tuple(sagas.event_types) if name == "default" and sagas is not None else (),
             )
             for name in self._names
         }

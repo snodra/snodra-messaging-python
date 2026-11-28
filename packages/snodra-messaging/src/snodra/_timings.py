@@ -100,6 +100,32 @@ class Timings:
     dns_drain_limit: float
     """An address that left the DNS answer: the longest wait for nothing of the instance to be in flight on it before
     its stream is closed."""
+    saga_stage_max_attempts: int
+    """Stage 2: attempts of one (event, saga type) transaction before the event is parked."""
+    saga_stage_initial_backoff: float
+    """Stage 2: the first wait after a version or start-key conflict."""
+    saga_stage_max_backoff: float
+    """Stage 2: the cap of that wait."""
+    saga_dispatch_poll: float
+    """How often the saga dispatch relay looks for sagas with pending entries."""
+    saga_dispatch_batch: int
+    """The most sagas one dispatch pass takes."""
+    saga_dispatch_lease: float
+    """How long one relay holds a saga's dispatch lease."""
+    saga_dispatch_max_attempts: int
+    """Sends of one dispatch entry in all before it is given up."""
+    saga_dispatch_initial_backoff: float
+    """The first wait before retrying a transient command failure."""
+    saga_dispatch_max_backoff: float
+    """The cap of that wait."""
+    saga_dispatch_workers: int
+    """How many sagas one instance dispatches at once."""
+    saga_notice_max_attempts: int
+    """Deliveries of one failure notice in all before it is given up."""
+    deadline_poll: float
+    """How often the deadline scheduler looks for due deadlines."""
+    deadline_lease: float
+    """How long a scheduler's claim on a deadline holds."""
 
 
 DEFAULT_TIMINGS: Final = Timings(
@@ -145,5 +171,18 @@ DEFAULT_TIMINGS: Final = Timings(
     reset_finished_kept=60.0,
     dns_refresh=30.0,
     dns_drain_limit=65.0,
+    saga_stage_max_attempts=5,
+    saga_stage_initial_backoff=0.2,
+    saga_stage_max_backoff=5.0,
+    saga_dispatch_poll=0.2,
+    saga_dispatch_batch=100,
+    saga_dispatch_lease=60.0,
+    saga_dispatch_max_attempts=10,
+    saga_dispatch_initial_backoff=1.0,
+    saga_dispatch_max_backoff=300.0,
+    saga_dispatch_workers=4,
+    saga_notice_max_attempts=10,
+    deadline_poll=1.0,
+    deadline_lease=30.0,
 )
 """The shipped timings."""

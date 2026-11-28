@@ -77,6 +77,15 @@ from snodra._identity import Caller, Guard, authenticated, caller_matches, role
 from snodra._messages import message_type
 from snodra._reset import ResetContext
 from snodra._retry import RetryPolicy
+from snodra._saga import (
+    SagaCommandFailed,
+    SagaContext,
+    SagaError,
+    saga_command_failed,
+    saga_deadline,
+    saga_event,
+    saga_start,
+)
 from snodra._settings import Settings
 from snodra._store import (
     MAX_ERROR_MESSAGE_CHARS,
@@ -230,9 +239,12 @@ __all__ = [
     "ResetTarget",
     "RetryPolicy",
     "Revoked",
+    "SagaCommandFailed",
+    "SagaContext",
     "SagaDispatchDocument",
     "SagaDispatchStore",
     "SagaDocument",
+    "SagaError",
     "SagaFailureDocument",
     "SagaMarkerStore",
     "SagaRepository",
@@ -272,6 +284,10 @@ __all__ = [
     "message_type",
     "now_ms",
     "role",
+    "saga_command_failed",
+    "saga_deadline",
+    "saga_event",
+    "saga_start",
     "segment_order",
     "unbind_transaction",
 ]

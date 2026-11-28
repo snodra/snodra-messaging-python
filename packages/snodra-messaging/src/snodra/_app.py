@@ -14,6 +14,7 @@ from snodra import _credentials, _tls
 from snodra._codec import Codec, JsonCodec
 from snodra._connection import HubConnection, Rejection
 from snodra._control import ControlPlane
+from snodra._deadline import DeadlineScheduler
 from snodra._dispatch import Dispatcher
 from snodra._errors import ConfigurationError, SnodraError
 from snodra._events import (
@@ -33,6 +34,10 @@ from snodra._pool import Pool
 from snodra._processors import Processors
 from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
+from snodra._saga import SagaModel
+from snodra._saga_dispatch import SagaDispatchRelay
+from snodra._saga_failure import NoticeDispatcher
+from snodra._saga_runtime import SagaRuntime
 from snodra._send import Sender
 from snodra._settings import Settings, hub_targets
 from snodra._store import MessageStore, StoreLifecycle, now_ms
@@ -55,8 +60,8 @@ U = TypeVar("U")
 class App:
     """One service instance: its handlers and its hub connections.
 
-    Handlers are registered before ``start`` (``command_handler``, ``query_handler``, ``stream_handler``,
-    ``subscription_handler``); ``start`` opens a connection per hub; ``shutdown`` leaves the hubs in order
+    Handlers and sagas are registered before ``start`` (``command_handler``, ``query_handler``, ``stream_handler``,
+    ``subscription_handler``, ``saga``); ``start`` opens a connection per hub; ``shutdown`` leaves the hubs in order
     (https://snodra.damoreira.com/docs/library-authors/protocol/, "Shutting down"). ``run`` does both around the
     process's life, and ``async with app:`` around a block. ``codec`` reads and writes the payloads
     (:class:`JsonCodec` by default).
@@ -80,6 +85,10 @@ class App:
         self._store = store
         self._event_store = event_store
         self._events = EventRegistry()
+        self._saga_runtime: SagaRuntime | None = None
+        self._saga_dispatch: SagaDispatchRelay | None = None
+        self._deadlines: DeadlineScheduler | None = None
+        self._notice_dispatcher: NoticeDispatcher | None = None
         self._clock: Callable[[], int] = now_ms if _clock is None else _clock
         self._outbox_seq = itertools.count((self._clock() << 20) + 1)
         self._event_tasks: list[asyncio.Task[None]] = []
@@ -108,6 +117,7 @@ class App:
                 ", ".join(hub_targets(settings.hubs)),
             )
         self._codec: Codec = JsonCodec() if codec is None else codec
+        self._sagas = SagaModel(self._codec)
         self._registry = Registry()
         verifier = None
         if settings.jwks_url is not None and settings.issuer is not None:
@@ -290,6 +300,24 @@ class App:
             self._check_guard(fn, guard)
             handler = self._registry.add("query", fn, guard, shared=shared, subscription=True)
             return Updates(self._dispatcher.subscriptions, self._codec, handler.type, handler.message, update)
+
+        return register
+
+    def saga(self, name: str | None = None) -> Callable[[type], type]:
+        """Registers a saga class (``@app.saga("payment")``); raises :class:`~snodra.SagaError` for a bad definition.
+
+        The class needs a no-argument constructor, at least one ``@saga_start`` handler, and its fields must round-trip
+        through the codec as JSON. Handlers are ``async def`` methods taking the event and optionally a
+        :class:`~snodra.SagaContext`; they record what they send instead of sending it.
+        """
+        if isinstance(name, type):
+            cls = name
+            self._sagas.add(cls, None)
+            return cls
+
+        def register(cls: type) -> type:
+            self._sagas.add(cls, name)
+            return cls
 
         return register
 
@@ -633,8 +661,10 @@ class App:
             raise RuntimeError("the app is already started")
         self._registry.close()
         self._events.close()
+        self._sagas.close()
         self._check_event_startup()
         await self._prepare_store()
+        self._saga_runtime = self._build_saga_runtime()
         self._processors = self._build_processors()
         self._control.attach(self._processors)
         if self._processors is not None:
@@ -693,9 +723,13 @@ class App:
         :meth:`publish` fails naming the missing add-on. Commands, queries and subscription queries need neither store.
         """
         processors = self._events.processors()
-        if not processors:
+        definitions = self._sagas.definitions()
+        if not processors and not definitions:
             return
-        first = min(type_ for processor in processors for type_ in self._events.types(processor))
+        if processors:
+            first = min(type_ for processor in processors for type_ in self._events.types(processor))
+        else:
+            first = definitions[0].event_types[0] if definitions[0].event_types else definitions[0].name
         if self._store is None:
             raise ConfigurationError(
                 f"the event handler for {first} needs a message store: pass store= to App "
@@ -711,7 +745,7 @@ class App:
         """The event processors this instance runs, or ``None`` when it runs none (no handler, or consuming is off)."""
         if not self._settings.consumer_enabled or self._store is None or self._event_store is None:
             return None
-        if not self._events.processors():
+        if not self._events.processors() and not self._sagas.definitions():
             return None
         return Processors(
             service=self._settings.service,
@@ -722,6 +756,20 @@ class App:
             settings=self._settings,
             timings=self._timings,
             clock=self._clock,
+            sagas=self._saga_runtime,
+        )
+
+    def _build_saga_runtime(self) -> SagaRuntime | None:
+        if not self._sagas.definitions():
+            return None
+        assert self._store is not None  # checked by _check_event_startup
+        assert self._event_store is not None  # checked by _check_event_startup
+        return SagaRuntime(
+            self._sagas,
+            self._store,
+            self._codec,
+            clock=self._clock,
+            timings=self._timings,
         )
 
     def _processor_statuses(self) -> list[hub_pb2.ProcessorStatus]:
@@ -747,12 +795,41 @@ class App:
                 clock=self._clock,
             )
             self._event_tasks.append(relay.start())
+        if self._saga_runtime is not None:
+            assert self._store is not None
+            self._notice_dispatcher = NoticeDispatcher(
+                store=self._store,
+                registry=self._events,
+                codec=self._codec,
+                sagas=self._saga_runtime,
+                clock=self._clock,
+            )
+            self._saga_dispatch = SagaDispatchRelay(
+                store=self._store,
+                sender=self._sender,
+                codec=self._codec,
+                notice=self._notice_dispatcher.dispatch,
+                clock=self._clock,
+                timings=self._timings,
+            )
+            self._event_tasks.append(self._saga_dispatch.start())
+            self._deadlines = DeadlineScheduler(
+                deadlines=self._store.sagas.deadlines,
+                sagas=self._saga_runtime,
+                clock=self._clock,
+                timings=self._timings,
+            )
+            self._event_tasks.append(self._deadlines.start())
 
     async def _stop_events(self, budget: float) -> None:
         """Cancels the outbox relay, the processors, their control workers and the store's work, and waits for them to
         end within ``budget`` seconds."""
         tasks = self._event_tasks
         self._event_tasks = []
+        if self._saga_dispatch is not None:
+            self._saga_dispatch.stop()
+        if self._deadlines is not None:
+            self._deadlines.stop()
         if self._processors is not None:
             await self._processors.stop()
             tasks = tasks + self._processors.tasks()
