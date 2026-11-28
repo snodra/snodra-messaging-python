@@ -52,6 +52,8 @@ class DeadlineScheduler:
 
     def stop(self) -> None:
         self._running = False
+        if self._task is not None:
+            self._task.cancel()
 
     async def run_once(self) -> bool:
         """Claims and fires at most one due deadline; whether one was claimed."""

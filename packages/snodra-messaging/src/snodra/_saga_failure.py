@@ -139,32 +139,43 @@ class NoticeDispatcher:
         return handled
 
     async def _ordinary(self, notice: SagaCommandFailed, headers: Mapping[str, str]) -> bool:
-        handlers = self._registry.handlers("default", COMMAND_FAILED_TYPE)
-        if not handlers:
-            return False
-        marker = processor_marker("default", notice.notice_id)
+        """Runs the ordinary handlers of every processor that has one for the notice, each under its own marker.
+
+        The marker is ``processor:<processor>:failed:<sagaId>:<seq>`` with empty source, segment and position: a local
+        notice was not delivered from an event-store position, so no reset range can delete it.
+        """
+        handled = False
         info = event_message(notice.notice_id, COMMAND_FAILED_TYPE, headers)
-        try:
-            async with self._store.transaction():
-                if not await self._store.processed.record(
-                    ProcessedMarker(
-                        id=marker,
-                        type_name=COMMAND_FAILED_TYPE,
-                        processed_at_ms=int(self._clock()),
-                        processor="default",
-                        source="",
-                        segment="",
-                        position="",
-                    )
-                ):
-                    return True
-                with event_handling(info, ""):
-                    for handler in handlers:
-                        await handler.fn(notice)
-        except Exception:
-            log.exception("an ordinary handler failed on the saga failure notice %s", notice.notice_id)
-            raise
-        return True
+        for processor in self._registry.processors():
+            handlers = self._registry.handlers(processor, COMMAND_FAILED_TYPE)
+            if not handlers:
+                continue
+            marker = processor_marker(processor, notice.notice_id)
+            try:
+                async with self._store.transaction():
+                    if await self._store.processed.record(
+                        ProcessedMarker(
+                            id=marker,
+                            type_name=COMMAND_FAILED_TYPE,
+                            processed_at_ms=int(self._clock()),
+                            processor=processor,
+                            source="",
+                            segment="",
+                            position="",
+                        )
+                    ):
+                        with event_handling(info, ""):
+                            for handler in handlers:
+                                await handler.fn(notice)
+                    handled = True
+            except Exception:
+                log.exception(
+                    "an ordinary handler of processor %s failed on the saga failure notice %s",
+                    processor,
+                    notice.notice_id,
+                )
+                raise
+        return handled
 
 
 __all__ = ["Classification", "NoticeDispatcher", "classify"]

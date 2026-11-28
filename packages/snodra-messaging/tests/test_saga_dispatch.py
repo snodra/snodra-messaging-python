@@ -69,6 +69,7 @@ def _timings() -> Any:
         saga_dispatch_initial_backoff=0.01,
         saga_dispatch_max_backoff=0.02,
         saga_dispatch_max_attempts=3,
+        saga_dispatch_send_timeout=0.01,
         saga_notice_max_attempts=3,
     )
 
@@ -120,7 +121,8 @@ async def test_commands_go_in_order_with_their_key_and_headers_and_the_event_goe
     assert routing == "o-1"
     assert await store.sagas.dispatch.next_pending(saga_id) is None
     outbox = await store.outbox.claim("relay-check", 60.0, 10)
-    assert [entry.id for entry in outbox] == [event.id]
+    assert len(outbox) == 1
+    assert outbox[0].id != event.id, "the outbox entry has an id of its own"
     assert outbox[0].type_name == "test.Done"
     assert outbox[0].key is None
     assert outbox[0].headers["correlationId"] == "c-1"
@@ -254,3 +256,104 @@ async def test_a_deadline_fires_once_after_it_is_due_and_a_cancelled_one_never_f
         await store.sagas.deadlines.cancel(saga.id, other.id, 61_000)
     clock[0] = 70_000
     assert await scheduler.run_once() is False
+
+
+class StubbornSender(Sender):
+    """A local send that ignores cancellation; the relay must abandon it as a transient failure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def call_payload(
+        self,
+        type_: str,
+        payload: bytes,
+        kind: str = "command",
+        *,
+        routing_key: str | None = None,
+        headers: dict[str, str] | None = None,
+        retry: object = None,
+    ) -> None:
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            await self.release.wait()
+
+
+async def test_a_send_that_ignores_cancellation_is_abandoned_transiently() -> None:
+    sender = StubbornSender()
+    relay, store = await _relay(sender)
+    saga_id = "saga-stubborn"
+    entry = _entry(saga_id, 0, DispatchKind.COMMAND)
+    async with store.transaction():
+        await store.sagas.dispatch.record([entry])
+    await relay.run_once()
+    pending = await store.sagas.dispatch.next_pending(saga_id)
+    assert pending is not None
+    assert pending.attempts == 1, "an abandoned send is a transient attempt, never permanent"
+    sender.release.set()
+    await asyncio.sleep(0)
+
+
+class HublessSender(Sender):
+    """No configured hubs and no local handler."""
+
+    has_configured_hubs = False
+
+
+async def test_a_hubless_command_with_no_local_handler_is_no_handler_at_once() -> None:
+    sender = HublessSender()
+    relay, store = await _relay(sender)
+    entry = _entry("saga-hubless", 0, DispatchKind.COMMAND)
+    async with store.transaction():
+        await store.sagas.dispatch.record([entry])
+    await relay.run_once()
+    assert await store.sagas.dispatch.next_pending("saga-hubless") is None
+    failed = await store.sagas.dispatch.next_pending("saga-hubless")
+    assert failed is None
+    # The notice is pending; there is no second attempt and no retry time on the command.
+    assert await store.sagas.dispatch.pending() == 0
+
+
+async def test_transient_failures_end_as_exhausted_with_a_notice() -> None:
+    clock = [1_000]
+    sender = Sender([NeverSent("down"), NeverSent("down"), NeverSent("down")])
+    relay, store = await _relay(sender, clock=lambda: clock[0])
+    entry = _entry("saga-exhausted", 0, DispatchKind.COMMAND)
+    async with store.transaction():
+        await store.sagas.dispatch.record([entry])
+    for _ in range(3):
+        await relay.run_once()
+        pending = await store.sagas.dispatch.next_pending("saga-exhausted")
+        if pending is None:
+            break
+        assert pending.next_attempt_at_ms is not None
+        clock[0] = pending.next_attempt_at_ms
+    assert await store.sagas.dispatch.next_pending("saga-exhausted") is None
+    assert await store.sagas.dispatch.pending() == 0
+
+
+async def test_a_notice_that_cannot_be_delivered_is_retried_then_cleared() -> None:
+    clock = [1_000]
+    sender = Sender([HubError(ErrorCode.PERMISSION_DENIED, "denied")])
+    attempts: list[int] = []
+
+    async def notice(failure: SagaCommandFailed, headers: dict[str, str]) -> bool:
+        attempts.append(1)
+        return len(attempts) >= 2
+
+    relay, store = await _relay(sender, clock=lambda: clock[0], notice=notice)
+    entry = _entry("saga-notice", 0, DispatchKind.COMMAND)
+    async with store.transaction():
+        await store.sagas.dispatch.record([entry])
+    await relay.run_once()
+    assert len(attempts) == 1, "the first delivery failed and was retried"
+    # Find the notice's next time and advance to it.
+    row = next(iter(store._data.dispatch.rows.values()))
+    assert row.notice_next_at_ms is not None
+    clock[0] = row.notice_next_at_ms
+    await relay.run_once()
+    assert len(attempts) == 2
+    cleared = next(iter(store._data.dispatch.rows.values()))
+    assert not cleared.notice_pending

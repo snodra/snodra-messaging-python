@@ -664,6 +664,10 @@ class EventConsumer:
         if head is None:
             self._parked_keys.discard(key)  # retried, discarded or expired, here or on another instance
             return False
+        # The saga stage runs before the record is parked behind another letter: the saga must not miss an event
+        # because its key happened to be blocked in the message store.
+        if not replay:
+            await self._saga_stage(delivery, type_, self._event_id(delivery), replay)
         own = letter_id(self._processor, self._source, segment, delivery.position)
         if head == own or await letters.get(own) is not None:
             log.info(

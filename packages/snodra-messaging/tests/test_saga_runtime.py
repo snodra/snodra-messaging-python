@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -250,3 +251,14 @@ async def test_a_second_runtime_continues_the_saga_on_the_same_store() -> None:
     stored = await store.sagas.sagas.find_by_id(saga.id, tx=store.plain())
     assert stored is not None
     assert stored.ended is True
+
+
+async def test_two_concurrent_deliveries_of_one_event_apply_it_once() -> None:
+    runtime, store, model = await _runtime(PaymentSaga)
+    payload = b'{"orderId":"o-1"}'
+    await asyncio.gather(
+        runtime.process("test.OrderPlaced", payload, _headers(), "evt-1"),
+        runtime.process("test.OrderPlaced", payload, _headers(), "evt-1"),
+    )
+    assert await store.sagas.sagas.count_live_by_type() == {model.definitions()[0].name: 1}
+    assert await store.sagas.dispatch.pending() == 2, "one command and one event, not two of each"

@@ -29,6 +29,7 @@ from snodra._saga import (
     SagaError,
     SagaEventBinding,
     SagaModel,
+    saga_handling,
     start_key,
 )
 from snodra._store import (
@@ -89,7 +90,6 @@ class SagaRuntime:
         self._codec = codec
         self._clock = clock
         self._timings = timings
-        self._lock = asyncio.Lock()
         self._running = False
 
     @property
@@ -344,7 +344,8 @@ class SagaRuntime:
             headers=headers,
         )
         for binding in handlers:
-            await _call_handler(binding.fn, instance, event, context)
+            with saga_handling():
+                await _call_handler(binding.fn, instance, event, context)
             if binding.end:
                 context.end()
             if context.ended:
@@ -476,7 +477,8 @@ class SagaRuntime:
             payload: object | None = None
             if handler.payload_type is not None and claimed.payload is not None:
                 payload = self._codec.decode(claimed.payload.encode(), handler.payload_type)
-            await _call_deadline(handler.fn, instance, payload, context)
+            with saga_handling():
+                await _call_deadline(handler.fn, instance, payload, context)
             if handler.end:
                 context.end()
             planned = await self._plan(definition, document, instance, context, now)

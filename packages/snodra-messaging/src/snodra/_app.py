@@ -34,7 +34,7 @@ from snodra._pool import Pool
 from snodra._processors import Processors
 from snodra._registry import Kind, Registry, label_of
 from snodra._retry import RetryPolicy
-from snodra._saga import SagaModel
+from snodra._saga import SagaModel, in_saga_handler
 from snodra._saga_dispatch import SagaDispatchRelay
 from snodra._saga_failure import NoticeDispatcher
 from snodra._saga_runtime import SagaRuntime
@@ -406,6 +406,11 @@ class App:
         publishes at startup. Raises :class:`ConfigurationError` in that case, ``TypeError`` for an event that is not a
         ``@message_type`` class and :class:`~snodra._store.InvalidMessage` for a payload no store may hold.
         """
+        if in_saga_handler():
+            raise ConfigurationError(
+                "App.publish cannot be used inside a saga handler: use SagaContext.publish to record the event "
+                "in the saga's transaction"
+            )
         if self._store is None:
             raise ConfigurationError(PUBLISH_NEEDS_STORE)
         if self._event_store is None:
@@ -479,6 +484,11 @@ class App:
         :class:`HubError` for an error code from the hub or the handler (``TIMEOUT`` also when no answer came
         within the hub's bound for the request plus 1 s), ``DecodeError`` when the answer is not a ``result``. A
         cancellation of the caller (``asyncio.timeout``, a task group) stays ``asyncio.CancelledError``."""
+        if in_saga_handler():
+            raise ConfigurationError(
+                "App.send cannot be used inside a saga handler: use SagaContext.send to record the command in the "
+                "saga's transaction"
+            )
         return await self._sender.call(  # type: ignore[return-value]
             command,
             result,

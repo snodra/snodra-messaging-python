@@ -70,6 +70,7 @@ class SagaDispatchRelay:
         self._outbox_seq = itertools.count((self._clock() << 20) + 1)
         self._in_flight: set[str] = set()
         self._tasks: set[asyncio.Task[None]] = set()
+        self._abandoned: set[asyncio.Task[None]] = set()
         self._running = False
         self._loop_task: asyncio.Task[None] | None = None
 
@@ -169,7 +170,7 @@ class SagaDispatchRelay:
             return "permanent"
         headers = _event_headers(entry)
         outbox = OutboxEntry(
-            id=entry.id,
+            id=str(uuid.uuid4()),
             type_name=entry.type_name,
             key=entry.routing_key,
             headers=headers,
@@ -219,16 +220,20 @@ class SagaDispatchRelay:
             return "permanent"
         headers = _command_headers(entry)
         try:
-            await self._sender.call_payload(
+            await self._call_bound(
                 entry.type_name,
                 entry.payload.encode(),
-                "command",
-                routing_key=entry.routing_key,
-                headers=headers,
-                retry=False,
+                entry.routing_key,
+                headers,
             )
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            return await self._transient(
+                entry,
+                now,
+                f"the send did not answer within {self._timings.saga_dispatch_send_timeout:g} s",
+            )
         except Exception as error:
             classification = classify(error)
             if classification.transient:
@@ -237,6 +242,32 @@ class SagaDispatchRelay:
             return "permanent"
         await self._store.sagas.dispatch.mark_dispatched(entry.id, now)
         return "sent"
+
+    async def _call_bound(
+        self,
+        type_: str,
+        payload: bytes,
+        routing_key: str | None,
+        headers: Mapping[str, str],
+    ) -> None:
+        """Runs one send, bounded; a local handler that ignores cancellation is abandoned, not awaited."""
+        task = asyncio.create_task(
+            self._sender.call_payload(
+                type_,
+                payload,
+                "command",
+                routing_key=routing_key,
+                headers=headers,
+                retry=False,
+            )
+        )
+        done, _ = await asyncio.wait({task}, timeout=self._timings.saga_dispatch_send_timeout)
+        if task not in done:
+            task.cancel()
+            self._abandoned.add(task)
+            task.add_done_callback(self._abandoned.discard)
+            raise TimeoutError
+        await task
 
     async def _transient(self, entry: SagaDispatchDocument, now: int, message: str) -> Outcome:
         attempts = entry.attempts + 1

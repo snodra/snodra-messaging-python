@@ -120,6 +120,8 @@ class Timings:
     """The cap of that wait."""
     saga_dispatch_workers: int
     """How many sagas one instance dispatches at once."""
+    saga_dispatch_send_timeout: float
+    """The longest one dispatch send may wait; an abandoned local send is transient."""
     saga_notice_max_attempts: int
     """Deliveries of one failure notice in all before it is given up."""
     deadline_poll: float
@@ -181,6 +183,7 @@ DEFAULT_TIMINGS: Final = Timings(
     saga_dispatch_initial_backoff=1.0,
     saga_dispatch_max_backoff=300.0,
     saga_dispatch_workers=4,
+    saga_dispatch_send_timeout=60.0,
     saga_notice_max_attempts=10,
     deadline_poll=1.0,
     deadline_lease=30.0,

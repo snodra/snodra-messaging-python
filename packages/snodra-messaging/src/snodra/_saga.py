@@ -38,7 +38,9 @@ import inspect
 import json
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, ClassVar, Final, get_origin, get_type_hints
 
@@ -64,6 +66,24 @@ _START_KEY_PART: Final = re.compile(r"[%|=]")
 
 class SagaError(ConfigurationError):
     """A saga definition the library refuses at startup: the message names the saga and the handler."""
+
+
+_IN_SAGA_HANDLER: ContextVar[bool] = ContextVar("snodra_in_saga_handler", default=False)
+
+
+@contextmanager
+def saga_handling() -> Iterator[None]:
+    """Marks the current task as running a saga handler; direct sends and publishes are refused there."""
+    token = _IN_SAGA_HANDLER.set(True)
+    try:
+        yield
+    finally:
+        _IN_SAGA_HANDLER.reset(token)
+
+
+def in_saga_handler() -> bool:
+    """Whether the current task runs a saga handler."""
+    return _IN_SAGA_HANDLER.get()
 
 
 @message_type(COMMAND_FAILED_TYPE)
