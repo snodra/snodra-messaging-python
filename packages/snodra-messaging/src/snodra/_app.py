@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import logging
 import signal
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Any, Literal, TypeVar, overload
@@ -24,6 +25,7 @@ from snodra._events import (
     outbox_entry,
 )
 from snodra._eventstore import EventStore
+from snodra._external import IdempotentAdapter
 from snodra._gather import Gathered, gather
 from snodra._hubpb import hub_pb2
 from snodra._identity import Guard, IdentityResolver
@@ -41,6 +43,7 @@ from snodra._saga_runtime import SagaRuntime
 from snodra._send import Sender
 from snodra._settings import Settings, hub_targets
 from snodra._store import MessageStore, StoreLifecycle, now_ms
+from snodra._store import Unsupported as StoreUnsupported
 from snodra._stream_client import Stream, stream
 from snodra._subscribe import Subscription, subscribe
 from snodra._subscription_handler import Updates
@@ -141,6 +144,13 @@ class App:
             telemetry=self._telemetry,
         )
         self._sender = Sender(self._codec, settings, self._timings, telemetry=self._telemetry)
+        self._external = IdempotentAdapter(
+            store=store,
+            codec=self._codec,
+            timings=self._timings,
+            clock=self._clock,
+        )
+        self._dispatcher.external = self._external
         self._cert_seen: set[str] = set()
         self._processors: Processors | None = None
         self._control = ControlPlane(None)
@@ -205,6 +215,57 @@ class App:
         refuses ``PERMISSION_DENIED`` once it decoded. A guard needs ``Settings.jwks_url``: without it, a guarded
         handler is a :class:`ConfigurationError` naming it."""
         return self._handler("command", fn, guard)
+
+    @overload
+    def idempotent_command_handler(
+        self, fn: H, /, *, guard: Guard | None = None, external_idempotent: bool = False
+    ) -> H: ...
+    @overload
+    def idempotent_command_handler(
+        self, fn: None = None, /, *, guard: Guard | None = None, external_idempotent: bool = False
+    ) -> Callable[[H], H]: ...
+    def idempotent_command_handler(
+        self,
+        fn: H | None = None,
+        /,
+        *,
+        guard: Guard | None = None,
+        external_idempotent: bool = False,
+    ) -> H | Callable[[H], H]:
+        """Registers an idempotent command handler, bare (``@app.idempotent_command_handler``) or called
+        (``@app.idempotent_command_handler(external_idempotent=True)``).
+
+        Each call is recorded in the message store's ``external_calls`` under the request's ``idempotency-key`` header
+        before the body runs: the first call wins, a repeat after success returns the first reply without running the
+        body, a repeat after a permanent failure replays the stored error, and one after an unknown outcome reports it
+        again. A header that is missing or blank fails the call before the record and the body. ``external_idempotent``
+        says the partner de-duplicates by the key: a lapsed ``IN_PROGRESS`` record is taken over and the body runs
+        again; without it, the call is given up as unknown and the body never runs automatically. The record's writes
+        are their own, so a rolled-back handler never forgets a call that happened.
+
+        Raise :class:`snodra.Retryable` for a failure a later attempt may cure (the relay owns the backoff) and
+        :class:`snodra.UnknownOutcome` when the external call may or may not have happened. Any other exception is
+        stored as a permanent failure and replayed; a panic is settled as an unknown outcome. The handler needs the
+        message store and its external-calls port: :meth:`start` probes it after the schema is prepared. ``guard`` is
+        that of :meth:`command_handler`. Raises ``TypeError`` for what cannot be served and
+        :class:`RegistrationClosed` after ``start``. Returns the function unchanged."""
+        if not isinstance(external_idempotent, bool):
+            raise TypeError(f"external_idempotent must be True or False, got {external_idempotent!r}")
+        if guard is not None and not isinstance(guard, Guard):
+            raise TypeError(f"guard must be made by authenticated(), role() or caller_matches(), got {guard!r}")
+
+        def register(f: H) -> H:
+            self._check_guard(f, guard)
+            self._registry.add(
+                "command",
+                f,
+                guard,
+                idempotent=True,
+                partner_idempotent=external_idempotent,
+            )
+            return f
+
+        return register if fn is None else register(fn)
 
     @overload
     def query_handler(self, fn: H, /) -> H: ...
@@ -674,6 +735,7 @@ class App:
         self._sagas.close()
         self._check_event_startup()
         await self._prepare_store()
+        await self._check_external_startup()
         self._saga_runtime = self._build_saga_runtime()
         self._processors = self._build_processors()
         self._control.attach(self._processors)
@@ -708,6 +770,47 @@ class App:
                 await self._store.check_schema()
         except Exception as error:
             raise SnodraError(f"the message store {self._store.name} could not {what} its schema: {error}") from error
+
+    async def _check_external_startup(self) -> None:
+        """Refuses an idempotent command handler without a usable external-call port, after the schema is ready."""
+        handlers = self._registry.idempotent_handlers()
+        if not handlers:
+            return
+        first = handlers[0]
+        if self._store is None:
+            raise ConfigurationError(
+                f"the idempotent command handler for {first.type} needs a message store: pass store= to App "
+                "(snodra.MemoryStore runs the in-memory one, not durable: tests and local runs)"
+            )
+        try:
+            port = self._store.external
+        except StoreUnsupported as error:
+            raise ConfigurationError(
+                f"the idempotent command handler for {first.type} needs the message store's external calls port; "
+                f"the message store {self._store.name} does not provide it ({error})"
+            ) from error
+        except Exception as error:
+            raise ConfigurationError(
+                f"the idempotent command handler for {first.type} needs the message store's external calls port; "
+                f"the message store {self._store.name} could not provide it ({error})"
+            ) from error
+        if port is None:
+            raise ConfigurationError(
+                f"the idempotent command handler for {first.type} needs the message store's external calls port; "
+                f"the message store {self._store.name} does not provide it"
+            )
+        try:
+            await port.find(f"snodra-probe:{uuid.uuid4().hex}")
+        except StoreUnsupported as error:
+            raise ConfigurationError(
+                f"the idempotent command handler for {first.type} needs the message store's external calls port; "
+                f"the message store {self._store.name} does not provide it ({error})"
+            ) from error
+        except Exception as error:
+            raise ConfigurationError(
+                f"the idempotent command handler for {first.type} could not read the external calls port of "
+                f"{self._store.name}: {error}"
+            ) from error
 
     def _start_store_background(self) -> None:
         """Starts the message store's own work, when the store implements the lifecycle."""

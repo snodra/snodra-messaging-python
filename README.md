@@ -53,9 +53,9 @@ retries and timeouts.
   handlers.
 - **Telemetry** behind an interface, with an OpenTelemetry implementation in the separate `snodra-messaging-observability` package.
 - **Feature level 3**, proved by the 33 level-1 checks of the conformance runner and by the level-2 and level-3
-  event-store and message-store kits. The saga runtime, the saga and external-call store ports and the level-4 store
-  checks are implemented on `main`; the external-call adapter and the public level-4 claim wait for the later level-4
-  tasks and the release.
+  event-store and message-store kits. The saga runtime, the idempotent external-call adapter, the saga and
+  external-call store ports and the level-4 store checks are implemented on `main`; the public level-4 claim waits for
+  the cross-language saga interop and the level-4 documentation and release.
 
 ## Install
 

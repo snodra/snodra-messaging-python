@@ -10,7 +10,6 @@ See https://snodra.damoreira.com/docs/library-authors/writing-a-library/#retries
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -25,6 +24,8 @@ from snodra._errors import (
     NeverSent,
     OutcomeUnknown,
     SnodraError,
+    is_retryable,
+    is_unknown_outcome,
 )
 from snodra._events import EventHeaders, EventRegistry, event_handling, event_message, processor_marker
 from snodra._saga import COMMAND_FAILED_TYPE, SagaCommandFailed
@@ -32,9 +33,6 @@ from snodra._saga_runtime import SagaRuntime
 from snodra._store import MessageStore, ProcessedMarker
 
 log = logging.getLogger(__name__)
-
-RETRYABLE: bytes = b'{"snodra":"retryable"}'
-UNKNOWN_OUTCOME: bytes = b'{"snodra":"unknown-outcome"}'
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,22 +61,24 @@ def classify(error: BaseException) -> Classification:
         if error.code is ErrorCode.INVALID_REQUEST:
             return Classification(False, "INVALID", message)
         if error.code is ErrorCode.HANDLER_ERROR:
-            details = error.details.strip()
-            if details == RETRYABLE:
+            if is_retryable(error):
                 return Classification(True, "EXHAUSTED", message)
-            if details == UNKNOWN_OUTCOME:
+            if is_unknown_outcome(error):
                 return Classification(False, "UNKNOWN_OUTCOME", message)
             return Classification(False, "FAILED", message)
         if error.code is ErrorCode.CANCELLED:
             return Classification(False, "FAILED", message)
         return Classification(False, "FAILED", message)
     if isinstance(error, HandlerError):
-        details = _details_bytes(error.details)
-        if details == RETRYABLE:
+        if is_retryable(error):
             return Classification(True, "EXHAUSTED", message)
-        if details == UNKNOWN_OUTCOME:
+        if is_unknown_outcome(error):
             return Classification(False, "UNKNOWN_OUTCOME", message)
         return Classification(False, "FAILED", message)
+    if is_retryable(error):
+        return Classification(True, "EXHAUSTED", message)
+    if is_unknown_outcome(error):
+        return Classification(False, "UNKNOWN_OUTCOME", message)
     if isinstance(error, InvalidRequest | DecodeError | ValueError):
         return Classification(False, "INVALID", message)
     if isinstance(error, SnodraError):
@@ -90,17 +90,6 @@ def classify(error: BaseException) -> Classification:
 def _text(error: BaseException) -> str:
     text = str(error).strip() or type(error).__name__
     return text[:2000]
-
-
-def _details_bytes(details: object) -> bytes:
-    if details is None:
-        return b""
-    if isinstance(details, bytes):
-        return details.strip()
-    try:
-        return json.dumps(details, separators=(",", ":")).encode()
-    except Exception:
-        return b""
 
 
 class NoticeDispatcher:

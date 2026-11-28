@@ -798,3 +798,34 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Question:** should prepare finish a record in hand within the hub's bound (and answer `ok` only then), as this
   library does, or leave it to the next subscription at once (a shorter wait, fewer odds of a late answer)?
 - **Wire change:** no.
+
+### SG-47: a custom idempotency key for an external-call adapter
+
+- **Specification:** [messages.md, Request headers](https://snodra.damoreira.com/docs/library-authors/messages/#request-headers)
+  says an idempotent adapter uses the `idempotency-key` header to act once and does not say whether the key may be
+  derived from the message. Kotlin's public `@IdempotentHandler` takes a SpEL key over the decoded message and the
+  headers and compiles it at registration
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/external/IdempotentHandler.kt:23-25,34,48`);
+  its default is the same header, and an adapter that polls can put the attempt in the key.
+- **Other Snodra libraries:** Go's `HandleIdempotentCommand` reads only the header and records the decision as SG-53.
+- **This library:** `snodra/_external.py` reads only the `idempotency-key` header; a missing or blank one fails the call
+  before the record and the body. An adapter whose key is derived from the message must set the header at the caller.
+- **Question:** should Python add a typed key expression/option (recognising the message and headers), or keep the
+  header-only contract? Settled for this level as the header only, matching Go.
+- **Wire change:** no.
+
+### SG-48: a panic in an external-call adapter body
+
+- **Specification:** [writing-a-library.md, The failure notice](https://snodra.damoreira.com/docs/library-authors/writing-a-library/#the-failure-notice)
+  says `UNKNOWN_OUTCOME` is for an idempotent adapter that cannot tell whether its external call happened; no page
+  says what a panic in the adapter body does. Kotlin catches `Throwable` and settles the record `FAILED`
+  (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/external/IdempotencyInterceptor.kt:84-90,193-209`),
+  so its first caller sees a plain permanent failure.
+- **Other Snodra libraries:** Go recovers a panic, settles the record `UNKNOWN` and returns the unknown-outcome marker
+  (its SG-54).
+- **This library:** `snodra/_external.py` treats a `BaseException` that is not an `Exception` (and is not
+  `asyncio.CancelledError`) as a panic: it settles the record `UNKNOWN`, then raises
+  `snodra.UnknownOutcome`, so the first caller and a redelivery agree and the body is not run again automatically.
+- **Question:** should a panic be `UNKNOWN` (this library and Go, the safe answer) or `FAILED` (Kotlin)? Settled as
+  `UNKNOWN` for this library.
+- **Wire change:** no.

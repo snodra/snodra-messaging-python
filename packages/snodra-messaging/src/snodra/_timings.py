@@ -128,6 +128,8 @@ class Timings:
     """How often the deadline scheduler looks for due deadlines."""
     deadline_lease: float
     """How long a scheduler's claim on a deadline holds."""
+    external_call_lease: float
+    """How long an idempotent external call may stay IN_PROGRESS before its outcome counts as unknown."""
 
 
 DEFAULT_TIMINGS: Final = Timings(
@@ -187,5 +189,6 @@ DEFAULT_TIMINGS: Final = Timings(
     saga_notice_max_attempts=10,
     deadline_poll=1.0,
     deadline_lease=30.0,
+    external_call_lease=300.0,
 )
 """The shipped timings."""

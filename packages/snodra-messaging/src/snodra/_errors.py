@@ -4,8 +4,9 @@ See https://snodra.damoreira.com/docs/library-authors/messages/ (Handler errors)
 """
 
 import enum
+import json
 import re
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from snodra._hubpb import hub_pb2
 
@@ -29,6 +30,70 @@ class ErrorCode(enum.IntEnum):
 
 class SnodraError(Exception):
     """The base of every exception the library raises."""
+
+
+RETRYABLE: Final[bytes] = b'{"snodra":"retryable"}'
+"""The reserved ``Error.details`` value of a failure a later attempt may cure (``L4-ADAPTER-MARKERS``)."""
+
+UNKNOWN_OUTCOME: Final[bytes] = b'{"snodra":"unknown-outcome"}'
+"""The reserved ``Error.details`` value of an external call whose outcome cannot be known."""
+
+
+class Retryable(SnodraError):
+    """Raised by a handler (an idempotent adapter) to answer ``HANDLER_ERROR`` with the retryable marker.
+
+    The saga relay treats it as transient and owns the backoff: do not retry inside the handler. It is not
+    :class:`OutcomeUnknown`, which is a sender's transport failure.
+    """
+
+
+class UnknownOutcome(SnodraError):
+    """Raised by an idempotent adapter that cannot tell whether its external call happened.
+
+    The answer is ``HANDLER_ERROR`` with the unknown-outcome marker; the relay records ``UNKNOWN_OUTCOME`` and does not
+    run the body again automatically.
+    """
+
+
+def is_retryable(error: BaseException | None) -> bool:
+    """Whether ``error`` carries the retryable marker, locally or from a hub, with surrounding whitespace trimmed.
+
+    The marker is the exception :class:`Retryable`, a :class:`HandlerError` or :class:`HubError` whose details are the
+    reserved bytes, or one of those reached through the explicit cause chain (``raise ... from ...``).
+    """
+    return _has_marker(error, Retryable, RETRYABLE)
+
+
+def is_unknown_outcome(error: BaseException | None) -> bool:
+    """Whether ``error`` carries the unknown-outcome marker, read as :func:`is_retryable` reads the other one."""
+    return _has_marker(error, UnknownOutcome, UNKNOWN_OUTCOME)
+
+
+def _has_marker(error: BaseException | None, kind: type[BaseException], marker: bytes) -> bool:
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, kind):
+            return True
+        if isinstance(error, HandlerError | HubError) and _details_bytes(error.details) == marker:
+            return True
+        if isinstance(error, BaseExceptionGroup) and any(_has_marker(part, kind, marker) for part in error.exceptions):
+            return True
+        error = error.__cause__
+    return False
+
+
+def _details_bytes(details: object) -> bytes:
+    if details is None:
+        return b""
+    if isinstance(details, bytes):
+        return details.strip()
+    if isinstance(details, str):
+        return details.encode().strip()
+    try:
+        return json.dumps(details, separators=(",", ":")).encode().strip()
+    except Exception:
+        return b""
 
 
 class HubError(SnodraError):
@@ -148,6 +213,12 @@ def error_to_wire(request_id: str, exc: BaseException, codec: "Codec") -> hub_pb
         code, message = ErrorCode.PERMISSION_DENIED, text or "access denied"
     elif isinstance(exc, InvalidRequest):
         code, message = ErrorCode.INVALID_REQUEST, text or "invalid request"
+    elif is_retryable(exc):
+        message = text or "the external call failed and may be retried"
+        details = RETRYABLE
+    elif is_unknown_outcome(exc):
+        message = text or "the outcome of the external call is unknown"
+        details = UNKNOWN_OUTCOME
     elif isinstance(exc, HandlerError):
         message = text
         details = _encode_details(codec, exc.details) if exc.details is not None else b""

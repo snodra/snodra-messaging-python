@@ -34,8 +34,12 @@ from snodra._errors import (
     PermissionDenied,
     RegistrationClosed,
     ReservedHeader,
+    Retryable,
     SnodraError,
     Unauthenticated,
+    UnknownOutcome,
+    is_retryable,
+    is_unknown_outcome,
 )
 from snodra._eventstore import (
     FIRST_ASSIGNMENT_WITHIN,
@@ -72,6 +76,7 @@ from snodra._eventstore import (
     segment_order,
 )
 from snodra._eventstore_memory import MemoryEventStore
+from snodra._external import IDEMPOTENCY_KEY_HEADER
 from snodra._gather import Gathered, Part
 from snodra._identity import Caller, Guard, authenticated, caller_matches, role
 from snodra._messages import message_type
@@ -151,6 +156,7 @@ __version__: str = version("snodra-messaging")
 
 __all__ = [
     "FIRST_ASSIGNMENT_WITHIN",
+    "IDEMPOTENCY_KEY_HEADER",
     "MAX_ERROR_MESSAGE_CHARS",
     "MAX_PAYLOAD_DEPTH",
     "MAX_POSITION_BYTES",
@@ -238,6 +244,7 @@ __all__ = [
     "ResetContext",
     "ResetTarget",
     "RetryPolicy",
+    "Retryable",
     "Revoked",
     "SagaCommandFailed",
     "SagaContext",
@@ -269,6 +276,7 @@ __all__ = [
     "Transactions",
     "Tx",
     "Unauthenticated",
+    "UnknownOutcome",
     "Unsupported",
     "Updates",
     "__version__",
@@ -280,6 +288,8 @@ __all__ = [
     "current_message",
     "current_transaction",
     "dead_letter_source",
+    "is_retryable",
+    "is_unknown_outcome",
     "letter_id",
     "message_type",
     "now_ms",

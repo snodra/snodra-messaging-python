@@ -14,6 +14,7 @@ snodra/_errors.py
 snodra/_events.py
 snodra/_eventstore.py
 snodra/_eventstore_memory.py
+snodra/_external.py
 snodra/_gather.py
 snodra/_http.py
 snodra/_hubpb/__init__.py

@@ -44,6 +44,11 @@ class Handler:
     subscription: bool = False
     """A subscription query handler: an async function answering the initial result, whose query type is served in mode
     ``SUBSCRIPTION``."""
+    idempotent: bool = False
+    """An idempotent command handler: its call is recorded in the message store's external calls under the request's
+    ``idempotency-key`` header."""
+    partner_idempotent: bool = False
+    """The partner de-duplicates by the idempotency key: a lapsed call is taken over rather than given up as unknown."""
 
 
 def label_of(fn: object) -> str:
@@ -72,6 +77,8 @@ class Registry:
         shared: bool = False,
         stream: bool = False,
         subscription: bool = False,
+        idempotent: bool = False,
+        partner_idempotent: bool = False,
     ) -> Handler:
         """Registers fn as the kind's handler of the type its first parameter is annotated with, for the callers
         guard lets through; a shared query type when shared, a streaming query handler when stream (an async generator
@@ -104,13 +111,33 @@ class Registry:
             raise TypeError(f"handler {label}: type {name} already has the {kind} handler {taken.label}")
         if shared and kind != "query":
             raise TypeError(f"handler {label}: a command type is never shared")
-        handler = Handler(typing.cast("HandlerFn", fn), message, name, kind, label, guard, shared, stream, subscription)
+        if idempotent and kind != "command":
+            raise TypeError(f"handler {label}: only a command handler is idempotent")
+        if partner_idempotent and not idempotent:
+            raise TypeError(f"handler {label}: external_idempotent applies to idempotent command handlers only")
+        handler = Handler(
+            typing.cast("HandlerFn", fn),
+            message,
+            name,
+            kind,
+            label,
+            guard,
+            shared,
+            stream,
+            subscription,
+            idempotent,
+            partner_idempotent,
+        )
         self._handlers[kind][name] = handler
         return handler
 
     def find(self, kind: Kind, type_: str) -> Handler | None:
         """The kind's handler of a type; None when there is none."""
         return self._handlers[kind].get(type_)
+
+    def idempotent_handlers(self) -> list[Handler]:
+        """The idempotent command handlers, in registration order."""
+        return [handler for handler in self._handlers["command"].values() if handler.idempotent]
 
     def types(self, kind: Kind) -> list[str]:
         """The kind's types that are not shared, sorted: ``Register.command_types`` or ``Register.query_types``."""

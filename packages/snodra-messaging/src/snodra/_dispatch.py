@@ -11,12 +11,12 @@ from collections.abc import AsyncIterator
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Final, Protocol, cast
+from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 
 from snodra import _traceparent
 from snodra._codec import Codec
 from snodra._context import _CALLER, _CURRENT, MessageInfo
-from snodra._errors import DecodeError, ErrorCode, Unauthenticated, error_to_wire
+from snodra._errors import DecodeError, ErrorCode, HandlerError, Unauthenticated, error_to_wire
 from snodra._hubpb import hub_pb2
 from snodra._identity import AUTHORIZATION, Caller, IdentityResolver
 from snodra._permits import PermitLedger
@@ -25,6 +25,9 @@ from snodra._stream_handler import StreamCredit, end_of_stream, failure, serve
 from snodra._subscription_handler import ServedSubscription, Subscriptions
 from snodra._telemetry import Handling, Telemetry
 from snodra._timings import Timings
+
+if TYPE_CHECKING:
+    from snodra._external import IdempotentAdapter
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +122,8 @@ class Dispatcher:
         self._timers: set[asyncio.Task[None]] = set()
         self._closed = False
         """Set by :meth:`abandon`: no permit timer is armed any more (the shutdown is under way)."""
+        self.external: IdempotentAdapter | None = None
+        """The idempotent external-call adapter, set by the app; None before the app wires it."""
 
     @property
     def subscriptions(self) -> Subscriptions:
@@ -414,8 +419,15 @@ class Dispatcher:
         cm = self._telemetry.handling(_handling_of(request)) if self._telemetry is not None else nullcontext()
         try:
             with cm:
-                result: Any = await handler.fn(message)
-                payload = self._codec.encode(result)
+                if handler.idempotent:
+                    if self.external is None:
+                        raise HandlerError(
+                            f"the idempotent command {handler.label} needs the message store's external calls port"
+                        )
+                    payload = await self.external.call(handler, message)
+                else:
+                    result: Any = await handler.fn(message)
+                    payload = self._codec.encode(result)
         except asyncio.CancelledError as e:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
