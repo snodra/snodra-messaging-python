@@ -23,6 +23,9 @@ this module mark its handlers, and its fields are the state persisted as JSON af
         @saga_command_failed
         async def failed(self, event: SagaCommandFailed, ctx: SagaContext) -> None: ...
 
+Postponed annotations (``from __future__ import annotations``) are resolved from the handler's module, so a handler
+written ``ctx: snodra.SagaContext`` registers like one that imported ``SagaContext`` directly.
+
 Handlers never send or publish directly: :meth:`SagaContext.send`, :meth:`~SagaContext.publish` and
 :meth:`~SagaContext.schedule` record messages and deadlines in the saga's transaction, and the runtime's relay sends
 them after the commit, in order, under the saga's lease. See
@@ -245,12 +248,21 @@ def _plain_state(instance: object) -> dict[str, object]:
     values: dict[str, object] = {}
     for cls in reversed(type(instance).__mro__):
         for name, annotation in getattr(cls, "__annotations__", {}).items():
-            if get_origin(annotation) is ClassVar:
+            if _is_classvar(annotation):
                 continue
             if hasattr(instance, name):
                 values[name] = getattr(instance, name)
     values.update(vars(instance))
     return values
+
+
+def _is_classvar(annotation: object) -> bool:
+    if get_origin(annotation) is ClassVar:
+        return True
+    if not isinstance(annotation, str):
+        return False
+    text = annotation.strip()
+    return text in ("ClassVar", "typing.ClassVar") or text.startswith(("ClassVar[", "typing.ClassVar["))
 
 
 def _json_default(value: object) -> object:
@@ -392,7 +404,7 @@ def _definition(cls: type, name: str | None) -> SagaDefinition:
 
 
 def _event_binding(label: str, fn: Callable[..., Awaitable[Any]], metadata: dict[str, object]) -> SagaEventBinding:
-    hints = _hints(label, fn)
+    hints = _hints(fn)
     parameters = list(inspect.signature(fn).parameters.values())[1:]
     if not parameters:
         raise SagaError(f"saga handler {label}: it needs the event as its first parameter")
@@ -416,7 +428,7 @@ def _event_binding(label: str, fn: Callable[..., Awaitable[Any]], metadata: dict
         raise SagaError(f"saga handler {label}: the event {event_type.__qualname__} has no field {association_name!r}")
     if header is not None and not isinstance(header, str):
         raise SagaError(f"saga handler {label}: a header association is text")
-    _check_context_parameters(label, parameters[1:])
+    _check_context_parameters(label, parameters[1:], hints)
     return SagaEventBinding(
         fn=fn,
         message=event_type,
@@ -435,17 +447,17 @@ def _event_binding(label: str, fn: Callable[..., Awaitable[Any]], metadata: dict
 def _deadline_binding(
     label: str, fn: Callable[..., Awaitable[Any]], metadata: dict[str, object]
 ) -> SagaDeadlineBinding:
-    hints = _hints(label, fn)
+    hints = _hints(fn)
     parameters = list(inspect.signature(fn).parameters.values())[1:]
     payload_type: type | None = None
     if parameters:
         first = parameters[0]
         annotation = hints.get(first.name, first.annotation)
-        if annotation is not SagaContext and annotation != "SagaContext":
+        if not _is_context(annotation):
             if not isinstance(annotation, type) and get_origin(annotation) is None:
                 raise SagaError(f"saga handler {label}: its first parameter must be a payload class or SagaContext")
             payload_type = annotation
-        _check_context_parameters(label, parameters[1:] if payload_type is not None else parameters)
+        _check_context_parameters(label, parameters[1:] if payload_type is not None else parameters, hints)
     return SagaDeadlineBinding(
         fn=fn, name=str(metadata["name"]), end=bool(metadata.get("end")), payload_type=payload_type, label=label
     )
@@ -457,19 +469,46 @@ def _has_field(cls: type, name: str) -> bool:
     return hasattr(cls, name)
 
 
-def _hints(label: str, fn: Callable[..., Awaitable[Any]]) -> dict[str, Any]:
+def _hints(fn: Callable[..., Awaitable[Any]]) -> dict[str, Any]:
+    """The handler's annotations, resolved when possible.
+
+    ``get_type_hints`` reads postponed annotations from the handler's module globals. When one annotation cannot be
+    resolved (a local import or a forward reference), each raw string is resolved on its own with the same globals and
+    kept as it is when it still cannot be read; the checks below can then recognize a directly imported ``SagaContext``.
+    """
     try:
         return get_type_hints(fn)
-    except Exception as error:
-        raise SagaError(f"saga handler {label}: its annotations cannot be read: {error}") from error
+    except Exception:
+        pass
+    globals_ = getattr(fn, "__globals__", {})
+    resolved: dict[str, Any] = {}
+    for name, annotation in getattr(fn, "__annotations__", {}).items():
+        if isinstance(annotation, str):
+            try:
+                resolved[name] = eval(annotation, dict(globals_))  # an annotation, evaluated as typing does
+            except Exception:
+                resolved[name] = annotation
+        else:
+            resolved[name] = annotation
+    return resolved
 
 
-def _check_context_parameters(label: str, parameters: Sequence[inspect.Parameter]) -> None:
+def _is_context(annotation: object) -> bool:
+    """Whether an annotation is a ``SagaContext`` (also as a postponed string), or ``Any``."""
+    if annotation is SagaContext or annotation is Any:
+        return True
+    if isinstance(annotation, str):
+        text = annotation.strip()
+        return text in ("SagaContext", "Any") or text.endswith((".SagaContext", ".Any"))
+    return False
+
+
+def _check_context_parameters(label: str, parameters: Sequence[inspect.Parameter], hints: dict[str, Any]) -> None:
     for parameter in parameters:
         if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             raise SagaError(f"saga handler {label}: it takes no *args or **kwargs")
-        annotation = parameter.annotation
-        if annotation not in (SagaContext, "SagaContext", Any):
+        annotation = hints.get(parameter.name, parameter.annotation)
+        if not _is_context(annotation):
             raise SagaError(f"saga handler {label}: parameter {parameter.name!r} must be a SagaContext")
 
 

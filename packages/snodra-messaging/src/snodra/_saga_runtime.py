@@ -478,7 +478,7 @@ class SagaRuntime:
             if handler.payload_type is not None and claimed.payload is not None:
                 payload = self._codec.decode(claimed.payload.encode(), handler.payload_type)
             with saga_handling():
-                await _call_deadline(handler.fn, instance, payload, context)
+                await _call_deadline(handler.fn, instance, payload, context, handler.payload_type)
             if handler.end:
                 context.end()
             planned = await self._plan(definition, document, instance, context, now)
@@ -548,6 +548,7 @@ async def _call_deadline(
     instance: object,
     payload: object | None,
     context: SagaContext,
+    payload_type: type | None,
 ) -> None:
     import inspect
 
@@ -555,9 +556,8 @@ async def _call_deadline(
     if len(parameters) >= 2:
         await fn(instance, payload, context)
     elif len(parameters) == 1:
-        # One parameter: either the payload or the context; the annotation decided which at registration.
-        annotation = parameters[0].annotation
-        if annotation is SagaContext or annotation == "SagaContext":
+        # One parameter is the payload or the context; registration decided that from the (resolved) annotation.
+        if payload_type is None:
             await fn(instance, context)
         else:
             await fn(instance, payload)
