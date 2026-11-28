@@ -360,6 +360,7 @@ class SagaStateReply:
     state: dict[str, object] | None = None
     version: int = 0
     ended: bool = False
+    live: int = 0
     associations: tuple[SagaAssociationView, ...] = ()
 
 
@@ -428,7 +429,6 @@ class SagaNoticeRequest:
     family: str
     run: str
     saga_id: str
-    notice_id: str
 
 
 @dataclass(frozen=True, slots=True)

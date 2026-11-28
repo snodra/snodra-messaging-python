@@ -42,8 +42,11 @@ and schedules `saga-timeout`, an advanced handler that records a slow command or
 fails with `INVALID`, a deadline handler and the local `SagaCommandFailed` handler. The same state
 fields and wire names are used in both languages, so a saga Python starts is continued by Go and the
 reverse. The slow command's handler tells the driver (`store.runner.SlowStarted`) which language ran
-it; the notice handler is ordinary (local dispatch); a raw subscription to the family source records
-any published `snodra.SagaCommandFailed` (there must be none).
+it and keeps the send in flight until the driver answers, so the relay holds the dispatch lease for
+the driver's probe. `SagaState` also returns the saga's version and live-instance count; a release is
+verified with a witness claim. The notice handler is ordinary (local dispatch); a raw subscription
+to the family source counts every published `snodra.SagaCommandFailed` for the saga (there must be
+none).
 
 The probe observes the library's processed-event markers by wrapping the message store's processed
 port; the consumer, its transaction and the relay are the library's. The harness starts and stops the

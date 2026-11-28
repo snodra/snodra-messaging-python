@@ -374,11 +374,12 @@ class Probe:
                 self.started_by = probe.settings.language
                 self.deadline_scheduled_by = probe.settings.language
                 ctx.associate_with(SAGA_ASSOCIATION_KEY, event.order_id)
-                ctx.schedule(
-                    2.0,
-                    SAGA_DEADLINE_NAME,
-                    SagaDeadlinePayload(order_id=event.order_id, run=event.run, family=event.family),
-                )
+                if event.mode == "deadline":
+                    ctx.schedule(
+                        2.0,
+                        SAGA_DEADLINE_NAME,
+                        SagaDeadlinePayload(order_id=event.order_id, run=event.run, family=event.family),
+                    )
                 log.info(
                     "the probe started a saga %s (order %s, mode %s, language %s)",
                     ctx.saga_id,
@@ -447,10 +448,11 @@ class Probe:
 
         @app.command_handler
         async def saga_slow(command: SagaSlow) -> SagaSlowReply:
+            # The driver answers this send only after it probed the lease from the other language:
+            # the command stays in flight, and the relay holds the saga's lease, until then.
             await self.app.send(
                 SagaSlowStarted(saga_id=command.saga_id, order_id=command.order_id, language=probe.settings.language)
             )
-            await asyncio.sleep(3.0)
             return SagaSlowReply()
 
         @app.command_handler
@@ -501,13 +503,16 @@ class Probe:
             self._check(request.family, request.run)
             if not request.type:
                 raise snodra.InvalidRequest("type is required")
+            live = 0
             if request.saga_id:
                 saga = await self.store.sagas.sagas.find_by_id(request.saga_id)
+                live = 1 if saga is not None and not saga.ended else 0
             else:
-                live = await self.store.sagas.sagas.find_live(request.type, request.key, request.value)
-                saga = live[0] if live else None
+                found = await self.store.sagas.sagas.find_live(request.type, request.key, request.value)
+                live = len(found)
+                saga = found[0] if found else None
             if saga is None:
-                return SagaStateReply(instance=self.instance, found=False)
+                return SagaStateReply(instance=self.instance, found=False, live=live)
             return SagaStateReply(
                 instance=self.instance,
                 found=True,
@@ -516,6 +521,7 @@ class Probe:
                 state=json.loads(saga.state),
                 version=saga.version,
                 ended=saga.ended,
+                live=live,
                 associations=tuple(
                     SagaAssociationView(key=association.key, value=association.value)
                     for association in saga.associations
@@ -558,8 +564,16 @@ class Probe:
             self._check(request.family, request.run)
             if not request.saga_id or not request.owner:
                 raise snodra.InvalidRequest("sagaId and owner are required")
-            await self.store.sagas.dispatch.release_lease(request.saga_id, request.owner)
-            return SagaReleaseReply(instance=self.instance, released=True)
+            dispatch = self.store.sagas.dispatch
+            await dispatch.release_lease(request.saga_id, request.owner)
+            # release_lease has no result: claim with a witness, which succeeds only when the
+            # release actually freed the lease, and release the witness again.
+            witness = f"{request.owner}-witness"
+            now_ms = int(time.time() * 1000)
+            taken = await dispatch.claim_lease(request.saga_id, witness, now_ms, now_ms + 5_000)
+            if taken:
+                await dispatch.release_lease(request.saga_id, witness)
+            return SagaReleaseReply(instance=self.instance, released=taken)
 
         @app.command_handler
         async def saga_notice(request: SagaNoticeRequest) -> SagaNoticeReply:
@@ -568,7 +582,7 @@ class Probe:
                 instance=self.instance,
                 language=self.settings.language,
                 ordinary=self._notices.get(request.saga_id, 0),
-                published=self._notice_watch.get(request.notice_id, 0),
+                published=self._notice_watch.get(request.saga_id, 0),
             )
 
     def _fail_if_poison(self, event: OrderPlaced) -> None:
@@ -660,8 +674,13 @@ class Probe:
             if not isinstance(event, snodra.Delivery):
                 continue
             if event.headers.get(EventHeaders.TYPE) == SAGA_COMMAND_FAILED_TYPE:
-                event_id = event.headers.get(EventHeaders.ID, "")
-                self._notice_watch[event_id] = self._notice_watch.get(event_id, 0) + 1
+                try:
+                    notice = json.loads(event.payload)
+                except ValueError:
+                    notice = {}
+                saga_id = notice.get("sagaId") if isinstance(notice, dict) else None
+                if isinstance(saga_id, str) and saga_id:
+                    self._notice_watch[saga_id] = self._notice_watch.get(saga_id, 0) + 1
             await sub.ack(event.segment, event.position)
 
     async def _stop_notice_watch(self) -> None:
