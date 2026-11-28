@@ -10,10 +10,11 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import snodra
-from snodra import EventHeaders, OutboxEntry, OutgoingEvent
+from snodra import EventHeaders, OutboxEntry, OutgoingEvent, SagaCommandFailed, SagaContext
 from snodra_kafka import KafkaConfig, KafkaEventStore
 from snodra_mongo import MongoConfig, MongoStore
 from snodra_rabbitmq import RabbitMQConfig, RabbitMQEventStore
@@ -21,6 +22,13 @@ from snodra_sql import DRIVER_MYSQL, DRIVER_POSTGRES, SqlConfig, SqlStore
 
 from store_interop.ledger import Ledger
 from store_interop.messages import (
+    SAGA_ADVANCED_TYPE,
+    SAGA_ASSOCIATION_KEY,
+    SAGA_COMMAND_FAILED_TYPE,
+    SAGA_DEADLINE_NAME,
+    SAGA_FAIL_TYPE,
+    SAGA_STARTED_TYPE,
+    SAGA_TYPE,
     Allow,
     AllowReply,
     ControlReply,
@@ -34,6 +42,27 @@ from store_interop.messages import (
     PublishRaw,
     PublishRawReply,
     PublishReply,
+    SagaAdvanced,
+    SagaAssociationView,
+    SagaDeadlinePayload,
+    SagaDispatchReply,
+    SagaDispatchRequest,
+    SagaFail,
+    SagaFailReply,
+    SagaLeaseReply,
+    SagaLeaseRequest,
+    SagaNoticeReply,
+    SagaNoticeRequest,
+    SagaPublish,
+    SagaPublishReply,
+    SagaReleaseReply,
+    SagaReleaseRequest,
+    SagaSlow,
+    SagaSlowReply,
+    SagaSlowStarted,
+    SagaStarted,
+    SagaStateReply,
+    SagaStateRequest,
     State,
     StateReply,
     Who,
@@ -87,9 +116,13 @@ class Probe:
         self._seq = itertools.count(1)
         self._opted_out = 0
         self._allowed: set[str] = set()
+        self._notices: dict[str, int] = {}
         self._dlt: list[DltEvent] = []
         self._dlt_sub: snodra.EventStoreSubscription | None = None
         self._dlt_task: asyncio.Task[None] | None = None
+        self._notice_watch: dict[str, int] = {}
+        self._notice_sub: snodra.EventStoreSubscription | None = None
+        self._notice_task: asyncio.Task[None] | None = None
         self._register()
 
     @property
@@ -307,6 +340,237 @@ class Probe:
                 len(reset.ranges),
             )
 
+        probe = self
+
+        @app.saga(SAGA_TYPE)
+        @dataclass
+        class InteropSaga:
+            """The shared saga: both languages register the same type and state fields."""
+
+            order_id: str = ""
+            run: str = ""
+            family: str = ""
+            mode: str = ""
+            started_by: str = ""
+            advanced_by: str = ""
+            advances: int = 0
+            deadline_scheduled_by: str = ""
+            deadline_fired: bool = False
+            deadline_fired_by: str = ""
+            slow_recorded_by: str = ""
+            notice_by: str = ""
+            notice_reason: str = ""
+            notice_command_type: str = ""
+            notice_key: str = ""
+            notice_message: str = ""
+            notices: int = 0
+
+            @snodra.saga_start("order_id", key=SAGA_ASSOCIATION_KEY)
+            async def started(self, event: SagaStarted, ctx: SagaContext) -> None:
+                self.order_id = event.order_id
+                self.run = event.run
+                self.family = event.family
+                self.mode = event.mode
+                self.started_by = probe.settings.language
+                self.deadline_scheduled_by = probe.settings.language
+                ctx.associate_with(SAGA_ASSOCIATION_KEY, event.order_id)
+                ctx.schedule(
+                    2.0,
+                    SAGA_DEADLINE_NAME,
+                    SagaDeadlinePayload(order_id=event.order_id, run=event.run, family=event.family),
+                )
+                log.info(
+                    "the probe started a saga %s (order %s, mode %s, language %s)",
+                    ctx.saga_id,
+                    event.order_id,
+                    event.mode,
+                    probe.settings.language,
+                )
+
+            @snodra.saga_event("order_id", key=SAGA_ASSOCIATION_KEY)
+            async def advanced(self, event: SagaAdvanced, ctx: SagaContext) -> None:
+                self.advanced_by = probe.settings.language
+                self.advances += 1
+                log.info(
+                    "the probe continued a saga %s (order %s, mode %s, language %s)",
+                    ctx.saga_id,
+                    event.order_id,
+                    event.mode,
+                    probe.settings.language,
+                )
+                if event.mode == "lease":
+                    self.slow_recorded_by = probe.settings.language
+                    ctx.send(SagaSlow(saga_id=ctx.saga_id, order_id=event.order_id))
+                elif event.mode == "notice":
+                    self.notice_command_type = SAGA_FAIL_TYPE
+                    ctx.send(SagaFail(saga_id=ctx.saga_id, order_id=event.order_id))
+
+            @snodra.saga_deadline(SAGA_DEADLINE_NAME)
+            async def timed_out(self, payload: SagaDeadlinePayload, ctx: SagaContext) -> None:
+                self.deadline_fired = True
+                self.deadline_fired_by = probe.settings.language
+                log.info(
+                    "the probe fired a saga deadline %s (order %s, language %s)",
+                    ctx.saga_id,
+                    payload.order_id,
+                    probe.settings.language,
+                )
+
+            @snodra.saga_command_failed
+            async def failed(self, event: SagaCommandFailed, ctx: SagaContext) -> None:
+                self.notice_by = probe.settings.language
+                self.notice_reason = event.reason
+                self.notice_command_type = event.command_type
+                self.notice_key = event.idempotency_key
+                self.notice_message = event.message
+                self.notices += 1
+                log.info(
+                    "the probe's saga received a command failure %s (%s, language %s)",
+                    ctx.saga_id,
+                    event.reason,
+                    probe.settings.language,
+                )
+
+        @app.event_handler
+        async def on_notice(event: SagaCommandFailed) -> None:
+            self._notices[event.saga_id] = self._notices.get(event.saga_id, 0) + 1
+            log.info(
+                "the probe's ordinary notice handler ran (saga %s, reason %s, language %s)",
+                event.saga_id,
+                event.reason,
+                probe.settings.language,
+            )
+
+        @app.command_handler
+        async def saga_fail(command: SagaFail) -> SagaFailReply:
+            raise snodra.InvalidRequest("the saga fail command fails on purpose")
+
+        @app.command_handler
+        async def saga_slow(command: SagaSlow) -> SagaSlowReply:
+            await self.app.send(
+                SagaSlowStarted(saga_id=command.saga_id, order_id=command.order_id, language=probe.settings.language)
+            )
+            await asyncio.sleep(3.0)
+            return SagaSlowReply()
+
+        @app.command_handler
+        async def saga_publish(command: SagaPublish) -> SagaPublishReply:
+            self._check(command.family, command.run)
+            if not command.id or not command.key or not command.order_id:
+                raise snodra.InvalidRequest("id, key and orderId are required")
+            if command.kind == "started":
+                type_name = SAGA_STARTED_TYPE
+                payload = {
+                    "orderId": command.order_id,
+                    "run": self.settings.run,
+                    "family": self.family.name,
+                    "mode": command.mode,
+                }
+            elif command.kind == "advanced":
+                type_name = SAGA_ADVANCED_TYPE
+                payload = {
+                    "orderId": command.order_id,
+                    "run": self.settings.run,
+                    "family": self.family.name,
+                    "mode": command.mode,
+                }
+            else:
+                raise snodra.InvalidRequest("kind is started or advanced")
+            headers = {
+                EventHeaders.TYPE: type_name,
+                EventHeaders.ID: command.id,
+                EventHeaders.CORRELATION_ID: command.id,
+                EventHeaders.TIMESTAMP: _now_text(),
+                EventHeaders.SOURCE: SERVICE,
+                EventHeaders.USER_ID: "",
+            }
+            await self.event_store.publish(
+                OutgoingEvent(
+                    source=source_name(self.settings.run, self.family.name),
+                    id=command.id,
+                    type_name=type_name,
+                    key=command.key,
+                    headers=headers,
+                    payload=json.dumps(payload).encode(),
+                )
+            )
+            return SagaPublishReply(instance=self.instance, published=command.id)
+
+        @app.command_handler
+        async def saga_state(request: SagaStateRequest) -> SagaStateReply:
+            self._check(request.family, request.run)
+            if not request.type:
+                raise snodra.InvalidRequest("type is required")
+            if request.saga_id:
+                saga = await self.store.sagas.sagas.find_by_id(request.saga_id)
+            else:
+                live = await self.store.sagas.sagas.find_live(request.type, request.key, request.value)
+                saga = live[0] if live else None
+            if saga is None:
+                return SagaStateReply(instance=self.instance, found=False)
+            return SagaStateReply(
+                instance=self.instance,
+                found=True,
+                saga_id=saga.id,
+                type=saga.type_name,
+                state=json.loads(saga.state),
+                version=saga.version,
+                ended=saga.ended,
+                associations=tuple(
+                    SagaAssociationView(key=association.key, value=association.value)
+                    for association in saga.associations
+                ),
+            )
+
+        @app.command_handler
+        async def saga_dispatch(request: SagaDispatchRequest) -> SagaDispatchReply:
+            self._check(request.family, request.run)
+            if not request.saga_id:
+                raise snodra.InvalidRequest("sagaId is required")
+            dispatch = self.store.sagas.dispatch
+            entry = await dispatch.next_pending(request.saga_id)
+            pending = await dispatch.pending()
+            if entry is None:
+                return SagaDispatchReply(instance=self.instance, pending=False, pending_count=pending)
+            return SagaDispatchReply(
+                instance=self.instance,
+                pending=True,
+                entry_id=entry.id,
+                seq=entry.seq,
+                kind=str(entry.kind),
+                type=entry.type_name,
+                attempts=entry.attempts,
+                pending_count=pending,
+            )
+
+        @app.command_handler
+        async def saga_lease(request: SagaLeaseRequest) -> SagaLeaseReply:
+            self._check(request.family, request.run)
+            if not request.saga_id or not request.owner or request.until_ms <= 0:
+                raise snodra.InvalidRequest("sagaId, owner and untilMs are required")
+            taken = await self.store.sagas.dispatch.claim_lease(
+                request.saga_id, request.owner, int(time.time() * 1000), request.until_ms
+            )
+            return SagaLeaseReply(instance=self.instance, taken=taken)
+
+        @app.command_handler
+        async def saga_release(request: SagaReleaseRequest) -> SagaReleaseReply:
+            self._check(request.family, request.run)
+            if not request.saga_id or not request.owner:
+                raise snodra.InvalidRequest("sagaId and owner are required")
+            await self.store.sagas.dispatch.release_lease(request.saga_id, request.owner)
+            return SagaReleaseReply(instance=self.instance, released=True)
+
+        @app.command_handler
+        async def saga_notice(request: SagaNoticeRequest) -> SagaNoticeReply:
+            self._check(request.family, request.run)
+            return SagaNoticeReply(
+                instance=self.instance,
+                language=self.settings.language,
+                ordinary=self._notices.get(request.saga_id, 0),
+                published=self._notice_watch.get(request.notice_id, 0),
+            )
+
     def _fail_if_poison(self, event: OrderPlaced) -> None:
         """A poison event fails until the driver allows its id on this instance."""
         if event.poison and event.id not in self._allowed:
@@ -324,6 +588,7 @@ class Probe:
     async def start(self) -> None:
         await self.app.start()
         await self._start_dlt()
+        await self._start_notice_watch()
         log.info("the %s probe (instance %s) started", self.family.name, self.instance)
 
     async def stop(self) -> None:
@@ -331,6 +596,7 @@ class Probe:
             await self.app.shutdown(timeout=SHUTDOWN_BUDGET)
         finally:
             await self._stop_dlt()
+            await self._stop_notice_watch()
             await self.close()
 
     async def close(self) -> None:
@@ -372,6 +638,43 @@ class Probe:
                 )
             )
             await sub.ack(event.segment, event.position)
+
+    async def _start_notice_watch(self) -> None:
+        """Read the family source as a raw subscription and record a published SagaCommandFailed."""
+        self._notice_sub = await self.event_store.subscribe(
+            snodra.SubscriptionSpec(
+                name=f"{SERVICE}.interop-{self.family.name}-notice-{self.settings.language}",
+                source=source_name(self.settings.run, self.family.name),
+            )
+        )
+        self._notice_task = asyncio.create_task(
+            self._drain_notice(), name=f"snodra:store-interop-notice:{self.family.name}"
+        )
+
+    async def _drain_notice(self) -> None:
+        sub = self._notice_sub
+        if sub is None:  # pragma: no cover - started before the task
+            return
+        while True:
+            event = await sub.next()
+            if not isinstance(event, snodra.Delivery):
+                continue
+            if event.headers.get(EventHeaders.TYPE) == SAGA_COMMAND_FAILED_TYPE:
+                event_id = event.headers.get(EventHeaders.ID, "")
+                self._notice_watch[event_id] = self._notice_watch.get(event_id, 0) + 1
+            await sub.ack(event.segment, event.position)
+
+    async def _stop_notice_watch(self) -> None:
+        task = self._notice_task
+        sub = self._notice_sub
+        self._notice_task = None
+        self._notice_sub = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if sub is not None:
+            await sub.close()
 
     async def _stop_dlt(self) -> None:
         task = self._dlt_task
