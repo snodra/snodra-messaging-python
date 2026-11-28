@@ -5,7 +5,8 @@
 <h1 align="center">Snodra Messaging (Python)</h1>
 
 <p align="center">
-  Commands, queries, events, streams, scatter-gathers and subscriptions for asyncio services, routed by Snodra Server.
+  Commands, queries, events, streams, scatter-gathers, subscriptions, sagas and idempotent external calls for asyncio
+  services, routed by Snodra Server.
 </p>
 
 <p align="center">
@@ -44,6 +45,19 @@ retries and timeouts.
   store declares `native-dead-letter`), or logs it and moves on in `log`.
   `Settings.dead_letter_retention` (`SNODRA_EVENTS_DEAD_LETTER_RETENTION_MS`, 30 days by default) is how long a
   collected letter is kept.
+- **Sagas**: `@app.saga("payment")` classes with `@saga_start`, `@saga_event` and `@saga_command_failed` handlers,
+  associations, a start key that keeps one live instance per order, an optimistic state version and parked failures.
+  A handler records through `SagaContext` (`send`, `publish`, `associate_with`, `end`) inside the saga's
+  transaction; a relay dispatches each saga's commands and events after it commits, in order under the saga's lease.
+  A command the relay gives up on comes back as the local `SagaCommandFailed` notice.
+- **Saga deadlines**: `ctx.schedule(...)` records a deadline and returns its id; `ctx.cancel_deadline(id)` and
+  `ctx.cancel_deadlines(name)` cancel one or every deadline of a name, and `@saga_deadline("charge-timeout", end=True)`
+  handles it. A leased scheduler claims each due deadline, runs its handler and marks it fired in one transaction.
+- **Idempotent external calls**: `@app.idempotent_command_handler` records each call in `external_calls` under the
+  `idempotency-key` header before the body runs: the first call wins, a repeat after success returns the first reply,
+  a permanent failure is replayed, and a lapsed call is given up as unknown (or taken over with
+  `external_idempotent=True`). `Retryable` and `UnknownOutcome` write the two reserved `Error.details` markers, which
+  `is_retryable` and `is_unknown_outcome` read locally and from a hub; the saga relay owns the backoff.
 - **Event and message stores**: Kafka or RabbitMQ Streams for events; MongoDB, PostgreSQL or MySQL for the outbox, the
   processed-event markers, the dead letters and the processor control state. Each store is a separate package, selected
   when the service is built.
@@ -52,10 +66,9 @@ retries and timeouts.
   certificate (rolled over to a renewed pair); the caller's token verified against the issuer's keys, and guards on
   handlers.
 - **Telemetry** behind an interface, with an OpenTelemetry implementation in the separate `snodra-messaging-observability` package.
-- **Feature level 3**, proved by the 33 level-1 checks of the conformance runner and by the level-2 and level-3
-  event-store and message-store kits. The saga runtime, the idempotent external-call adapter, the saga and
-  external-call store ports and the level-4 store checks are implemented on `main`; the public level-4 claim waits for
-  the cross-language saga interop and the level-4 documentation and release.
+- **Feature level 4**, proved by the 33 level-1 checks of the conformance runner, by the level-2 to level-4
+  event-store and message-store kits, and by the cross-language interop run: one saga continued across languages on
+  shared stores, with the dispatch lease, deadlines and failure notices.
 
 ## Install
 

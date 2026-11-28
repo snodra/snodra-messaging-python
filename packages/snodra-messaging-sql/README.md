@@ -43,7 +43,7 @@ the variable is empty.
 
 The store implements every message-store port: the outbox, the processed-event markers, the dead letters, the
 processor control state, the external-call records and the saga records. The level-3 and level-4 store checks pass on
-both engines; level 4 is not claimed publicly until the release that publishes it for every library.
+both engines.
 
 ### The transaction is the service's
 

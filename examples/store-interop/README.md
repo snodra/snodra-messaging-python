@@ -53,8 +53,7 @@ port; the consumer, its transaction and the relay are the library's. The harness
 service and creates its topics, streams and databases; it runs with `PYTHON_SRC` or `PYTHON_REF` from
 `interop/run.sh`. `store_interop.topology` is the one-shot init container that creates the RabbitMQ
 super stream and its dead-letter super stream through the stream client the RabbitMQ add-on uses (a
-library never creates streams). The released tags carry the level-3 probe; the saga scenarios need
-`PYTHON_SRC` (and `GO_SRC` for the other language) until a release carries the saga commands.
+library never creates streams). The released tags carry the level-4 probe, the saga commands included.
 
 Tests: `uv run pytest -q examples/store-interop/tests` from the repository root (the settings, the
 ledger and the observed store; no Docker).
