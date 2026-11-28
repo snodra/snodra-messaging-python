@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 import gc
 import uuid
+from dataclasses import replace
 
 import pytest
 from snodra._eventstore import ProcessedMarker
 from snodra._store import (
+    Association,
     Conflict,
     Failed,
     InvalidMessage,
     MessageStore,
     OutboxEntry,
+    SagaDocument,
     Tx,
     bind_transaction,
     current_transaction,
@@ -358,6 +361,72 @@ async def test_a_foreign_transaction_rolls_back_without_failing() -> None:
     tx = await other.begin()
     await store.rollback(tx)
     await other.rollback(tx)
+
+
+async def test_a_revived_saga_cannot_share_its_start_key_with_a_concurrent_insert() -> None:
+    """A live update of an ended saga reserves its start key too: a concurrent insert of the same key cannot make two
+    live instances."""
+    store = MemoryStore()
+    type_name = f"conformance.Revived{uuid.uuid4().hex}"
+    start_key = f"{type_name}|orderId=o-1"
+    now = now_ms()
+    saga = SagaDocument(
+        id=str(uuid.uuid4()),
+        type_name=type_name,
+        state='{"step":0}',
+        associations=(Association("orderId", "o-1"),),
+        start_key=start_key,
+        ended=False,
+        ended_at_ms=None,
+        version=0,
+        created_at_ms=now,
+        updated_at_ms=now,
+    )
+    async with store.transaction():
+        await store.sagas.sagas.insert(saga)
+    ended = replace(saga, ended=True, ended_at_ms=now, version=1, updated_at_ms=now)
+    async with store.transaction():
+        assert await store.sagas.sagas.update(ended, 0)
+    revived = replace(ended, ended=False, ended_at_ms=None, version=2, updated_at_ms=now)
+    inserted = replace(
+        saga,
+        id=str(uuid.uuid4()),
+        state='{"step":"inserted"}',
+        version=0,
+    )
+    first = await store.begin()
+    second = await store.begin()
+    outcomes: list[Exception | None] = [None, None]
+
+    async def revive(tx: Tx) -> object:
+        return await store.sagas.sagas.update(revived, 1, tx=tx)
+
+    async def insert_new(tx: Tx) -> object:
+        await store.sagas.sagas.insert(inserted, tx=tx)
+        return None
+
+    actions = (revive, insert_new)
+    transactions = (first, second)
+    performed = [False, False]
+    for index, (tx, action) in enumerate(zip(transactions, actions, strict=True)):
+        try:
+            await action(tx)
+        except Exception as error:
+            outcomes[index] = error
+            await store.rollback(tx)
+        else:
+            performed[index] = True
+    for index, tx in enumerate(transactions):
+        if not performed[index]:
+            continue
+        try:
+            await store.commit(tx)
+        except Exception as error:
+            outcomes[index] = error
+    assert sum(outcome is None for outcome in outcomes) == 1, f"one operation wins: {outcomes}"
+    assert any(isinstance(outcome, Conflict) for outcome in outcomes), f"the other conflicts: {outcomes}"
+    live = await store.sagas.sagas.find_live(type_name, "orderId", "o-1")
+    assert len(live) == 1, f"one live saga holds the start key: {live}"
 
 
 async def test_the_level_4_ports_are_implemented_with_the_level_3_ones_in_place() -> None:

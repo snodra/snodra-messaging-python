@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from snodra._eventstore_memory import MemoryEventStore
-from snodra._store import InvalidMessage, Locked, OutboxEntry, Tx, Unsupported
+from snodra._store import Conflict, InvalidMessage, Locked, OutboxEntry, SagaDocument, SagaStores, Tx, Unsupported
 from snodra._store_memory import MemoryStore
 from snodra.testing import (
     MESSAGE_STORE_CHECKS,
@@ -21,6 +21,7 @@ from snodra.testing import (
     run_store_conformance,
     run_store_l3_conformance,
     run_store_l4_conformance,
+    two_transactions_starting_one_saga_key_leave_one_live_saga,
 )
 from snodra.testing.store import _checks_for
 
@@ -160,6 +161,55 @@ class NoDeadLettersStore(MemoryStore):
     def __init__(self) -> None:
         super().__init__()
         self.dead_letters = UnsupportedDeadLetters()  # type: ignore[assignment]
+
+
+class _UnreservedSagas:
+    """A saga repository that checks only committed live start keys and never reserves one.
+
+    This is the old memory-store behaviour: a sequential insert-then-commit sees the first live saga and conflicts,
+    but two inserts that both happen before either commit slip through.
+    """
+
+    def __init__(self, store: MemoryStore, inner: object) -> None:
+        self._store = store
+        self._inner = inner
+
+    async def insert(self, saga: SagaDocument, *, tx: Tx | None = None) -> None:
+        if saga.start_key is not None and not saga.ended:
+            for other in self._store._data.sagas.rows.values():
+                if other.id != saga.id and not other.ended and other.start_key == saga.start_key:
+                    raise Conflict(f"a live saga holds the start key {saga.start_key}")
+        inner = self._store.resolve(tx)
+        self._store._write(
+            "sagas",
+            self._store._data.sagas,
+            None if inner is None else inner.sagas,
+            inner,
+            saga.id,
+            saga,
+        )
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class UnreservedStartKeyStore(MemoryStore):
+    """A store whose start key is not reserved, for the start-key check's discrimination test."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sagas = SagaStores(
+            sagas=_UnreservedSagas(self, self.sagas.sagas),  # type: ignore[arg-type]
+            dispatch=self.sagas.dispatch,
+            deadlines=self.sagas.deadlines,
+            failures=self.sagas.failures,
+            markers=self.sagas.markers,
+        )
+
+
+async def test_the_start_key_check_bites_on_a_store_that_does_not_reserve() -> None:
+    with pytest.raises(AssertionError, match="exactly one commits"):
+        await two_transactions_starting_one_saga_key_leave_one_live_saga(UnreservedStartKeyStore())
 
 
 async def test_the_runner_names_a_failing_level_three_check() -> None:

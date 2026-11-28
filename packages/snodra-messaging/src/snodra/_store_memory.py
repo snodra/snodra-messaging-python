@@ -992,8 +992,11 @@ class _Sagas:
             raise Conflict(f"duplicate key: a saga {saga.id} exists")
         if not self._start_key_free(saga, tx):
             raise Conflict(f"a live saga holds the start key {saga.start_key}")
-        if inner is not None and saga.start_key is not None and not saga.ended:
-            self._store._reserve(inner, "saga-start", saga.start_key)
+        if saga.start_key is not None and not saga.ended:
+            if inner is not None:
+                self._store._reserve(inner, "saga-start", saga.start_key)
+            elif ("saga-start", saga.start_key) in self._store._data.reserved:
+                raise Conflict(f"a transaction is starting a saga with the start key {saga.start_key}")
         self._store._write(
             "sagas", self._store._data.sagas, None if inner is None else inner.sagas, inner, saga.id, saga
         )
@@ -1005,8 +1008,11 @@ class _Sagas:
         inner = self._write(tx)
         if not self._start_key_free(saga, tx):
             raise Conflict(f"a live saga holds the start key {saga.start_key}")
-        if inner is not None and saga.start_key is not None and not saga.ended and current.start_key != saga.start_key:
-            self._store._reserve(inner, "saga-start", saga.start_key)
+        if saga.start_key is not None and not saga.ended:
+            if inner is not None:
+                self._store._reserve(inner, "saga-start", saga.start_key)
+            elif ("saga-start", saga.start_key) in self._store._data.reserved:
+                raise Conflict(f"a transaction is starting a saga with the start key {saga.start_key}")
         self._store._write(
             "sagas", self._store._data.sagas, None if inner is None else inner.sagas, inner, saga.id, saga
         )

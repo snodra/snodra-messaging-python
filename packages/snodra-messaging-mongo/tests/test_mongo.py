@@ -13,10 +13,16 @@ import pytest
 from bson import Int64
 from pymongo import AsyncMongoClient
 from snodra import (
+    Association,
     Conflict,
     DeadLetter,
     DeadLetterError,
     DeadLetterReason,
+    DeadlineDocument,
+    DeadlineStatus,
+    DispatchKind,
+    ExternalCall,
+    ExternalCallStatus,
     InvalidMessage,
     Locked,
     MessageStoreFailed,
@@ -24,6 +30,8 @@ from snodra import (
     Parked,
     ProcessedMarker,
     ReplayRange,
+    SagaDispatchDocument,
+    SagaDocument,
     Tx,
     bind_transaction,
     unbind_transaction,
@@ -36,6 +44,11 @@ OUTBOX = "outbox"
 PROCESSED = "processed_events"
 DEAD_LETTERS = "dead_letters"
 CONTROL = "processor_control"
+SAGAS = "sagas"
+DISPATCH = "saga_dispatch"
+LEASES = "saga_dispatch_leases"
+DEADLINES = "deadlines"
+EXTERNAL = "external_calls"
 
 
 class _Rollback(Exception):
@@ -487,6 +500,111 @@ async def test_blank_optional_dead_letter_fields_stay_absent(store: MongoStore) 
     assert found is not None
     assert (found.key, found.event_id, found.event_type, found.blocked_by) == ("", None, None, None)
     assert found.payload == b""
+
+
+async def test_saga_dispatch_deadline_and_external_documents_write_the_layouts_shape(store: MongoStore) -> None:
+    """The raw BSON follows the published layout: Int64 versions and seqs, associations as {k,v}, absent optional
+    fields, the partial unique live startKey index, and the deadline's empty correlation id absent."""
+    now = 1_762_250_000_000
+    saga = SagaDocument(
+        id=str(uuid.uuid4()),
+        type_name="orders.PaymentSaga",
+        state='{"orderId":"order-1"}',
+        associations=(Association("orderId", "order-1"),),
+        start_key=None,
+        ended=False,
+        ended_at_ms=None,
+        version=3,
+        created_at_ms=now,
+        updated_at_ms=now,
+    )
+    async with store.transaction():
+        await store.sagas.sagas.insert(saga)
+    document = await store.database[SAGAS].find_one({"_id": saga.id})
+    assert document is not None
+    assert document["version"] == Int64(3)
+    assert document["associations"] == [{"k": "orderId", "v": "order-1"}]
+    assert "startKey" not in document
+    assert "endedAt" not in document
+    indexes = await store.database[SAGAS].index_information()
+    live_start = indexes["startKey_live_unique"]
+    assert live_start.get("unique") is True
+    assert live_start["partialFilterExpression"] == {"ended": False, "startKey": {"$exists": True}}
+
+    entry = SagaDispatchDocument(
+        id=f"{saga.id}:1000",
+        saga_id=saga.id,
+        seq=1000,
+        kind=DispatchKind.COMMAND,
+        type_name="orders.Charge",
+        payload='{"amount":42}',
+        headers={"correlation-id": "c-1"},
+        routing_key=None,
+        created_at_ms=now,
+    )
+    async with store.transaction():
+        await store.sagas.dispatch.record([entry])
+    dispatch = await store.database[DISPATCH].find_one({"_id": entry.id})
+    assert dispatch is not None
+    assert dispatch["seq"] == Int64(1000)
+    assert dispatch["kind"] == "COMMAND"
+    assert "routingKey" not in dispatch
+    assert "dispatchedAt" not in dispatch
+    assert await store.sagas.dispatch.claim_lease(saga.id, "relay-a", now, now + 1_000)
+    lease = await store.database[LEASES].find_one({"_id": saga.id})
+    assert lease is not None
+    assert lease["owner"] == "relay-a"
+    assert lease["until"] == _at(now + 1_000)
+
+    deadline = DeadlineDocument(
+        id=str(uuid.uuid4()),
+        saga_type=saga.type_name,
+        saga_id=saga.id,
+        name="timeout",
+        payload=None,
+        payload_type=None,
+        due_at_ms=now + 60_000,
+        status=DeadlineStatus.SCHEDULED,
+        claimed_by=None,
+        claimed_until_ms=None,
+        finished_at_ms=None,
+        correlation_id="",
+    )
+    async with store.transaction():
+        await store.sagas.deadlines.insert(deadline)
+    stored = await store.database[DEADLINES].find_one({"_id": deadline.id})
+    assert stored is not None
+    assert "correlationId" not in stored, "an empty correlation id is no field"
+    assert "payload" not in stored
+    assert "payloadType" not in stored
+    assert "claimedBy" not in stored
+    found = await store.sagas.deadlines.find_scheduled(deadline.id)
+    assert found is not None
+    assert found.correlation_id is None
+
+    call = ExternalCall(
+        key=str(uuid.uuid4()),
+        status=ExternalCallStatus.IN_PROGRESS,
+        attempts=1,
+        updated_at_ms=now,
+        lease_until_ms=now + 60_000,
+        owner="caller-1",
+    )
+    assert await store.external.insert(call)
+    external = await store.database[EXTERNAL].find_one({"_id": call.key})
+    assert external is not None
+    assert external["status"] == "IN_PROGRESS"
+    assert external["attempts"] == 1
+    assert external["leaseUntil"] == _at(now + 60_000)
+    assert external["owner"] == "caller-1"
+    assert await store.external.succeed(call.key, "caller-1", '{"ok":true}', now + 1)
+    settled = await store.database[EXTERNAL].find_one({"_id": call.key})
+    assert settled is not None
+    assert settled["status"] == "SUCCEEDED"
+    assert settled["reply"] == '{"ok":true}'
+    assert "leaseUntil" not in settled
+    assert "owner" not in settled
+    assert "error" not in settled
 
 
 async def test_another_stores_transaction_is_refused(store: MongoStore, make_config: Any) -> None:

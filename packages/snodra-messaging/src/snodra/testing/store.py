@@ -71,6 +71,9 @@ from snodra._store import (
 BARRIER_WAIT: Final = 30.0
 """The longest a racing check waits at a barrier for the other task, in seconds."""
 
+START_WAIT: Final = 5.0
+"""The longest a saga start may block on another transaction before the kit calls the store broken, in seconds."""
+
 LONG_LEASE: Final = 60.0
 """The lease of a claim that must not run out while a check runs, in seconds."""
 
@@ -1151,20 +1154,29 @@ async def two_transactions_starting_one_saga_key_leave_one_live_saga(store: Mess
     ]
     first = await store.begin()
     second = await store.begin()
-    outcomes: list[Exception | None] = []
-    for tx, document in ((first, documents[0]), (second, documents[1])):
+    pairs = ((first, documents[0]), (second, documents[1]))
+    outcomes: list[Exception | None] = [None, None]
+    inserted = [False, False]
+    for index, (tx, document) in enumerate(pairs):
         try:
-            await sagas.insert(document, tx=tx)
+            await asyncio.wait_for(sagas.insert(document, tx=tx), START_WAIT)
+        except TimeoutError:
+            await store.rollback(tx)
+            raise AssertionError(f"the start blocked for more than {START_WAIT:g} s") from None
         except Exception as error:
-            outcomes.append(error)
+            outcomes[index] = error
             await store.rollback(tx)
         else:
-            try:
-                await store.commit(tx)
-            except Exception as error:
-                outcomes.append(error)
-            else:
-                outcomes.append(None)
+            inserted[index] = True
+    for index, (tx, _document) in enumerate(pairs):
+        if not inserted[index]:
+            continue
+        try:
+            await asyncio.wait_for(store.commit(tx), START_WAIT)
+        except TimeoutError:
+            raise AssertionError(f"the commit blocked for more than {START_WAIT:g} s") from None
+        except Exception as error:
+            outcomes[index] = error
     wins = [index for index, outcome in enumerate(outcomes) if outcome is None]
     assert len(wins) == 1, f"exactly one commits: {outcomes}"
     lost = outcomes[1 - wins[0]]
