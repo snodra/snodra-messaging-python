@@ -9,8 +9,11 @@ library does there. Where an entry is settled, its behaviour is this library's r
 ### SG-<n>: short title
 
 - **Specification:** what the specification says, or that it is silent.
+- **Settled:** what is now the specification, when the entry is settled.
+- **Other Snodra libraries:** the choice another official library makes, where one exists.
 - **This library:** what the Python code does, and in which file.
 - **Question:** the open question, or "settled".
+- **Wire change:** whether the answer changes the bytes on the hub or the broker.
 
 ## Entries
 
@@ -313,6 +316,9 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **Specification:** `writing-a-library.md` (Level 2, Consume) says a failing handler is "retried with backoff, then the
   record becomes a dead letter (level 3) or, at level 2, is logged and skipped". It names neither the attempts nor the
   wait, nor whether the stage-1 marker of a record whose attempts are exhausted stays out of the store.
+- **Settled:** five invocations one second apart, each attempt in one transaction; after the fifth the record is logged
+  and acknowledged at level 2, and at level 3 the configured dead-letter mode decides its fate. A payload its handler
+  cannot decode is not retried. No further decision is needed.
 - **Other Snodra libraries:** the Kotlin consumer invokes a handler five times in all, one second apart, and gives the
   record up after the fifth (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/EventConsumer.kt:97`,
   line 98, lines 455-472; the default five is `SnodraMessagingProperties.kt:314`); the Rust consumer does the same with
@@ -321,9 +327,9 @@ library does there. Where an entry is settled, its behaviour is this library's r
   (`consumer_max_attempts`, `SNODRA_CONSUMER_MAX_ATTEMPTS`, five by default; `Timings.event_handler_backoff`, 1 s).
   Each attempt runs the stage-1 marker and the handlers in one transaction, so a failed attempt commits nothing (no
   marker, no published event). After the last attempt the record is logged at error, without its payload, and
-  acknowledged as the level-2 rule says; level 3 replaces this with a dead letter.
-- **Question:** open: should the specification name the level-2 attempts and wait, or leave them to each library?
-  Recommend naming both, since the wait is what a service sees when its handler is down.
+  acknowledged as the level-2 rule says; level 3 uses the configured dead-letter mode instead.
+- **Question:** settled by the level-2 gate: five attempts one second apart is the wait a service sees when its handler
+  is down, and the specification should name it.
 - **Wire change:** no.
 
 ### SG-21: the wait before subscribing again after a failed event subscription
@@ -349,6 +355,10 @@ library does there. Where an entry is settled, its behaviour is this library's r
   is not a JSON object is an `INVALID` letter (discard only) and that a record whose handler cannot read its payload is
   not retried. At level 2 the specification says only that a record failing its attempts is "logged and skipped"; it
   does not say what a malformed record does, nor whether it gets a stage-1 marker.
+- **Settled:** at level 2 a record with no type or a payload that is not a JSON object is logged and acknowledged without
+  a marker; at level 3 it is an `INVALID` letter in `collection` (which blocks no key and can only be discarded),
+  `<source>.dlt` in `event-store`, or logged and acknowledged in `log`. A payload its handler cannot decode is tried
+  once and is a `HANDLER_FAILED` letter in `collection`, never retried. No further decision is needed.
 - **Other Snodra libraries:** the Kotlin consumer's `log` sink logs the record (never its payload) and acknowledges it
   without a marker; an `InvalidMessageException` from a handler's decode breaks its attempt loop at once
   (`snodra-messaging@64dde1e:snodra-messaging/src/main/kotlin/com/damoreira/snodra/messaging/events/EventConsumer.kt:463`,
@@ -359,9 +369,8 @@ library does there. Where an entry is settled, its behaviour is this library's r
   (`DecodeError`) is logged at error and acknowledged after that one attempt: the marker recorded before the decode
   rolls back with the transaction, so it leaves no marker and no handler effect, and the other attempts are not made.
   Any other handler failure is retried as SG-20 says.
-- **Question:** open: should the level-2 rule name the malformed record explicitly, and should a decode failure be
-  tried once (as Kotlin breaks at once) or with the other attempts? Recommend naming both as this library does: a
-  decode failure is logged and skipped once, without a marker.
+- **Question:** settled by the level-2 gate and the level-3 dead-letter modes: malformed records and decode failures
+  follow the rules above.
 - **Wire change:** no.
 
 ### SG-23: the seven event headers when nothing being handled carries a trace context
@@ -811,7 +820,8 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **This library:** `snodra/_external.py` reads only the `idempotency-key` header; a missing or blank one fails the call
   before the record and the body. An adapter whose key is derived from the message must set the header at the caller.
 - **Question:** should Python add a typed key expression/option (recognising the message and headers), or keep the
-  header-only contract? Settled for this level as the header only, matching Go.
+  header-only contract? This library's answer at level 4 is the header only, matching Go; the specification decision
+  is still open.
 - **Wire change:** no.
 
 ### SG-48: a panic in an external-call adapter body
@@ -826,6 +836,6 @@ library does there. Where an entry is settled, its behaviour is this library's r
 - **This library:** `snodra/_external.py` treats a `BaseException` that is not an `Exception` (and is not
   `asyncio.CancelledError`) as a panic: it settles the record `UNKNOWN`, then raises
   `snodra.UnknownOutcome`, so the first caller and a redelivery agree and the body is not run again automatically.
-- **Question:** should a panic be `UNKNOWN` (this library and Go, the safe answer) or `FAILED` (Kotlin)? Settled as
-  `UNKNOWN` for this library.
+- **Question:** should a panic be `UNKNOWN` (this library and Go, the safe answer) or `FAILED` (Kotlin)? This library's
+  answer is `UNKNOWN`, matching Go; the specification decision is still open.
 - **Wire change:** no.
